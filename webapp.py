@@ -137,7 +137,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
     conn.row_factory = sqlite3.Row
     try:
         agents = conn.execute(
-            "SELECT user_id, display_name, name FROM agents WHERE status='active' AND role<>'online' "
+            "SELECT user_id, display_name, name FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') "
             "ORDER BY name"
         ).fetchall()
     finally:
@@ -526,7 +526,7 @@ def handover_payload(user_id: int) -> dict:
         return out
 
     return {
-        "isOnline": is_online(user_id),
+        "isOnline": online_view(user_id),
         "myChannels": online_channels(user_id),
         "openCases": [shape(r) for r in open_rows],
         "closedCases": [shape(r, True) for r in closed_rows],
@@ -662,7 +662,7 @@ def web_case_add(user_id: int, c: dict) -> dict:
 
     d.update(section="follow" if c.get("section") == "follow" else "open",
              prio=prio, platform=platform, flag=flag, store=store)
-    if is_online(user_id):
+    if online_view(user_id):
         d["section"] = "open"
         cid = insert_case(user_id, d, now().date(), origin="on")
         log_case(cid, user_id, "on", "raised")
@@ -865,7 +865,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/") and path not in ("/api/handover", "/api/home"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
-            if user and "id" in user and is_online(int(user["id"])):
+            if user and "id" in user and not is_livechat(int(user["id"])):
                 self._send(403, b'{"error":"online team: handover only"}')
                 return
         if path == "/api/handover":
@@ -916,9 +916,14 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 if not web_has_access(uid):
                     self._send(403, b'{"error":"no access"}')
                     return
-                if is_online(uid):
+                if online_view(uid):
                     # Their app is the handover view only.
                     self._send(200, json.dumps({"online": True}).encode())
+                    return
+                if not is_livechat(uid):
+                    # SH, On-Site and FS: their screens are still to come.
+                    teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(uid)]
+                    self._send(200, json.dumps({"comingSoon": True, "teams": teams}).encode())
                     return
                 data = home_payload(uid)
                 data["slotsToday"] = todays_slots(uid)
@@ -1028,7 +1033,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if not web_has_access(uid):
             self._send(403, b'{"error":"no access"}')
             return
-        if is_online(uid) and path not in ONLINE_POSTS:
+        if not is_livechat(uid) and path not in ONLINE_POSTS:
             self._send(403, b'{"error":"online team: handover only"}')
             return
 
