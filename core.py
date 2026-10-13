@@ -502,7 +502,8 @@ if not db.execute("SELECT 1 FROM settings WHERE key='memberships_moved'").fetcho
     db.execute("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
                "SELECT user_id, 'LIVECHAT', ? FROM agents WHERE status='active' "
                "AND role IN ('agent', 'admin')", (_ts,))
-    db.execute("UPDATE agents SET role='agent' WHERE role='online'")
+    # agents.role 'online' is left as it is: the new code goes by memberships,
+    # and the previous version still reads it if we ever roll back.
     db.execute("INSERT INTO settings (key, value) VALUES ('memberships_moved', ?)", (_ts,))
 # Who did what to a case, and any note they left.
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
@@ -1086,6 +1087,10 @@ def set_depts(user_id: int, depts) -> None:
             (user_id, d, now().isoformat()))
     if "LIVECHAT" not in depts:
         run("UPDATE agents SET on_avails=0, tag_calls=0 WHERE user_id=?", (user_id,))
+    # Keep the old role label in step, so the previous version still works
+    # if this one is ever rolled back. Admins keep 'admin'.
+    run("UPDATE agents SET role=? WHERE user_id=? AND role<>'admin'",
+        ("online" if set(depts) == {"ON"} else "agent", user_id))
 
 
 def is_online(user_id: int) -> bool:
