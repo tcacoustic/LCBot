@@ -698,7 +698,7 @@ async def edit_or_send(query, text: str, kb=None) -> None:
 
 
 async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """vz:lst · vz:v view · vz:ar arrived · vz:sk skip location · vz:lv leave ·
+    """vz:lst · vz:v view · vz:ar arrived · vz:lv leave ·
     vz:oc outcome · vz:ok suggested amount · vz:nc no charge · vz:pm method ·
     vz:fd follow-up done."""
     query = update.callback_query
@@ -740,24 +740,9 @@ async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 (now().isoformat(), v["id"]))
             log_visit(v["id"], uid, "arrived")
         await query.answer("Arrived ✓")
-        context.user_data["arriving"] = v["id"]
         v = q1("SELECT * FROM appointments WHERE id=?", (v["id"],))
         await edit_or_send(query, "✅ Arrived. Please check the customer's details:\n\n"
                            + visit_detail(v), visit_buttons(v, uid))
-        await context.bot.send_message(
-            uid, "Share your location for the visit record?",
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("📍 Share my location", request_location=True)]],
-                resize_keyboard=True, one_time_keyboard=True))
-        await context.bot.send_message(
-            uid, "Or skip it:", reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Skip", callback_data=f"vz:sk:{v['id']}")]]))
-        return
-    if action == "sk":
-        context.user_data.pop("arriving", None)
-        await query.answer()
-        await edit_or_send(query, "Skipped the location.")
-        await context.bot.send_message(uid, "👍", reply_markup=ReplyKeyboardRemove())
         return
     if action == "lv" and v["status"] == "ONSITE":
         await query.answer()
@@ -822,19 +807,6 @@ async def ask_method(query, appt_id: int) -> None:
         query, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?",
         InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=f"vz:pm:{appt_id}:{k}")
                                for k, n in PAY_METHODS]]))
-
-
-async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """The specialist shared their location after tapping Arrived."""
-    appt_id = context.user_data.pop("arriving", None)
-    if not appt_id or not update.message.location:
-        return
-    loc = update.message.location
-    async with write_lock:
-        run("UPDATE appointments SET arrive_lat=?, arrive_lng=? WHERE id=? AND specialist_id=?",
-            (loc.latitude, loc.longitude, appt_id, update.effective_user.id))
-    await update.message.reply_text("📍 Location saved. Tap 🏁 Leave when you're done.",
-                                    reply_markup=ReplyKeyboardRemove())
 
 
 async def on_amount_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

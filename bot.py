@@ -876,8 +876,7 @@ def main() -> None:
         )
     )
     app.add_handler(CallbackQueryHandler(
-        on_visit_button, pattern=r"^vz:(lst|v|ar|sk|lv|oc|ok|nc|pm|fd)(:|$)"))
-    app.add_handler(MessageHandler(filters.LOCATION & filters.ChatType.PRIVATE, on_location))
+        on_visit_button, pattern=r"^vz:(lst|v|ar|lv|oc|ok|nc|pm|fd)(:|$)"))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))

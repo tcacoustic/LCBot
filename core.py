@@ -528,8 +528,6 @@ db.execute("""CREATE TABLE IF NOT EXISTS appointments (
     proposed_starts_at TEXT,
     proposed_by        INTEGER,
     arrived_at         TEXT,
-    arrive_lat         REAL,
-    arrive_lng         REAL,
     left_at            TEXT,
     outcome            TEXT,
     amount_cents       INTEGER,
