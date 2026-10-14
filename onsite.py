@@ -171,7 +171,7 @@ def clash(specialist_id: int, start: datetime, end: datetime,
         s, e = datetime.fromisoformat(b["starts_at"]), datetime.fromisoformat(b["ends_at"])
         if s < end and start < e:
             if b["part"]:
-                half = {"AM": "in the morning", "PM": "in the afternoon", "FD": "all day"}[b["part"]]
+                half = {"AM": "10am–2pm", "PM": "2pm–6pm", "FD": "all day"}[b["part"]]
                 return f"marked themselves not free {half} ({s.strftime('%a %-d %b')})"
             return f"a time they aren't free ({s.strftime('%a %-d %b, %H:%M')}–{e.strftime('%H:%M')})"
     return None
@@ -377,9 +377,9 @@ async def notify_cancelled(bot, appt_id: int, reason: str = "") -> None:
 # Times the specialist isn't free
 # --------------------------------------------------------------------------
 
-# The specialist marks days by halves: not free in the morning (AM), the
-# afternoon (PM) or all day (FD). The split is 1pm.
-DAY_PARTS = {"AM": ("00:00", "13:00"), "PM": ("13:00", "23:59"), "FD": ("00:00", "23:59")}
+# The specialist marks days by halves: not free 10am–2pm (AM), 2pm–6pm (PM)
+# or all day (FD).
+DAY_PARTS = {"AM": ("10:00", "14:00"), "PM": ("14:00", "18:00"), "FD": ("00:00", "23:59")}
 PART_NAMES = {"AM": "Not free AM", "PM": "Not free PM", "FD": "Not free all day"}
 AVAIL_DAYS = 5
 

@@ -4028,8 +4028,8 @@ async function loadVisits() {
     h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+  Book a visit</button>';
   } else {
     h += '<h2>My availability</h2>'
-       + '<div class="note" style="margin-top:0">Tap a day. AM = not free in the morning (until 1pm), '
-       + 'PM = not free from 1pm, FD = not free all day.</div>';
+       + '<div class="note" style="margin-top:0">Tap a day. AM = not free 10am–2pm, '
+       + 'PM = not free 2pm–6pm, FD = not free all day.</div>';
     const partName = { AM: 'Not free AM', PM: 'Not free PM', FD: 'Not free all day' };
     for (const day of d.availability) {
       h += '<div class="case' + (day.part ? ' gone' : '') + '" data-aday="' + day.date + '" style="cursor:pointer">'
