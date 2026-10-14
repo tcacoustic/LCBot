@@ -330,7 +330,7 @@ async def on_dept_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"<b>Which channels does {esc(shown)} look after?</b>\n"
                 "Tick all that apply, then Done.",
                 parse_mode=constants.ParseMode.HTML, reply_markup=channel_picker(uid))
-        if "ONSITE" in have:
+        if "ONSITE" in have or "FS" in have:
             from onsite import ask_country
             await ask_country(context.bot, query.from_user.id, uid, shown)
         return

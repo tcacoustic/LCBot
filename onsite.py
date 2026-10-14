@@ -76,9 +76,22 @@ def country_picker(user_id: int) -> InlineKeyboardMarkup:
          for c, flag, name, _ in COUNTRIES])
 
 
+def country_question(user_id: int, shown: str) -> str:
+    if "ONSITE" in depts_of(user_id):
+        return f"Which country does {shown} do visits in?"
+    return f"Which country is {shown}'s store in?"
+
+
+def country_answer(user_id: int, country: str) -> str:
+    who = display_name_of(user_id, "They")
+    if "ONSITE" in depts_of(user_id):
+        return f"{who} does visits in {COUNTRY_NAMES[country]}."
+    return f"{who}'s store is in {COUNTRY_NAMES[country]}."
+
+
 async def ask_country(bot, admin_id: int, user_id: int, shown: str) -> None:
     await bot.send_message(
-        admin_id, f"<b>Which country does {esc(shown)} do visits in?</b>",
+        admin_id, f"<b>{esc(country_question(user_id, shown))}</b>",
         parse_mode=constants.ParseMode.HTML, reply_markup=country_picker(user_id))
 
 
@@ -96,12 +109,11 @@ async def on_country_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     async with write_lock:
         run("UPDATE agents SET country=? WHERE user_id=?", (country, uid))
     await query.answer()
-    await query.edit_message_text(
-        f"✅ {display_name_of(uid, 'They')} does visits in {COUNTRY_NAMES[country]}.")
+    await query.edit_message_text(f"✅ {country_answer(uid, country)}")
 
 
 async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/specialists — On-Site Specialists by country · /specialists @name — set theirs."""
+    """/specialists — On-Site Specialists and FS by country · /specialists @name — set theirs."""
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
     if not is_admin(update.effective_user.id):
@@ -109,13 +121,14 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     target = " ".join(context.args).strip()
     if target:
         row = find_agent(target)
-        if not row or "ONSITE" not in depts_of(row["user_id"]):
+        if not row or not {"ONSITE", "FS"} & depts_of(row["user_id"]):
             await update.message.reply_text(
-                "I can't find an On-Site Specialist by that name. Add them to the "
-                "On-Site team first with /departments @username.")
+                "I can't find an On-Site Specialist or FS member by that name. Add them "
+                "to the team first with /departments @username.")
             return
+        shown = row["display_name"] or row["name"]
         await update.message.reply_text(
-            f"<b>Which country does {esc(row['display_name'] or row['name'])} do visits in?</b>",
+            f"<b>{esc(country_question(row['user_id'], shown))}</b>",
             parse_mode=constants.ParseMode.HTML, reply_markup=country_picker(row["user_id"]))
         return
     lines = ["<b>On-Site Specialists</b>", ""]
@@ -123,8 +136,17 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         team = specialists_in(c)
         lines.append(f"{flag} {name}: " + (", ".join(esc(r["display_name"] or r["name"])
                                                     for r in team) or "<i>none</i>"))
-    unset = q("SELECT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
-              "WHERE m.dept='ONSITE' AND a.status='active' AND a.country IS NULL")
+    fs = q("SELECT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
+           "WHERE m.dept='FS' AND a.status='active' ORDER BY a.name")
+    if fs:
+        lines += ["", "<b>FS</b>"]
+        for c, flag, name, _ in COUNTRIES:
+            here = [r for r in fs if r["country"] == c]
+            if here:
+                lines.append(f"{flag} {name}: " + ", ".join(
+                    esc(r["display_name"] or r["name"]) for r in here))
+    unset = q("SELECT DISTINCT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
+              "WHERE m.dept IN ('ONSITE','FS') AND a.status='active' AND a.country IS NULL")
     if unset:
         lines += ["", "No country yet: " + ", ".join(esc(r["display_name"] or r["name"])
                                                       for r in unset)]
@@ -523,7 +545,10 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
         country = (me["country"] if me else "") or "SG"
         spec_id = user_id
     else:
-        country = country if country in COUNTRY_NAMES else "SG"
+        if country not in COUNTRY_NAMES:
+            # FS open on their own store's country; SH and admins on SG.
+            me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+            country = (me["country"] if me else "") or "SG"
         team = next(c["specialists"] for c in countries if c["code"] == country)
         try:
             spec_id = int(spec)
