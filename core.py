@@ -505,6 +505,56 @@ if not db.execute("SELECT 1 FROM settings WHERE key='memberships_moved'").fetcho
     # agents.role 'online' is left as it is: the new code goes by memberships,
     # and the previous version still reads it if we ever roll back.
     db.execute("INSERT INTO settings (key, value) VALUES ('memberships_moved', ?)", (_ts,))
+# On-Site: home visits, their history, and times a specialist isn't free.
+# Times are ISO strings with the visit country's UTC offset.
+db.execute("""CREATE TABLE IF NOT EXISTS appointments (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    country            TEXT NOT NULL,
+    specialist_id      INTEGER,
+    visit_type         TEXT NOT NULL,
+    starts_at          TEXT NOT NULL,
+    duration_min       INTEGER NOT NULL DEFAULT 120,
+    customer_name      TEXT NOT NULL,
+    phone              TEXT,
+    email              TEXT,
+    address            TEXT NOT NULL,
+    postal             TEXT,
+    product            TEXT,
+    issue              TEXT,
+    order_no           TEXT,
+    status             TEXT NOT NULL DEFAULT 'SCHEDULED',
+    created_by         INTEGER,
+    created_at         TEXT NOT NULL,
+    proposed_starts_at TEXT,
+    proposed_by        INTEGER,
+    arrived_at         TEXT,
+    arrive_lat         REAL,
+    arrive_lng         REAL,
+    left_at            TEXT,
+    outcome            TEXT,
+    amount_cents       INTEGER,
+    currency           TEXT,
+    pay_method         TEXT,
+    followup_done      INTEGER NOT NULL DEFAULT 0
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS appointment_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    appt_id    INTEGER NOT NULL,
+    user_id    INTEGER,
+    action     TEXT NOT NULL,
+    note       TEXT,
+    created_at TEXT NOT NULL
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS specialist_blocks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    starts_at  TEXT NOT NULL,
+    ends_at    TEXT NOT NULL,
+    note       TEXT,
+    created_at TEXT NOT NULL
+)""")
+if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
+    db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
 # Who did what to a case, and any note they left.
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2843,6 +2893,7 @@ ADMIN_GROUPS = [
         ("report", "Case report by channel, last 7 days"),
         ("channels", "Online team and the channels they cover"),
         ("departments", "Who's in which team; change someone's team"),
+        ("specialists", "On-Site Specialists by country"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),

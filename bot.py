@@ -9,6 +9,7 @@ from people import *  # noqa: F401,F403
 from shifts import *  # noqa: F401,F403
 from timeclock import *  # noqa: F401,F403
 from handover import *  # noqa: F401,F403
+from onsite import *  # noqa: F401,F403
 from webapp import *  # noqa: F401,F403
 
 async def on_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -860,6 +861,9 @@ def main() -> None:
     app.add_handler(CommandHandler("departments", cmd_departments))
     app.add_handler(CallbackQueryHandler(on_dept_pick, pattern=r"^dp:\d+:"))
     app.add_handler(CommandHandler("viewas", cmd_viewas))
+    app.add_handler(CommandHandler("specialists", cmd_specialists))
+    app.add_handler(CallbackQueryHandler(on_country_pick, pattern=r"^vz:cy:\d+:[A-Z]{2}$"))
+    app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))
