@@ -25,6 +25,7 @@ STORES = [
     ("SG_SONOS", "SG", "Sonos Flagship Store"),
     ("SG_ADELPHI", "SG", "TC Acoustic @ The Adelphi"),
     ("MY_SONOS", "MY", "Sonos Concept Store by TC Acoustic"),
+    ("HK_EXPCENTRE", "HK", "TC Experience Centre HK"),
     ("TH_EMSPHERE", "TH", "Sonos Store EmSphere"),
 ]
 STORE_NAMES = {code: name for code, _, name in STORES}
