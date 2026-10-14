@@ -595,7 +595,7 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
 
 
 VISIT_POSTS = {"/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
-               "/api/block", "/api/block/remove"}
+               "/api/block", "/api/block/remove", "/api/block/day"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -635,6 +635,11 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         return {"ok": True}
     if not is_specialist(user_id):
         return {"ok": False, "error": "Only the specialist blocks out their own time."}
+    if path == "/api/block/day":
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        ok, err = set_day_part(user_id, (me["country"] if me else "") or "SG",
+                               str(b.get("date", "")), str(b.get("part", "")).upper())
+        return {"ok": True} if ok else {"ok": False, "error": err}
     if path == "/api/block":
         me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
         bid, err = add_block(user_id, (me["country"] if me else "") or "SG",
@@ -934,7 +939,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 one = lambda k: (qs.get(k) or [""])[0]
                 self._send(200, json.dumps(visits_payload(
-                    uid, one("week"), one("country"), one("spec"))).encode())
+                    uid, one("week"), one("country"), one("spec"), one("avail"))).encode())
             except Exception as e:
                 log.warning("Visits view failed: %s", e)
                 try:

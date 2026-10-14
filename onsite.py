@@ -151,6 +151,11 @@ def when_text(v) -> str:
     return f"{start.strftime('%a %-d %b, %H:%M')}–{end.strftime('%H:%M')}"
 
 
+def clash_phrase(busy: str) -> str:
+    """'another visit (…)' → 'has another visit (…)'; 'marked …' stays."""
+    return busy if busy.startswith("marked") else f"has {busy}"
+
+
 def clash(specialist_id: int, start: datetime, end: datetime,
           exclude_id: int | None = None) -> str | None:
     """What the specialist is already doing then, or None if they're free."""
@@ -165,6 +170,9 @@ def clash(specialist_id: int, start: datetime, end: datetime,
     for b in q("SELECT * FROM specialist_blocks WHERE user_id=?", (specialist_id,)):
         s, e = datetime.fromisoformat(b["starts_at"]), datetime.fromisoformat(b["ends_at"])
         if s < end and start < e:
+            if b["part"]:
+                half = {"AM": "in the morning", "PM": "in the afternoon", "FD": "all day"}[b["part"]]
+                return f"marked themselves not free {half} ({s.strftime('%a %-d %b')})"
             return f"a time they aren't free ({s.strftime('%a %-d %b, %H:%M')}–{e.strftime('%H:%M')})"
     return None
 
@@ -217,7 +225,7 @@ def create_visit(user_id: int, f: dict) -> tuple:
             return None, f"Fill in {label}."
     busy = clash(spec, start, start + timedelta(minutes=duration))
     if busy:
-        return None, f"The specialist already has {busy}. Pick another time."
+        return None, f"That clashes: the specialist {clash_phrase(busy)}. Pick another time."
     cur = run(
         "INSERT INTO appointments (country, specialist_id, visit_type, starts_at, duration_min,"
         " customer_name, phone, email, address, postal, product, issue, order_no,"
@@ -285,7 +293,7 @@ def request_reschedule(appt_id: int, user_id: int, day: str, hhmm: str) -> tuple
     busy = clash(v["specialist_id"], start, start + timedelta(minutes=v["duration_min"]),
                  exclude_id=appt_id)
     if busy:
-        return False, f"The specialist already has {busy} then."
+        return False, f"That clashes: the specialist {clash_phrase(busy)}."
     run("UPDATE appointments SET proposed_starts_at=?, proposed_by=? WHERE id=?",
         (start.isoformat(), user_id, appt_id))
     log_visit(appt_id, user_id, "asked to move", start.strftime("%a %-d %b, %H:%M"))
@@ -369,6 +377,52 @@ async def notify_cancelled(bot, appt_id: int, reason: str = "") -> None:
 # Times the specialist isn't free
 # --------------------------------------------------------------------------
 
+# The specialist marks days by halves: not free in the morning (AM), the
+# afternoon (PM) or all day (FD). The split is 1pm.
+DAY_PARTS = {"AM": ("00:00", "13:00"), "PM": ("13:00", "23:59"), "FD": ("00:00", "23:59")}
+PART_NAMES = {"AM": "Not free AM", "PM": "Not free PM", "FD": "Not free all day"}
+AVAIL_DAYS = 5
+
+
+def day_part(user_id: int, country: str, day: str) -> str:
+    """'AM', 'PM', 'FD' or '' for a day the specialist marked."""
+    tz = COUNTRY_TZ[country]
+    for b in q("SELECT * FROM specialist_blocks WHERE user_id=? AND part IS NOT NULL", (user_id,)):
+        if datetime.fromisoformat(b["starts_at"]).astimezone(tz).date().isoformat() == day:
+            return b["part"]
+    return ""
+
+
+def set_day_part(user_id: int, country: str, day: str, part: str) -> tuple:
+    """Mark a day AM / PM / FD, or FREE to clear it. Refused over a booked visit."""
+    if part not in DAY_PARTS and part != "FREE":
+        return False, "Pick AM, PM, FD or Free."
+    tz = COUNTRY_TZ[country]
+    old = [b for b in q("SELECT * FROM specialist_blocks WHERE user_id=? AND part IS NOT NULL",
+                        (user_id,))
+           if datetime.fromisoformat(b["starts_at"]).astimezone(tz).date().isoformat() == day]
+    if part != "FREE":
+        s, e = DAY_PARTS[part]
+        try:
+            start, end = local_start(country, day, s), local_start(country, day, e)
+        except (ValueError, TypeError):
+            return False, "Pick a day."
+        marks = ",".join("?" * len(LIVE_STATUSES))
+        for v in q(f"SELECT * FROM appointments WHERE specialist_id=? AND status IN ({marks})",
+                   (user_id, *LIVE_STATUSES)):
+            vs, ve = span_of(v)
+            if vs < end and start < ve:
+                return False, (f"You have a visit then ({when_text(v)}). Ask SH to move it "
+                               "first.")
+    for b in old:
+        run("DELETE FROM specialist_blocks WHERE id=?", (b["id"],))
+    if part != "FREE":
+        run("INSERT INTO specialist_blocks (user_id, starts_at, ends_at, note, part, created_at) "
+            "VALUES (?,?,?,?,?,?)", (user_id, start.isoformat(), end.isoformat(),
+                                     None, part, now().isoformat()))
+    return True, None
+
+
 def add_block(user_id: int, country: str, day: str, start_hhmm: str, end_hhmm: str,
               note: str = "") -> tuple:
     try:
@@ -424,7 +478,8 @@ def visit_item(v, role: str) -> dict:
     }
 
 
-def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = "") -> dict:
+def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = "",
+                   avail: str = "") -> dict:
     role = visit_role(user_id)
     countries = [{"code": c, "name": COUNTRY_NAMES[c],
                   "specialists": [{"id": r["user_id"], "name": r["display_name"] or r["name"]}
@@ -466,10 +521,24 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
                 by_day[s.date().isoformat()]["items"].append({
                     "kind": "block", "id": b["id"], "start": s.strftime("%H:%M"),
                     "end": e.strftime("%H:%M"), "note": b["note"] or "",
-                    "canRemove": role == "specialist"})
+                    "part": PART_NAMES.get(b["part"] or "", ""),
+                    "canRemove": role == "specialist" and not b["part"]})
     for d in days:
         d["items"].sort(key=lambda it: it["start"])
+    availability, a_prev, a_next = [], "", ""
+    if role == "specialist":
+        try:
+            a0 = max(date.fromisoformat(avail), today)
+        except (TypeError, ValueError):
+            a0 = today
+        for i in range(AVAIL_DAYS):
+            d = a0 + timedelta(days=i)
+            availability.append({"date": d.isoformat(), "label": d.strftime("%a %-d %b"),
+                                 "part": day_part(user_id, country, d.isoformat())})
+        a_prev = max(today, a0 - timedelta(days=AVAIL_DAYS)).isoformat() if a0 > today else ""
+        a_next = (a0 + timedelta(days=AVAIL_DAYS)).isoformat()
     return {
+        "availability": availability, "availPrev": a_prev, "availNext": a_next,
         "role": role, "countries": countries, "country": country, "specId": spec_id,
         "types": [{"key": k, "name": n} for k, n in VISIT_TYPES], "durations": DURATIONS,
         "weekStart": first.isoformat(), "prev": (first - timedelta(days=7)).isoformat(),

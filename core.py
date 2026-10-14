@@ -551,8 +551,11 @@ db.execute("""CREATE TABLE IF NOT EXISTS specialist_blocks (
     starts_at  TEXT NOT NULL,
     ends_at    TEXT NOT NULL,
     note       TEXT,
+    part       TEXT,
     created_at TEXT NOT NULL
 )""")
+if "part" not in {r[1] for r in db.execute("PRAGMA table_info(specialist_blocks)")}:
+    db.execute("ALTER TABLE specialist_blocks ADD COLUMN part TEXT")   # AM, PM or FD
 if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
 # Who did what to a case, and any note they left.
@@ -3299,7 +3302,7 @@ let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 // The Online team's app: handover cases only, sorted into platform tabs.
 let ONLINE = false, ON_GROUP = '', ON_REGION = '', ON_EDIT = {};
 // On-Site visits: SH and FS book, the specialist sees their week.
-let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null };
+let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '' };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function navBar() {
@@ -3914,7 +3917,7 @@ function openLink(u) { if (tg && tg.openLink) tg.openLink(u); else window.open(u
 
 function visitCard(it, d) {
   if (it.kind === 'block') {
-    let h = '<div class="case gone"><div class="nm">Not free ' + esc(it.start) + '–' + esc(it.end) + '</div>';
+    let h = '<div class="case gone"><div class="nm">' + (it.part ? esc(it.part) : 'Not free ' + esc(it.start) + '–' + esc(it.end)) + '</div>';
     if (it.note) h += '<div class="meta">' + esc(it.note) + '</div>';
     if (it.canRemove) h += '<div class="more" data-unblock="' + it.id + '">Remove this</div>';
     return h + '</div>';
@@ -4003,7 +4006,7 @@ function keepBookForm() {
 
 async function loadVisits() {
   const app = document.getElementById('app');
-  const qs = new URLSearchParams({ week: VS.week, country: VS.country, spec: VS.spec });
+  const qs = new URLSearchParams({ week: VS.week, country: VS.country, spec: VS.spec, avail: VS.avail });
   const d = await getJSON('/api/visits?' + qs.toString());
   VS.country = d.country; VS.spec = String(d.specId || ''); VS.week = d.weekStart;
   if (VS.form) {
@@ -4023,13 +4026,24 @@ async function loadVisits() {
       h += '<div class="note">No On-Site Specialist in this country yet.</div>';
     }
     h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+  Book a visit</button>';
-  } else if (VS.block) {
-    h += '<h2>Block out time</h2><div class="fld"><label>Date</label><input type="date" id="bk_date"></div>'
-       + '<div class="fld"><label>From and to</label><input type="time" id="bk_start"><input type="time" id="bk_end" style="margin-top:6px"></div>'
-       + '<div class="fld"><label>Note (optional)</label><input id="bk_note" placeholder="e.g. class, another job"></div>'
-       + '<div class="acts"><button id="bkSave">Block it</button><button class="soft" id="bkBack">Back</button></div>';
   } else {
-    h += '<button class="big" id="bkNew" style="margin:6px 0 4px">Block out time I am not free</button>';
+    h += '<h2>My availability</h2>'
+       + '<div class="note" style="margin-top:0">Tap a day. AM = not free in the morning (until 1pm), '
+       + 'PM = not free from 1pm, FD = not free all day.</div>';
+    const partName = { AM: 'Not free AM', PM: 'Not free PM', FD: 'Not free all day' };
+    for (const day of d.availability) {
+      h += '<div class="case' + (day.part ? ' gone' : '') + '" data-aday="' + day.date + '" style="cursor:pointer">'
+         + '<div class="nm">' + esc(day.label) + ' · ' + (day.part ? esc(partName[day.part]) : 'Free') + '</div>';
+      if (VS.day === day.date) {
+        h += '<div class="otabs small" style="margin-bottom:0">' + ['AM', 'PM', 'FD'].map(k =>
+            '<button data-apart="' + k + '" data-adate="' + day.date + '" class="' + (day.part === k ? 'on' : '') + '">' + k + '</button>').join('')
+           + '<button data-apart="FREE" data-adate="' + day.date + '" class="' + (!day.part ? 'on' : '') + '">Free</button></div>';
+      }
+      h += '</div>';
+    }
+    h += '<div class="otabs small">' + (d.availPrev ? '<button data-av="' + d.availPrev + '">◀ Earlier</button>' : '')
+       + '<button data-av="' + d.availNext + '">Next 5 days ▶</button></div>'
+       + '<h2>My visits</h2>';
   }
   h += '<div class="otabs small"><button data-vw="' + d.prev + '">◀ Prev</button>'
      + '<button class="on">' + esc(d.weekLabel) + '</button>'
@@ -4079,20 +4093,18 @@ function wireVisits(d) {
     if (!out.ok) { toast(out.error || 'Could not remove that.'); return; }
     toast('Removed'); loadVisits();
   });
-  const bk = document.getElementById('bkNew');
-  if (bk) bk.onclick = () => { VS.block = true; loadVisits(); };
-  const bkb = document.getElementById('bkBack');
-  if (bkb) bkb.onclick = () => { VS.block = null; loadVisits(); };
-  const bks = document.getElementById('bkSave');
-  if (bks) bks.onclick = async () => {
-    const val = k => document.getElementById('bk_' + k).value;
-    if (!val('date') || !val('start') || !val('end')) { toast('Pick the date and both times.'); return; }
-    bks.disabled = true;
-    const out = await post('/api/block', { date: val('date'), start: val('start'), end: val('end'), note: val('note') });
-    bks.disabled = false;
-    if (!out.ok) { toast(out.error || 'Could not block that.'); return; }
-    VS.block = null; toast('Blocked out'); loadVisits();
-  };
+  on('[data-aday]', el => { VS.day = VS.day === el.dataset.aday ? '' : el.dataset.aday; loadVisits(); });
+  on('[data-av]', el => { VS.avail = el.dataset.av; VS.day = ''; loadVisits(); });
+  document.querySelectorAll('[data-apart]').forEach(el => {
+    el.onclick = async ev => {
+      ev.stopPropagation();
+      const day = d.availability.find(x => x.date === el.dataset.adate);
+      const part = (day && day.part === el.dataset.apart) ? 'FREE' : el.dataset.apart;
+      const out = await post('/api/block/day', { date: el.dataset.adate, part });
+      if (!out.ok) { toast(out.error || 'Could not change that.'); return; }
+      toast(part === 'FREE' ? 'Free all day' : 'Saved'); loadVisits();
+    };
+  });
   const bn = document.getElementById('bookNew');
   if (bn) bn.onclick = () => { VS.form = { country: d.country, spec: VS.spec, visit_type: 'SETUP', duration_min: 120, date: '', time: '' }; loadVisits(); };
   on('[data-bf]', el => {
