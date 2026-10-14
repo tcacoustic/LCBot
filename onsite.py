@@ -31,8 +31,9 @@ STORES = [
 STORE_NAMES = {code: name for code, _, name in STORES}
 STORE_COUNTRY = {code: c for code, c, _ in STORES}
 
-VISIT_TYPES = [("SETUP", "Set up"), ("TROUBLESHOOT", "Troubleshoot"), ("SURVEY", "Survey")]
-VISIT_NAMES = dict(VISIT_TYPES)
+VISIT_TYPES = [("SETUP", "Set up"), ("TROUBLESHOOT", "Troubleshoot")]
+# Survey is no longer offered; the name stays so any old survey still shows.
+VISIT_NAMES = {**dict(VISIT_TYPES), "SURVEY": "Survey"}
 # Bookers only pick a start time: a visit takes 1 to 2 hours and only the
 # specialist knows, so 2 hours are kept free after it for clash checks.
 RESERVE_MIN = 120
@@ -317,7 +318,7 @@ def create_visit(user_id: int, f: dict) -> tuple:
     if country not in COUNTRY_NAMES:
         return None, "Pick a country."
     vtype = str(f.get("visit_type", "")).upper()
-    if vtype not in VISIT_NAMES:
+    if vtype not in dict(VISIT_TYPES):
         return None, "Pick the visit type."
     duration = RESERVE_MIN
     team = specialists_in(country)
