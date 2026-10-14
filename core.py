@@ -556,6 +556,8 @@ if "part" not in {r[1] for r in db.execute("PRAGMA table_info(specialist_blocks)
     db.execute("ALTER TABLE specialist_blocks ADD COLUMN part TEXT")   # AM, PM or FD
 if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
+if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
+    db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
 # Who did what to a case, and any note they left.
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2966,6 +2968,9 @@ SH_COMMANDS = [
 ONSITE_COMMANDS = [
     ("visits", "My visits: arrive, leave, report"),
 ]
+FS_COMMANDS = [
+    ("store", "Change the store you're at"),
+]
 
 ONLINE_COMMANDS = [
     ("cases", "Open cases for your channels"),
@@ -2988,6 +2993,8 @@ def menu_for(user_id: int) -> list:
             pairs += ONLINE_COMMANDS
         if "SH" in depts or "FS" in depts:
             pairs += SH_COMMANDS
+        if "FS" in depts:
+            pairs += FS_COMMANDS
         if "ONSITE" in depts:
             pairs += ONSITE_COMMANDS
         pairs += [("help", "List commands")]
@@ -3013,7 +3020,7 @@ def team_help(user_id: int) -> str:
         parts.append("👋 <b>FS</b>\n\nBook on-site visits in the <b>App</b> by the 📎: "
                      "pick the country, the date and time, and the customer's details. "
                      "The specialist is told straight away.\n/visits — upcoming visits "
-                     "and follow-ups")
+                     "and follow-ups\n/store — change the store you're at")
     if "ONSITE" in depts:
         parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
                      "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "

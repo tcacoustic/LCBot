@@ -863,6 +863,8 @@ def main() -> None:
     app.add_handler(CommandHandler("viewas", cmd_viewas))
     app.add_handler(CommandHandler("specialists", cmd_specialists))
     app.add_handler(CallbackQueryHandler(on_country_pick, pattern=r"^vz:cy:\d+:[A-Z]{2}$"))
+    app.add_handler(CommandHandler("store", cmd_store))
+    app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^vz:(fc|fs):\d+:\w+$"))
     app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:\d+$"))
     app.add_handler(CommandHandler("visits", cmd_visits))
     app.add_handler(CommandHandler("visitchat", cmd_visitchat))

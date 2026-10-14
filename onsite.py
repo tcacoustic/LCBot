@@ -20,6 +20,15 @@ COUNTRIES = [
 ]
 COUNTRY_NAMES = {c: f"{flag} {name}" for c, flag, name, _ in COUNTRIES}
 COUNTRY_TZ = {c: ZoneInfo(tz) for c, _, _, tz in COUNTRIES}
+# FS stores: (code, country, name). FS staff pick theirs when they join.
+STORES = [
+    ("SG_SONOS", "SG", "Sonos Flagship Store"),
+    ("SG_ADELPHI", "SG", "TC Acoustic @ The Adelphi"),
+    ("MY_SONOS", "MY", "Sonos Concept Store by TC Acoustic"),
+    ("TH_EMSPHERE", "TH", "Sonos Store EmSphere"),
+]
+STORE_NAMES = {code: name for code, _, name in STORES}
+STORE_COUNTRY = {code: c for code, c, _ in STORES}
 
 VISIT_TYPES = [("SETUP", "Set up"), ("TROUBLESHOOT", "Troubleshoot"), ("SURVEY", "Survey")]
 VISIT_NAMES = dict(VISIT_TYPES)
@@ -76,22 +85,9 @@ def country_picker(user_id: int) -> InlineKeyboardMarkup:
          for c, flag, name, _ in COUNTRIES])
 
 
-def country_question(user_id: int, shown: str) -> str:
-    if "ONSITE" in depts_of(user_id):
-        return f"Which country does {shown} do visits in?"
-    return f"Which country is {shown}'s store in?"
-
-
-def country_answer(user_id: int, country: str) -> str:
-    who = display_name_of(user_id, "They")
-    if "ONSITE" in depts_of(user_id):
-        return f"{who} does visits in {COUNTRY_NAMES[country]}."
-    return f"{who}'s store is in {COUNTRY_NAMES[country]}."
-
-
 async def ask_country(bot, admin_id: int, user_id: int, shown: str) -> None:
     await bot.send_message(
-        admin_id, f"<b>{esc(country_question(user_id, shown))}</b>",
+        admin_id, f"<b>Which country does {esc(shown)} do visits in?</b>",
         parse_mode=constants.ParseMode.HTML, reply_markup=country_picker(user_id))
 
 
@@ -109,7 +105,108 @@ async def on_country_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     async with write_lock:
         run("UPDATE agents SET country=? WHERE user_id=?", (country, uid))
     await query.answer()
-    await query.edit_message_text(f"✅ {country_answer(uid, country)}")
+    await query.edit_message_text(
+        f"✅ {display_name_of(uid, 'They')} does visits in {COUNTRY_NAMES[country]}.")
+
+
+# --------------------------------------------------------------------------
+# FS stores: country first, then that country's stores
+# --------------------------------------------------------------------------
+
+def store_of(user_id: int) -> str:
+    row = q1("SELECT store FROM agents WHERE user_id=?", (user_id,))
+    return STORE_NAMES.get(row["store"] or "", "") if row else ""
+
+
+def booker_name(user_id: int) -> str:
+    """Who booked a visit; FS staff also show their store."""
+    who = display_name_of(user_id, "SH")
+    store = store_of(user_id) if "FS" in depts_of(user_id) else ""
+    return f"{who} · {store}" if store else who
+
+
+def store_question(user_id: int, asker_id: int) -> str:
+    if user_id == asker_id:
+        return "Which store are you at? Pick your country first."
+    return f"Which store is {display_name_of(user_id, 'they')} at? Pick the country first."
+
+
+def store_country_picker(user_id: int) -> InlineKeyboardMarkup:
+    have = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+    have = have["country"] if have else None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"{'✅' if c == have else '⬜️'} {flag} {name}",
+                               callback_data=f"vz:fc:{user_id}:{c}")]
+         for c, flag, name, _ in COUNTRIES if c in STORE_COUNTRY.values()])
+
+
+def store_picker(user_id: int, country: str) -> InlineKeyboardMarkup:
+    row = q1("SELECT store FROM agents WHERE user_id=?", (user_id,))
+    have = row["store"] if row else None
+    rows = [[InlineKeyboardButton(f"{'✅' if code == have else '⬜️'} {name}",
+                                  callback_data=f"vz:fs:{user_id}:{code}")]
+            for code, c, name in STORES if c == country]
+    rows.append([InlineKeyboardButton("‹ Back", callback_data=f"vz:fc:{user_id}:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def ask_store(bot, chat_id: int, user_id: int) -> None:
+    """Send the store picker to chat_id (the FS member themselves, or an admin)."""
+    try:
+        await bot.send_message(chat_id, f"<b>{esc(store_question(user_id, chat_id))}</b>",
+                               parse_mode=constants.ParseMode.HTML,
+                               reply_markup=store_country_picker(user_id))
+    except Exception as e:
+        log.info("Couldn't ask %s for a store: %s", chat_id, e)
+
+
+async def on_store_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vz:fc:<id>:<CC|back> picks the country · vz:fs:<id>:<STORE> saves the store."""
+    query = update.callback_query
+    _, step, raw, value = query.data.split(":")
+    uid = int(raw)
+    if query.from_user.id != uid and not is_admin(query.from_user.id):
+        await query.answer("Only admins can change someone else's store.", show_alert=True)
+        return
+    question = f"<b>{esc(store_question(uid, query.from_user.id))}</b>"
+    if step == "fc":
+        await query.answer()
+        if value == "back":
+            await query.edit_message_text(question, parse_mode=constants.ParseMode.HTML,
+                                          reply_markup=store_country_picker(uid))
+            return
+        if value not in COUNTRY_NAMES:
+            return
+        await query.edit_message_text(f"{question}\n\n{COUNTRY_NAMES[value]}",
+                                      parse_mode=constants.ParseMode.HTML,
+                                      reply_markup=store_picker(uid, value))
+        return
+    if value not in STORE_NAMES:
+        await query.answer()
+        return
+    async with write_lock:
+        run("UPDATE agents SET store=?, country=? WHERE user_id=?",
+            (value, STORE_COUNTRY[value], uid))
+    await query.answer()
+    who = "You're" if query.from_user.id == uid else f"{display_name_of(uid, 'They')} is"
+    await query.edit_message_text(
+        f"✅ {who} at {STORE_NAMES[value]} ({COUNTRY_NAMES[STORE_COUNTRY[value]]}).")
+
+
+async def cmd_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/store — FS staff change the store they're at."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if "FS" not in depts_of(uid) and not is_admin(uid):
+        return
+    if "FS" not in depts_of(uid):
+        await update.message.reply_text("To set an FS member's store: /specialists @username")
+        return
+    now_at = store_of(uid)
+    if now_at:
+        await update.message.reply_text(f"You're at {now_at}.")
+    await ask_store(context.bot, uid, uid)
 
 
 async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -126,9 +223,11 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "I can't find an On-Site Specialist or FS member by that name. Add them "
                 "to the team first with /departments @username.")
             return
-        shown = row["display_name"] or row["name"]
+        if "ONSITE" not in depts_of(row["user_id"]):
+            await ask_store(context.bot, update.effective_user.id, row["user_id"])
+            return
         await update.message.reply_text(
-            f"<b>{esc(country_question(row['user_id'], shown))}</b>",
+            f"<b>Which country does {esc(row['display_name'] or row['name'])} do visits in?</b>",
             parse_mode=constants.ParseMode.HTML, reply_markup=country_picker(row["user_id"]))
         return
     lines = ["<b>On-Site Specialists</b>", ""]
@@ -139,16 +238,17 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     fs = q("SELECT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
            "WHERE m.dept='FS' AND a.status='active' ORDER BY a.name")
     if fs:
-        lines += ["", "<b>FS</b>"]
-        for c, flag, name, _ in COUNTRIES:
-            here = [r for r in fs if r["country"] == c]
+        lines += ["", "<b>FS stores</b>"]
+        for code, c, name in STORES:
+            here = [r for r in fs if r["store"] == code]
             if here:
-                lines.append(f"{flag} {name}: " + ", ".join(
+                lines.append(f"{COUNTRY_NAMES[c]} {esc(name)}: " + ", ".join(
                     esc(r["display_name"] or r["name"]) for r in here))
     unset = q("SELECT DISTINCT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
-              "WHERE m.dept IN ('ONSITE','FS') AND a.status='active' AND a.country IS NULL")
+              "WHERE a.status='active' AND ((m.dept='ONSITE' AND a.country IS NULL) "
+              "OR (m.dept='FS' AND a.store IS NULL))")
     if unset:
-        lines += ["", "No country yet: " + ", ".join(esc(r["display_name"] or r["name"])
+        lines += ["", "No country or store yet: " + ", ".join(esc(r["display_name"] or r["name"])
                                                       for r in unset)]
     lines += ["", "Set someone's country: <code>/specialists @username</code>"]
     await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
@@ -293,9 +393,8 @@ async def tell(bot, user_id: int | None, text: str, kb=None) -> None:
 
 async def notify_booked(bot, appt_id: int) -> None:
     v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
-    who = display_name_of(v["created_by"], "SH")
     await tell(bot, v["specialist_id"],
-               visit_text(v, "📅 New on-site visit") + f"\n\nBooked by {who}.")
+               visit_text(v, "📅 New on-site visit") + f"\n\nBooked by {booker_name(v['created_by'])}.")
 
 
 def request_reschedule(appt_id: int, user_id: int, day: str, hhmm: str) -> tuple:
@@ -529,7 +628,7 @@ def visit_item(v, role: str) -> dict:
         "address": v["address"], "postal": v["postal"] or "", "product": v["product"] or "",
         "issue": v["issue"] or "", "order": v["order_no"] or "", "map": map_link(v),
         "specialist": display_name_of(v["specialist_id"], ""),
-        "bookedBy": display_name_of(v["created_by"], ""), "proposed": proposed,
+        "bookedBy": booker_name(v["created_by"]) if v["created_by"] else "", "proposed": proposed,
         "canChange": role == "booker" and v["status"] == "SCHEDULED",
     }
 
