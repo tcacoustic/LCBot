@@ -3284,12 +3284,15 @@ if (tg) { tg.ready(); tg.expand(); }
 let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 // The Online team's app: handover cases only, sorted into platform tabs.
 let ONLINE = false, ON_GROUP = '', ON_REGION = '', ON_EDIT = {};
+// On-Site visits: SH and FS book, the specialist sees their week.
+let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function navBar() {
-  if (ONLINE) return '';
+  if (ONLINE || VISITS_ONLY) return '';
   const items = [['home','🏠','Home'], ['week','📅','Week'],
                  ['me','🕐','Hours'], ['ho','📝','Handover']];
+  if (IS_ADMIN) items.push(['vis','📍','Visits']);
   if (IS_ADMIN) items.push(['team','👥','Team']);
   return '<div class="nav-bar">'
     + items.map(([v, i, t]) =>
@@ -3334,6 +3337,7 @@ async function loadHome() {
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
   if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
+  if (d.visits) { VISITS_ONLY = true; VIEW = 'vis'; return loadVisits(); }
   if (d.comingSoon) {
     app.innerHTML = `<h1>Hello</h1><div class="sub">${esc((d.teams || []).join(', ') || 'Your team')}</div>`
       + '<div class="note">Your team\u2019s screens are on the way. Until then, send /help to the bot to see what you can use.</div>';
@@ -3892,6 +3896,214 @@ function renderOnline(d) {
   });
 }
 
+function openLink(u) { if (tg && tg.openLink) tg.openLink(u); else window.open(u, '_blank'); }
+
+function visitCard(it, d) {
+  if (it.kind === 'block') {
+    let h = '<div class="case gone"><div class="nm">Not free ' + esc(it.start) + '–' + esc(it.end) + '</div>';
+    if (it.note) h += '<div class="meta">' + esc(it.note) + '</div>';
+    if (it.canRemove) h += '<div class="more" data-unblock="' + it.id + '">Remove this</div>';
+    return h + '</div>';
+  }
+  const done = it.status === 'COMPLETED';
+  let h = '<div class="case' + (done ? ' gone' : '') + '">';
+  h += '<div class="nm">' + esc(it.start) + '–' + esc(it.end) + ' · ' + esc(it.type) + '</div>';
+  h += '<div class="meta">' + esc(it.customer) + (it.postal ? ' · ' + esc(it.postal) : '')
+     + (d.role === 'booker' ? ' · ' + esc(it.specialist) : '') + '</div>';
+  if (it.status === 'ONSITE') h += '<div class="st">On-Site now</div>';
+  if (done) h += '<div class="st">Completed</div>';
+  if (it.proposed) h += '<div class="st">' + (d.role === 'booker'
+      ? 'Waiting for ' + esc(it.specialist || 'the specialist') + ' to accept: ' + esc(it.proposed)
+      : 'Asked to move to ' + esc(it.proposed) + '. Answer in your chat with the bot.') + '</div>';
+  if (VS.open[it.id]) {
+    let b = '';
+    if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+    if (it.email) b += 'Email: ' + esc(it.email) + '<br>';
+    b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '<br>';
+    if (it.product) b += 'Product: ' + esc(it.product) + '<br>';
+    if (it.issue) b += 'Issue: ' + esc(it.issue) + '<br>';
+    if (it.order) b += 'Order: ' + esc(it.order) + '<br>';
+    if (it.bookedBy) b += 'Booked by ' + esc(it.bookedBy);
+    h += '<div class="body" style="white-space:normal">' + b + '</div>';
+    h += '<div class="more" data-map="' + esc(it.map) + '">Open in Maps</div>';
+    if (it.canChange && VS.move[it.id]) {
+      h += '<div class="fld" style="margin-top:8px"><label>New date and time</label>'
+         + '<input type="date" id="mv_d_' + it.id + '"><input type="time" id="mv_t_' + it.id + '" style="margin-top:6px"></div>'
+         + '<div class="acts"><button data-mvsend="' + it.id + '">Ask the specialist</button>'
+         + '<button class="soft" data-mvback="' + it.id + '">Back</button></div>';
+    } else if (it.canChange && VS.cancel[it.id]) {
+      h += '<div class="addnote"><textarea id="cx_' + it.id + '" rows="2" placeholder="Why is it cancelled? (optional)"></textarea></div>'
+         + '<div class="acts"><button data-cxsend="' + it.id + '">Cancel the visit</button>'
+         + '<button class="soft" data-cxback="' + it.id + '">Keep it</button></div>';
+    } else if (it.canChange) {
+      h += '<div class="acts"><button class="soft" data-mv="' + it.id + '">Request a new time</button>'
+         + '<button class="soft" data-cx="' + it.id + '">Cancel</button></div>';
+    }
+    h += '<div class="more" data-vhide="' + it.id + '">Hide</div>';
+  } else {
+    h += '<div class="more" data-vshow="' + it.id + '">Details</div>';
+  }
+  return h + '</div>';
+}
+
+function bookForm(d) {
+  const f = VS.form;
+  const team = (d.countries.find(c => c.code === f.country) || {}).specialists || [];
+  let h = '<h1>Book a visit</h1>';
+  h += '<div class="fld"><label>Country</label><div class="pick">' + d.countries.map(c =>
+      '<button data-bf="country" data-v="' + c.code + '" class="' + (f.country === c.code ? 'on' : '') + '">' + esc(c.name) + '</button>').join('') + '</div></div>';
+  if (!team.length) {
+    h += '<div class="note">There is no On-Site Specialist in this country yet.</div>';
+  } else if (team.length > 1) {
+    h += '<div class="fld"><label>Specialist</label><div class="pick">' + team.map(s =>
+        '<button data-bf="spec" data-v="' + s.id + '" class="' + (String(f.spec) === String(s.id) ? 'on' : '') + '">' + esc(s.name) + '</button>').join('') + '</div></div>';
+  } else {
+    h += '<div class="note" style="margin-top:0">Specialist: ' + esc(team[0].name) + '</div>';
+  }
+  h += '<div class="fld"><label>Visit type</label><div class="pick">' + d.types.map(t =>
+      '<button data-bf="visit_type" data-v="' + t.key + '" class="' + (f.visit_type === t.key ? 'on' : '') + '">' + esc(t.name) + '</button>').join('') + '</div></div>';
+  h += '<div class="fld"><label>Date and time (local time there)</label><input type="date" id="bf_date" value="' + esc(f.date || '') + '">'
+     + '<input type="time" id="bf_time" value="' + esc(f.time || '') + '" style="margin-top:6px"></div>';
+  h += '<div class="fld"><label>How long</label><div class="pick">' + d.durations.map(m =>
+      '<button data-bf="duration_min" data-v="' + m + '" class="' + (String(f.duration_min) === String(m) ? 'on' : '') + '">' + (m / 60) + 'h</button>').join('') + '</div></div>';
+  const fields = [['customer_name', 'Customer name'], ['phone', 'Phone'], ['email', 'Email (optional)'],
+    ['address', 'Address'], ['postal', 'Postal code'], ['product', 'Product'],
+    ['issue', 'Issue or what to set up'], ['order_no', 'Order number (optional)']];
+  for (const [k, label] of fields) {
+    h += '<div class="fld"><label>' + esc(label) + '</label>' + (k === 'issue'
+      ? '<textarea id="bf_' + k + '" rows="2">' + esc(f[k] || '') + '</textarea>'
+      : '<input id="bf_' + k + '" value="' + esc(f[k] || '') + '">') + '</div>';
+  }
+  h += '<button class="big" id="bfSave">Book the visit</button>';
+  h += '<button class="big" id="bfCancel" style="margin-top:8px;background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111)">Back</button>';
+  return h;
+}
+
+function keepBookForm() {
+  if (!VS.form) return;
+  for (const k of ['date', 'time', 'customer_name', 'phone', 'email', 'address', 'postal', 'product', 'issue', 'order_no']) {
+    const el = document.getElementById('bf_' + k);
+    if (el) VS.form[k] = el.value;
+  }
+}
+
+async function loadVisits() {
+  const app = document.getElementById('app');
+  const qs = new URLSearchParams({ week: VS.week, country: VS.country, spec: VS.spec });
+  const d = await getJSON('/api/visits?' + qs.toString());
+  VS.country = d.country; VS.spec = String(d.specId || ''); VS.week = d.weekStart;
+  if (VS.form) {
+    app.innerHTML = bookForm(d) + navBar();
+    wireVisits(d);
+    return;
+  }
+  let h = '<h1>' + (d.role === 'booker' ? 'On-Site visits' : 'My visits') + '</h1>';
+  if (d.role === 'booker') {
+    h += '<div class="otabs">' + d.countries.map(c =>
+        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + esc(c.name) + '</button>').join('') + '</div>';
+    const team = d.countries.find(c => c.code === d.country).specialists;
+    if (team.length > 1) {
+      h += '<div class="otabs small">' + team.map(s =>
+          '<button data-vsp="' + s.id + '" class="' + (VS.spec === String(s.id) ? 'on' : '') + '">' + esc(s.name) + '</button>').join('') + '</div>';
+    } else if (!team.length) {
+      h += '<div class="note">No On-Site Specialist in this country yet.</div>';
+    }
+    h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+  Book a visit</button>';
+  } else if (VS.block) {
+    h += '<h2>Block out time</h2><div class="fld"><label>Date</label><input type="date" id="bk_date"></div>'
+       + '<div class="fld"><label>From and to</label><input type="time" id="bk_start"><input type="time" id="bk_end" style="margin-top:6px"></div>'
+       + '<div class="fld"><label>Note (optional)</label><input id="bk_note" placeholder="e.g. class, another job"></div>'
+       + '<div class="acts"><button id="bkSave">Block it</button><button class="soft" id="bkBack">Back</button></div>';
+  } else {
+    h += '<button class="big" id="bkNew" style="margin:6px 0 4px">Block out time I am not free</button>';
+  }
+  h += '<div class="otabs small"><button data-vw="' + d.prev + '">◀ Prev</button>'
+     + '<button class="on">' + esc(d.weekLabel) + '</button>'
+     + '<button data-vw="' + d.next + '">Next ▶</button></div>';
+  for (const day of d.days) {
+    h += '<h2>' + esc(day.label) + (day.today ? ' · today' : '') + '</h2>';
+    if (!day.items.length) { h += '<div class="note" style="margin-top:0">Free</div>'; continue; }
+    for (const it of day.items) h += visitCard(it, d);
+  }
+  app.innerHTML = h + navBar();
+  wireVisits(d);
+}
+
+function wireVisits(d) {
+  wire();
+  const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
+  on('[data-vc]', el => { VS.country = el.dataset.vc; VS.spec = ''; loadVisits(); });
+  on('[data-vsp]', el => { VS.spec = el.dataset.vsp; loadVisits(); });
+  on('[data-vw]', el => { VS.week = el.dataset.vw; loadVisits(); });
+  on('[data-vshow]', el => { VS.open[el.dataset.vshow] = true; loadVisits(); });
+  on('[data-vhide]', el => { delete VS.open[el.dataset.vhide]; loadVisits(); });
+  on('[data-map]', el => openLink(el.dataset.map));
+  on('[data-mv]', el => { VS.move[el.dataset.mv] = true; loadVisits(); });
+  on('[data-mvback]', el => { delete VS.move[el.dataset.mvback]; loadVisits(); });
+  on('[data-cx]', el => { VS.cancel[el.dataset.cx] = true; loadVisits(); });
+  on('[data-cxback]', el => { delete VS.cancel[el.dataset.cxback]; loadVisits(); });
+  on('[data-mvsend]', async el => {
+    const id = el.dataset.mvsend;
+    const date = document.getElementById('mv_d_' + id).value, time = document.getElementById('mv_t_' + id).value;
+    if (!date || !time) { toast('Pick the new date and time.'); return; }
+    el.disabled = true;
+    const out = await post('/api/visit/reschedule', { id: Number(id), date, time });
+    el.disabled = false;
+    if (!out.ok) { toast(out.error || 'Could not ask for that.'); return; }
+    delete VS.move[id]; toast('Sent to the specialist to accept'); loadVisits();
+  });
+  on('[data-cxsend]', async el => {
+    const id = el.dataset.cxsend;
+    el.disabled = true;
+    const out = await post('/api/visit/cancel', { id: Number(id), reason: document.getElementById('cx_' + id).value });
+    el.disabled = false;
+    if (!out.ok) { toast(out.error || 'Could not cancel that.'); return; }
+    delete VS.cancel[id]; toast('Cancelled. The specialist has been told.'); loadVisits();
+  });
+  on('[data-unblock]', async el => {
+    const out = await post('/api/block/remove', { id: Number(el.dataset.unblock) });
+    if (!out.ok) { toast(out.error || 'Could not remove that.'); return; }
+    toast('Removed'); loadVisits();
+  });
+  const bk = document.getElementById('bkNew');
+  if (bk) bk.onclick = () => { VS.block = true; loadVisits(); };
+  const bkb = document.getElementById('bkBack');
+  if (bkb) bkb.onclick = () => { VS.block = null; loadVisits(); };
+  const bks = document.getElementById('bkSave');
+  if (bks) bks.onclick = async () => {
+    const val = k => document.getElementById('bk_' + k).value;
+    if (!val('date') || !val('start') || !val('end')) { toast('Pick the date and both times.'); return; }
+    bks.disabled = true;
+    const out = await post('/api/block', { date: val('date'), start: val('start'), end: val('end'), note: val('note') });
+    bks.disabled = false;
+    if (!out.ok) { toast(out.error || 'Could not block that.'); return; }
+    VS.block = null; toast('Blocked out'); loadVisits();
+  };
+  const bn = document.getElementById('bookNew');
+  if (bn) bn.onclick = () => { VS.form = { country: d.country, spec: VS.spec, visit_type: 'SETUP', duration_min: 120, date: '', time: '' }; loadVisits(); };
+  on('[data-bf]', el => {
+    keepBookForm();
+    VS.form[el.dataset.bf] = el.dataset.v;
+    if (el.dataset.bf === 'country') { VS.form.spec = ''; VS.country = el.dataset.v; VS.spec = ''; }
+    if (el.dataset.bf === 'spec') VS.spec = el.dataset.v;
+    loadVisits();
+  });
+  const bc = document.getElementById('bfCancel');
+  if (bc) bc.onclick = () => { VS.form = null; loadVisits(); };
+  const bs = document.getElementById('bfSave');
+  if (bs) bs.onclick = async () => {
+    keepBookForm();
+    const team = (d.countries.find(c => c.code === VS.form.country) || {}).specialists || [];
+    const body = Object.assign({}, VS.form, { specialist_id: VS.form.spec || (team.length === 1 ? team[0].id : '') });
+    bs.disabled = true; bs.textContent = 'Booking…';
+    const out = await post('/api/visit', body);
+    bs.disabled = false; bs.textContent = 'Book the visit';
+    if (!out.ok) { toast(out.error || 'Could not book that.'); return; }
+    const when = VS.form.date;
+    VS.form = null; VS.week = when; toast('Booked. The specialist has been told.'); loadVisits();
+  };
+}
+
 async function loadWeek() {
   const app = document.getElementById('app');
   const r = await fetch('/api/week?which=' + WHICH,
@@ -4168,6 +4380,11 @@ async function render() {
   if (VIEW === 'ho') {
     try { await loadHandover(); }
     catch (e) { showFatal('The handover would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'vis') {
+    try { await loadVisits(); }
+    catch (e) { showFatal('Visits would not load', e.message || e); }
     return;
   }
   if (VIEW === 'team') {

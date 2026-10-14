@@ -394,3 +394,86 @@ def add_block(user_id: int, country: str, day: str, start_hhmm: str, end_hhmm: s
 def remove_block(user_id: int, block_id: int) -> bool:
     return run("DELETE FROM specialist_blocks WHERE id=? AND user_id=?",
                (block_id, user_id)).rowcount > 0
+
+
+# --------------------------------------------------------------------------
+# The App: a week of visits and blocked times, for bookers and specialists
+# --------------------------------------------------------------------------
+
+def visit_role(user_id: int) -> str:
+    """'booker' (SH, FS, admins), 'specialist', or '' (no On-Site screens)."""
+    if may_book(user_id):
+        return "booker"
+    return "specialist" if is_specialist(user_id) else ""
+
+
+def visit_item(v, role: str) -> dict:
+    s, e = span_of(v)
+    proposed = ""
+    if v["proposed_starts_at"]:
+        proposed = datetime.fromisoformat(v["proposed_starts_at"]).strftime("%a %-d %b, %H:%M")
+    return {
+        "kind": "visit", "id": v["id"], "start": s.strftime("%H:%M"), "end": e.strftime("%H:%M"),
+        "type": VISIT_NAMES[v["visit_type"]], "status": v["status"],
+        "customer": v["customer_name"], "phone": v["phone"] or "", "email": v["email"] or "",
+        "address": v["address"], "postal": v["postal"] or "", "product": v["product"] or "",
+        "issue": v["issue"] or "", "order": v["order_no"] or "", "map": map_link(v),
+        "specialist": display_name_of(v["specialist_id"], ""),
+        "bookedBy": display_name_of(v["created_by"], ""), "proposed": proposed,
+        "canChange": role == "booker" and v["status"] == "SCHEDULED",
+    }
+
+
+def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = "") -> dict:
+    role = visit_role(user_id)
+    countries = [{"code": c, "name": COUNTRY_NAMES[c],
+                  "specialists": [{"id": r["user_id"], "name": r["display_name"] or r["name"]}
+                                  for r in specialists_in(c)]} for c, _, _, _ in COUNTRIES]
+    if role == "specialist":
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        country = (me["country"] if me else "") or "SG"
+        spec_id = user_id
+    else:
+        country = country if country in COUNTRY_NAMES else "SG"
+        team = next(c["specialists"] for c in countries if c["code"] == country)
+        try:
+            spec_id = int(spec)
+        except (TypeError, ValueError):
+            spec_id = 0
+        if spec_id not in {s["id"] for s in team}:
+            spec_id = team[0]["id"] if team else 0
+    tz = COUNTRY_TZ[country]
+    today = datetime.now(tz).date()
+    try:
+        first = date.fromisoformat(week)
+    except (TypeError, ValueError):
+        first = today
+    first = first - timedelta(days=first.weekday())
+    days = [{"date": (first + timedelta(days=i)).isoformat(),
+             "label": (first + timedelta(days=i)).strftime("%a %-d %b"),
+             "today": first + timedelta(days=i) == today, "items": []} for i in range(7)]
+    by_day = {d["date"]: d for d in days}
+    if spec_id:
+        for v in q("SELECT * FROM appointments WHERE specialist_id=? AND status<>'CANCELLED'",
+                   (spec_id,)):
+            key = datetime.fromisoformat(v["starts_at"]).astimezone(tz).date().isoformat()
+            if key in by_day:
+                by_day[key]["items"].append(visit_item(v, role))
+        for b in q("SELECT * FROM specialist_blocks WHERE user_id=?", (spec_id,)):
+            s = datetime.fromisoformat(b["starts_at"]).astimezone(tz)
+            e = datetime.fromisoformat(b["ends_at"]).astimezone(tz)
+            if s.date().isoformat() in by_day:
+                by_day[s.date().isoformat()]["items"].append({
+                    "kind": "block", "id": b["id"], "start": s.strftime("%H:%M"),
+                    "end": e.strftime("%H:%M"), "note": b["note"] or "",
+                    "canRemove": role == "specialist"})
+    for d in days:
+        d["items"].sort(key=lambda it: it["start"])
+    return {
+        "role": role, "countries": countries, "country": country, "specId": spec_id,
+        "types": [{"key": k, "name": n} for k, n in VISIT_TYPES], "durations": DURATIONS,
+        "weekStart": first.isoformat(), "prev": (first - timedelta(days=7)).isoformat(),
+        "next": (first + timedelta(days=7)).isoformat(),
+        "weekLabel": f"{first.strftime('%-d %b')} – {(first + timedelta(days=6)).strftime('%-d %b')}",
+        "today": today.isoformat(), "days": days,
+    }
