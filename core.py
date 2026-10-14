@@ -3916,7 +3916,7 @@ function openLink(u) { if (tg && tg.openLink) tg.openLink(u); else window.open(u
 function visitCard(it, d) {
   const done = it.status === 'COMPLETED';
   let h = '<div class="case' + (done ? ' gone' : '') + '">';
-  h += '<div class="nm">' + esc(it.start) + '–' + esc(it.end) + ' · ' + esc(it.type) + '</div>';
+  h += '<div class="nm">' + esc(it.start) + ' · ' + esc(it.type) + '</div>';
   h += '<div class="meta">' + esc(it.customer) + (it.postal ? ' · ' + esc(it.postal) : '')
      + (d.role === 'booker' ? ' · ' + esc(it.specialist) : '') + '</div>';
   if (it.status === 'ONSITE') h += '<div class="st">On-Site now</div>';
@@ -3971,11 +3971,9 @@ function bookForm(d) {
   }
   h += '<div class="fld"><label>Visit type</label><div class="pick">' + d.types.map(t =>
       '<button data-bf="visit_type" data-v="' + t.key + '" class="' + (f.visit_type === t.key ? 'on' : '') + '">' + esc(t.name) + '</button>').join('') + '</div></div>';
-  h += '<div class="fld"><label>Date and time (local time there)</label><input type="date" id="bf_date" value="' + esc(f.date || '') + '">'
+  h += '<div class="fld"><label>Date and start time (local time there)</label><input type="date" id="bf_date" value="' + esc(f.date || '') + '">'
      + '<input type="time" id="bf_time" value="' + esc(f.time || '') + '" style="margin-top:6px">'
      + '<div class="note" id="bf_free" style="margin-top:6px">' + (f.date ? 'Checking that day…' : 'Pick a date to see when the specialist is available.') + '</div></div>';
-  h += '<div class="fld"><label>How long</label><div class="pick">' + d.durations.map(m =>
-      '<button data-bf="duration_min" data-v="' + m + '" class="' + (String(f.duration_min) === String(m) ? 'on' : '') + '">' + (m / 60) + 'h</button>').join('') + '</div></div>';
   const fields = [['customer_name', 'Customer name'], ['phone', 'Phone'], ['email', 'Email (optional)'],
     ['address', 'Address'], ['postal', 'Postal code'], ['product', 'Product'],
     ['issue', 'Issue or what to set up'], ['order_no', 'Order number (optional)']];
@@ -4093,7 +4091,7 @@ function wireVisits(d) {
     };
   });
   const bn = document.getElementById('bookNew');
-  if (bn) bn.onclick = () => { VS.form = { country: d.country, spec: VS.spec, visit_type: 'SETUP', duration_min: 120, date: '', time: '' }; loadVisits(); };
+  if (bn) bn.onclick = () => { VS.form = { country: d.country, spec: VS.spec, visit_type: 'SETUP', date: '', time: '' }; loadVisits(); };
   on('[data-bf]', el => {
     keepBookForm();
     VS.form[el.dataset.bf] = el.dataset.v;

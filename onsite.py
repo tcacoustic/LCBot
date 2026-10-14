@@ -23,7 +23,9 @@ COUNTRY_TZ = {c: ZoneInfo(tz) for c, _, _, tz in COUNTRIES}
 
 VISIT_TYPES = [("SETUP", "Set up"), ("TROUBLESHOOT", "Troubleshoot"), ("SURVEY", "Survey")]
 VISIT_NAMES = dict(VISIT_TYPES)
-DURATIONS = [60, 90, 120]                 # minutes the booker can pick
+# Bookers only pick a start time: a visit takes 1 to 2 hours and only the
+# specialist knows, so 2 hours are kept free after it for clash checks.
+RESERVE_MIN = 120
 LIVE_STATUSES = ("SCHEDULED", "ONSITE")   # visits that take up the specialist's time
 
 # What a visit costs, by country: first hour, each started hour after, currency.
@@ -148,7 +150,7 @@ def span_of(v) -> tuple:
 
 def when_text(v) -> str:
     start, end = span_of(v)
-    return f"{start.strftime('%a %-d %b, %H:%M')}–{end.strftime('%H:%M')}"
+    return start.strftime('%a %-d %b, %H:%M')
 
 
 def clash_phrase(busy: str) -> str:
@@ -194,12 +196,7 @@ def create_visit(user_id: int, f: dict) -> tuple:
     vtype = str(f.get("visit_type", "")).upper()
     if vtype not in VISIT_NAMES:
         return None, "Pick the visit type."
-    try:
-        duration = int(f.get("duration_min") or 120)
-    except (TypeError, ValueError):
-        duration = 120
-    if duration not in DURATIONS:
-        return None, "Pick how long it takes."
+    duration = RESERVE_MIN
     team = specialists_in(country)
     if not team:
         return None, f"There's no On-Site Specialist in {COUNTRY_NAMES[country]} yet."
@@ -571,7 +568,7 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
     return {
         "availability": availability, "availPrev": a_prev, "availNext": a_next,
         "role": role, "countries": countries, "country": country, "specId": spec_id,
-        "types": [{"key": k, "name": n} for k, n in VISIT_TYPES], "durations": DURATIONS,
+        "types": [{"key": k, "name": n} for k, n in VISIT_TYPES],
         "weekStart": first.isoformat(), "prev": (first - timedelta(days=7)).isoformat(),
         "next": (first + timedelta(days=7)).isoformat(),
         "weekLabel": f"{first.strftime('%-d %b')} – {(first + timedelta(days=6)).strftime('%-d %b')}",
