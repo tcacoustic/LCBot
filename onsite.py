@@ -382,6 +382,43 @@ async def notify_cancelled(bot, appt_id: int, reason: str = "") -> None:
 DAY_PARTS = {"AM": ("10:00", "14:00"), "PM": ("14:00", "18:00"), "FD": ("00:00", "23:59")}
 PART_NAMES = {"AM": "Not free AM", "PM": "Not free PM", "FD": "Not free all day"}
 AVAIL_DAYS = 5
+WORK_DAY = ("10:00", "18:00")    # the hours availability is shown for
+AVAIL_TEXT = {"": "Available 10am–6pm", "AM": "Available 2pm–6pm",
+              "PM": "Available 10am–2pm", "FD": "Not available"}
+
+
+def hm(t: datetime) -> str:
+    """10am, 12:30pm."""
+    h = t.hour % 12 or 12
+    return f"{h}{'' if t.minute == 0 else f':{t.minute:02d}'}{'am' if t.hour < 12 else 'pm'}"
+
+
+def free_windows(spec_id: int, country: str, day: str) -> list:
+    """The open stretches of the working day: blocked times and booked visits
+    taken off. Gaps under 30 minutes don't count."""
+    ws, we = local_start(country, day, WORK_DAY[0]), local_start(country, day, WORK_DAY[1])
+    busy = []
+    marks = ",".join("?" * len(LIVE_STATUSES))
+    for v in q(f"SELECT * FROM appointments WHERE specialist_id=? AND status IN ({marks})",
+               (spec_id, *LIVE_STATUSES)):
+        busy.append(span_of(v))
+    for b in q("SELECT * FROM specialist_blocks WHERE user_id=?", (spec_id,)):
+        busy.append((datetime.fromisoformat(b["starts_at"]), datetime.fromisoformat(b["ends_at"])))
+    busy = sorted((max(s, ws), min(e, we)) for s, e in busy if s < we and ws < e)
+    out, cursor = [], ws
+    for s, e in busy:
+        if s > cursor:
+            out.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < we:
+        out.append((cursor, we))
+    return [(s, e) for s, e in out if (e - s) >= timedelta(minutes=30)]
+
+
+def free_text(windows: list) -> str:
+    if not windows:
+        return "Not available"
+    return "Available " + ", ".join(f"{hm(s)}–{hm(e)}" for s, e in windows)
 
 
 def day_part(user_id: int, country: str, day: str) -> str:
@@ -514,15 +551,8 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
             key = datetime.fromisoformat(v["starts_at"]).astimezone(tz).date().isoformat()
             if key in by_day:
                 by_day[key]["items"].append(visit_item(v, role))
-        for b in q("SELECT * FROM specialist_blocks WHERE user_id=?", (spec_id,)):
-            s = datetime.fromisoformat(b["starts_at"]).astimezone(tz)
-            e = datetime.fromisoformat(b["ends_at"]).astimezone(tz)
-            if s.date().isoformat() in by_day:
-                by_day[s.date().isoformat()]["items"].append({
-                    "kind": "block", "id": b["id"], "start": s.strftime("%H:%M"),
-                    "end": e.strftime("%H:%M"), "note": b["note"] or "",
-                    "part": PART_NAMES.get(b["part"] or "", ""),
-                    "canRemove": role == "specialist" and not b["part"]})
+        for d in days:
+            d["free"] = free_text(free_windows(spec_id, country, d["date"]))
     for d in days:
         d["items"].sort(key=lambda it: it["start"])
     availability, a_prev, a_next = [], "", ""
@@ -533,8 +563,9 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
             a0 = today
         for i in range(AVAIL_DAYS):
             d = a0 + timedelta(days=i)
+            part = day_part(user_id, country, d.isoformat())
             availability.append({"date": d.isoformat(), "label": d.strftime("%a %-d %b"),
-                                 "part": day_part(user_id, country, d.isoformat())})
+                                 "part": part, "text": AVAIL_TEXT[part]})
         a_prev = max(today, a0 - timedelta(days=AVAIL_DAYS)).isoformat() if a0 > today else ""
         a_next = (a0 + timedelta(days=AVAIL_DAYS)).isoformat()
     return {

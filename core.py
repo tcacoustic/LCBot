@@ -3916,12 +3916,6 @@ function renderOnline(d) {
 function openLink(u) { if (tg && tg.openLink) tg.openLink(u); else window.open(u, '_blank'); }
 
 function visitCard(it, d) {
-  if (it.kind === 'block') {
-    let h = '<div class="case gone"><div class="nm">' + (it.part ? esc(it.part) : 'Not free ' + esc(it.start) + '–' + esc(it.end)) + '</div>';
-    if (it.note) h += '<div class="meta">' + esc(it.note) + '</div>';
-    if (it.canRemove) h += '<div class="more" data-unblock="' + it.id + '">Remove this</div>';
-    return h + '</div>';
-  }
   const done = it.status === 'COMPLETED';
   let h = '<div class="case' + (done ? ' gone' : '') + '">';
   h += '<div class="nm">' + esc(it.start) + '–' + esc(it.end) + ' · ' + esc(it.type) + '</div>';
@@ -3980,7 +3974,8 @@ function bookForm(d) {
   h += '<div class="fld"><label>Visit type</label><div class="pick">' + d.types.map(t =>
       '<button data-bf="visit_type" data-v="' + t.key + '" class="' + (f.visit_type === t.key ? 'on' : '') + '">' + esc(t.name) + '</button>').join('') + '</div></div>';
   h += '<div class="fld"><label>Date and time (local time there)</label><input type="date" id="bf_date" value="' + esc(f.date || '') + '">'
-     + '<input type="time" id="bf_time" value="' + esc(f.time || '') + '" style="margin-top:6px"></div>';
+     + '<input type="time" id="bf_time" value="' + esc(f.time || '') + '" style="margin-top:6px">'
+     + '<div class="note" id="bf_free" style="margin-top:6px">' + (f.date ? 'Checking that day…' : 'Pick a date to see when the specialist is available.') + '</div></div>';
   h += '<div class="fld"><label>How long</label><div class="pick">' + d.durations.map(m =>
       '<button data-bf="duration_min" data-v="' + m + '" class="' + (String(f.duration_min) === String(m) ? 'on' : '') + '">' + (m / 60) + 'h</button>').join('') + '</div></div>';
   const fields = [['customer_name', 'Customer name'], ['phone', 'Phone'], ['email', 'Email (optional)'],
@@ -4030,10 +4025,9 @@ async function loadVisits() {
     h += '<h2>My availability</h2>'
        + '<div class="note" style="margin-top:0">Tap a day. AM = not free 10am–2pm, '
        + 'PM = not free 2pm–6pm, FD = not free all day.</div>';
-    const partName = { AM: 'Not free AM', PM: 'Not free PM', FD: 'Not free all day' };
     for (const day of d.availability) {
       h += '<div class="case' + (day.part ? ' gone' : '') + '" data-aday="' + day.date + '" style="cursor:pointer">'
-         + '<div class="nm">' + esc(day.label) + ' · ' + (day.part ? esc(partName[day.part]) : 'Free') + '</div>';
+         + '<div class="nm">' + esc(day.label) + ' · ' + esc(day.text) + '</div>';
       if (VS.day === day.date) {
         h += '<div class="otabs small" style="margin-bottom:0">' + ['AM', 'PM', 'FD'].map(k =>
             '<button data-apart="' + k + '" data-adate="' + day.date + '" class="' + (day.part === k ? 'on' : '') + '">' + k + '</button>').join('')
@@ -4050,7 +4044,7 @@ async function loadVisits() {
      + '<button data-vw="' + d.next + '">Next ▶</button></div>';
   for (const day of d.days) {
     h += '<h2>' + esc(day.label) + (day.today ? ' · today' : '') + '</h2>';
-    if (!day.items.length) { h += '<div class="note" style="margin-top:0">Free</div>'; continue; }
+    if (day.free) h += '<div class="note" style="margin-top:0">' + esc(day.free) + '</div>';
     for (const it of day.items) h += visitCard(it, d);
   }
   app.innerHTML = h + navBar();
@@ -4088,11 +4082,6 @@ function wireVisits(d) {
     if (!out.ok) { toast(out.error || 'Could not cancel that.'); return; }
     delete VS.cancel[id]; toast('Cancelled. The specialist has been told.'); loadVisits();
   });
-  on('[data-unblock]', async el => {
-    const out = await post('/api/block/remove', { id: Number(el.dataset.unblock) });
-    if (!out.ok) { toast(out.error || 'Could not remove that.'); return; }
-    toast('Removed'); loadVisits();
-  });
   on('[data-aday]', el => { VS.day = VS.day === el.dataset.aday ? '' : el.dataset.aday; loadVisits(); });
   on('[data-av]', el => { VS.avail = el.dataset.av; VS.day = ''; loadVisits(); });
   document.querySelectorAll('[data-apart]').forEach(el => {
@@ -4114,6 +4103,16 @@ function wireVisits(d) {
     if (el.dataset.bf === 'spec') VS.spec = el.dataset.v;
     loadVisits();
   });
+  const showFree = async () => {
+    const box = document.getElementById('bf_free'), date = (document.getElementById('bf_date') || {}).value;
+    if (!box || !date) return;
+    const qs = new URLSearchParams({ week: date, country: VS.form.country, spec: VS.spec });
+    const wk = await getJSON('/api/visits?' + qs.toString());
+    const day = (wk.days || []).find(x => x.date === date);
+    box.textContent = day ? 'On ' + day.label + ': ' + (day.free || 'no specialist yet') : '';
+  };
+  const bd = document.getElementById('bf_date');
+  if (bd) { bd.onchange = () => { keepBookForm(); showFree(); }; if (bd.value) showFree(); }
   const bc = document.getElementById('bfCancel');
   if (bc) bc.onclick = () => { VS.form = null; loadVisits(); };
   const bs = document.getElementById('bfSave');
