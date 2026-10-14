@@ -477,3 +477,349 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
         "weekLabel": f"{first.strftime('%-d %b')} – {(first + timedelta(days=6)).strftime('%-d %b')}",
         "today": today.isoformat(), "days": days,
     }
+
+
+# --------------------------------------------------------------------------
+# The specialist's day in the bot: /visits, Arrived, Leave, payment, report
+# --------------------------------------------------------------------------
+
+OUTCOMES = [("RESOLVED", "✅ Resolved"), ("RETURN", "🔁 Needs a return visit"),
+            ("REPLACE", "📦 Needs a replacement unit")]
+OUTCOME_NAMES = dict(OUTCOMES)
+PAY_METHODS = [("CASH", "Cash"), ("PAYNOW", "PayNow"), ("OTHER", "Other")]
+CURRENCY = {"SG": "SGD", "MY": "MYR", "HK": "HKD", "TH": "THB"}
+VISIT_AMOUNT = 280
+# The customer sign-off form the specialist fills in on site (Zoho).
+VISIT_FORM_URL = (os.environ.get("ONSITE_FORM_URL", "").strip() or
+                  "https://forms.zohopublic.com/tatchuanacoustic/form/test/formperma/"
+                  "iNsu3uIgPk9pCmF7VejBqy1sgbvkZisp4s3IqxD4hcM")
+
+
+def mins_text(minutes: int) -> str:
+    h, m = divmod(max(0, minutes), 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def visit_minutes(v) -> int:
+    if not v["arrived_at"]:
+        return 0
+    end = datetime.fromisoformat(v["left_at"]) if v["left_at"] else now()
+    return int((end - datetime.fromisoformat(v["arrived_at"])).total_seconds() // 60)
+
+
+def visit_buttons(v, user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    mine = v["specialist_id"] == user_id
+    if mine and v["status"] == "SCHEDULED":
+        rows.append([InlineKeyboardButton("📍 Arrived", callback_data=f"vz:ar:{v['id']}")])
+    if mine and v["status"] == "ONSITE":
+        rows.append([InlineKeyboardButton("📝 Open the visit form", url=VISIT_FORM_URL)])
+        rows.append([InlineKeyboardButton("🏁 Leave", callback_data=f"vz:lv:{v['id']}")])
+    if (v["status"] == "COMPLETED" and v["outcome"] in ("RETURN", "REPLACE")
+            and not v["followup_done"] and may_book(user_id)):
+        rows.append([InlineKeyboardButton("✅ Follow-up done", callback_data=f"vz:fd:{v['id']}")])
+    rows.append([InlineKeyboardButton("◀️ All visits", callback_data="vz:lst")])
+    return InlineKeyboardMarkup(rows)
+
+
+def visit_detail(v) -> str:
+    text = visit_text(v)
+    if v["status"] == "ONSITE":
+        text += f"\n\n📍 On-Site since {datetime.fromisoformat(v['arrived_at']).strftime('%H:%M')}"
+    if v["status"] == "COMPLETED":
+        text += "\n\n" + report_lines(v)
+    return text
+
+
+def report_lines(v) -> str:
+    lines = [OUTCOME_NAMES.get(v["outcome"], "Completed")]
+    if v["arrived_at"] and v["left_at"]:
+        a = datetime.fromisoformat(v["arrived_at"]).strftime("%H:%M")
+        b = datetime.fromisoformat(v["left_at"]).strftime("%H:%M")
+        lines.append(f"Arrived {a} · Left {b} ({mins_text(visit_minutes(v))})")
+    if v["outcome"] == "RESOLVED":
+        lines.append(f"Paid: {money_text(v['amount_cents'], v['currency'])} by "
+                     f"{dict(PAY_METHODS).get(v['pay_method'], v['pay_method'])}"
+                     if v["amount_cents"] else "No charge")
+    elif v["followup_done"]:
+        lines.append("Follow-up: done")
+    else:
+        need = "the return visit" if v["outcome"] == "RETURN" else "the replacement unit"
+        lines.append(f"Follow-up for SH: arrange {need}.")
+    lines.append(f"Specialist: {display_name_of(v['specialist_id'], '')}")
+    return "\n".join(lines)
+
+
+def visits_list(user_id: int) -> tuple:
+    """The specialist's visits from today on; for bookers, everyone's, plus
+    open follow-ups."""
+    rows = []
+    if is_specialist(user_id) and not may_book(user_id):
+        found = q("SELECT * FROM appointments WHERE specialist_id=? AND status IN "
+                  "('SCHEDULED','ONSITE') ORDER BY starts_at", (user_id,))
+        title = "📍 My visits"
+    else:
+        found = q("SELECT * FROM appointments WHERE status IN ('SCHEDULED','ONSITE') "
+                  "ORDER BY starts_at")
+        title = "📍 On-Site visits"
+        follow = q("SELECT * FROM appointments WHERE status='COMPLETED' AND "
+                   "outcome IN ('RETURN','REPLACE') AND followup_done=0 ORDER BY left_at")
+        for v in follow:
+            rows.append([InlineKeyboardButton(
+                f"⚠️ Follow-up · {v['customer_name']} · {OUTCOME_NAMES[v['outcome']][2:]}"[:60],
+                callback_data=f"vz:v:{v['id']}")])
+    for v in found[:40]:
+        s = datetime.fromisoformat(v["starts_at"])
+        mark = "📍 " if v["status"] == "ONSITE" else ""
+        rows.append([InlineKeyboardButton(
+            f"{mark}{s.strftime('%a %-d %b %H:%M')} · {v['customer_name']}"[:60],
+            callback_data=f"vz:v:{v['id']}")])
+    if not rows:
+        return f"{title}\n\nNothing coming up.", None
+    return (f"{title}\n\nTap one for the details." +
+            ("\nBook or move visits in the App." if may_book(user_id) else "")), InlineKeyboardMarkup(rows)
+
+
+async def cmd_visits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if not visit_role(uid):
+        return
+    text, kb = visits_list(uid)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def edit_or_send(query, text: str, kb=None) -> None:
+    try:
+        await query.edit_message_text(text, reply_markup=kb, disable_web_page_preview=True)
+    except BadRequest:
+        pass
+
+
+async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vz:lst · vz:v view · vz:ar arrived · vz:sk skip location · vz:lv leave ·
+    vz:oc outcome · vz:ok suggested amount · vz:nc no charge · vz:pm method ·
+    vz:fd follow-up done."""
+    query = update.callback_query
+    uid = query.from_user.id
+    parts = query.data.split(":")
+    action = parts[1]
+    if action == "lst":
+        await query.answer()
+        text, kb = visits_list(uid)
+        await edit_or_send(query, text, kb)
+        return
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(parts[2]),))
+    if not v or not visit_role(uid):
+        await query.answer("That visit is gone.", show_alert=True)
+        return
+    mine = v["specialist_id"] == uid
+    if action == "v":
+        await query.answer()
+        await edit_or_send(query, visit_detail(v), visit_buttons(v, uid))
+        return
+    if action == "fd":
+        if not may_book(uid):
+            await query.answer("For SH, FS and admins.", show_alert=True)
+            return
+        async with write_lock:
+            run("UPDATE appointments SET followup_done=1 WHERE id=?", (v["id"],))
+            log_visit(v["id"], uid, "follow-up done")
+        await query.answer("Marked done ✓")
+        v = q1("SELECT * FROM appointments WHERE id=?", (v["id"],))
+        await edit_or_send(query, visit_detail(v), visit_buttons(v, uid))
+        return
+    if not mine:
+        await query.answer("That's another specialist's visit.", show_alert=True)
+        return
+
+    if action == "ar" and v["status"] == "SCHEDULED":
+        async with write_lock:
+            run("UPDATE appointments SET status='ONSITE', arrived_at=? WHERE id=?",
+                (now().isoformat(), v["id"]))
+            log_visit(v["id"], uid, "arrived")
+        await query.answer("Arrived ✓")
+        context.user_data["arriving"] = v["id"]
+        v = q1("SELECT * FROM appointments WHERE id=?", (v["id"],))
+        await edit_or_send(query, "✅ Arrived. Please check the customer's details:\n\n"
+                           + visit_detail(v), visit_buttons(v, uid))
+        await context.bot.send_message(
+            uid, "Share your location for the visit record?",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("📍 Share my location", request_location=True)]],
+                resize_keyboard=True, one_time_keyboard=True))
+        await context.bot.send_message(
+            uid, "Or skip it:", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Skip", callback_data=f"vz:sk:{v['id']}")]]))
+        return
+    if action == "sk":
+        context.user_data.pop("arriving", None)
+        await query.answer()
+        await edit_or_send(query, "Skipped the location.")
+        await context.bot.send_message(uid, "👍", reply_markup=ReplyKeyboardRemove())
+        return
+    if action == "lv" and v["status"] == "ONSITE":
+        await query.answer()
+        await edit_or_send(query, f"🏁 Leaving {v['customer_name']} after "
+                           f"{mins_text(visit_minutes(v))}. How did it go?",
+                           InlineKeyboardMarkup(
+                               [[InlineKeyboardButton(n, callback_data=f"vz:oc:{v['id']}:{k}")]
+                                for k, n in OUTCOMES]))
+        return
+    if action == "oc" and v["status"] == "ONSITE" and parts[3] in OUTCOME_NAMES:
+        outcome = parts[3]
+        async with write_lock:
+            run("UPDATE appointments SET outcome=?, left_at=? WHERE id=?",
+                (outcome, now().isoformat(), v["id"]))
+        await query.answer()
+        if outcome != "RESOLVED":
+            await finish_visit(context.bot, query, v["id"], uid)
+            return
+        v = q1("SELECT * FROM appointments WHERE id=?", (v["id"],))
+        minutes = visit_minutes(v)
+        suggest = visit_charge(v["country"], minutes)
+        rows = []
+        if suggest:
+            cents, cur = suggest
+            async with write_lock:
+                run("UPDATE appointments SET amount_cents=?, currency=? WHERE id=?",
+                    (cents, cur, v["id"]))
+            rows.append([InlineKeyboardButton(f"✅ Charge {money_text(cents, cur)}",
+                                              callback_data=f"vz:ok:{v['id']}")])
+            head = f"Time on site {mins_text(minutes)}, so the charge is {money_text(cents, cur)}."
+        else:
+            head = (f"Time on site {mins_text(minutes)}. Pricing for "
+                    f"{COUNTRY_NAMES[v['country']]} isn't set yet, so type the amount.")
+        rows.append([InlineKeyboardButton("✏️ A different amount" if suggest else "✏️ Type the amount",
+                                          callback_data=f"vz:am:{v['id']}")])
+        rows.append([InlineKeyboardButton("No charge", callback_data=f"vz:nc:{v['id']}")])
+        await edit_or_send(query, head, InlineKeyboardMarkup(rows))
+        return
+    if action == "ok" and v["status"] == "ONSITE":
+        await query.answer()
+        await ask_method(query, v["id"])
+        return
+    if action == "nc" and v["status"] == "ONSITE":
+        async with write_lock:
+            run("UPDATE appointments SET amount_cents=0, currency=NULL, pay_method=NULL "
+                "WHERE id=?", (v["id"],))
+        await query.answer()
+        await finish_visit(context.bot, query, v["id"], uid)
+        return
+    if action == "pm" and v["status"] == "ONSITE" and parts[3] in dict(PAY_METHODS):
+        async with write_lock:
+            run("UPDATE appointments SET pay_method=? WHERE id=?", (parts[3], v["id"]))
+        await query.answer()
+        await finish_visit(context.bot, query, v["id"], uid)
+        return
+    await query.answer("That step is already done.")
+
+
+async def ask_method(query, appt_id: int) -> None:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    await edit_or_send(
+        query, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?",
+        InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=f"vz:pm:{appt_id}:{k}")
+                               for k, n in PAY_METHODS]]))
+
+
+async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The specialist shared their location after tapping Arrived."""
+    appt_id = context.user_data.pop("arriving", None)
+    if not appt_id or not update.message.location:
+        return
+    loc = update.message.location
+    async with write_lock:
+        run("UPDATE appointments SET arrive_lat=?, arrive_lng=? WHERE id=? AND specialist_id=?",
+            (loc.latitude, loc.longitude, appt_id, update.effective_user.id))
+    await update.message.reply_text("📍 Location saved. Tap 🏁 Leave when you're done.",
+                                    reply_markup=ReplyKeyboardRemove())
+
+
+async def on_amount_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """vz:am:<id> — type the amount instead of the suggested one."""
+    query = update.callback_query
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(query.data.split(":")[2]),))
+    if not v or v["specialist_id"] != query.from_user.id or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["visit_amount"] = v["id"]
+    cur = CURRENCY.get(v["country"], "SGD")
+    await edit_or_send(query, f"Type the amount in {cur}, e.g. 150 or 99.50.\n/cancel to stop")
+    return VISIT_AMOUNT
+
+
+async def on_amount_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    appt_id = context.user_data.get("visit_amount")
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,)) if appt_id else None
+    if not v:
+        return ConversationHandler.END
+    raw = update.message.text.strip().replace(",", "")
+    raw = re.sub(r"^[A-Za-z$ ]+", "", raw)
+    try:
+        cents = round(float(raw) * 100)
+    except ValueError:
+        cents = -1
+    if cents < 0 or cents > 10_000_000:
+        await update.message.reply_text("Type just the number, e.g. 150. Or /cancel.")
+        return VISIT_AMOUNT
+    context.user_data.pop("visit_amount", None)
+    cur = CURRENCY.get(v["country"], "SGD")
+    async with write_lock:
+        run("UPDATE appointments SET amount_cents=?, currency=? WHERE id=?", (cents, cur, appt_id))
+    if cents == 0:
+        await update.message.reply_text("No charge noted.")
+        await finish_visit(context.bot, None, appt_id, update.effective_user.id)
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"How did they pay {money_text(cents, cur)}?",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            n, callback_data=f"vz:pm:{appt_id}:{k}") for k, n in PAY_METHODS]]))
+    return ConversationHandler.END
+
+
+async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
+    """Mark it Completed and send the visit report to SH (whoever booked it,
+    and the visit report chat if one is set with /visitchat)."""
+    async with write_lock:
+        run("UPDATE appointments SET status='COMPLETED', left_at=COALESCE(left_at, ?) "
+            "WHERE id=?", (now().isoformat(), appt_id))
+        v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+        log_visit(appt_id, uid, "completed", OUTCOME_NAMES.get(v["outcome"], "")[2:])
+    report = "🏁 Visit completed\n\n" + visit_text(v) + "\n\n" + report_lines(v)
+    done = "✅ Done, the report has gone to SH. Thank you!\n\n" + report_lines(v)
+    if query is not None:
+        await edit_or_send(query, done)
+    else:
+        await tell(bot, uid, done)
+    await tell(bot, v["created_by"], report)
+    where = setting("visit_report_chat", "")
+    if where:
+        try:
+            target = json.loads(where)
+            kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
+            await bot.send_message(target["chat"], report, disable_web_page_preview=True, **kw)
+        except Exception as e:
+            log.info("Couldn't post the visit report: %s", e)
+
+
+async def cmd_visitchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/visitchat (admins, inside a group) — post visit reports here as well.
+    /visitchat off — stop."""
+    if not is_admin(update.effective_user.id):
+        return
+    chat = update.effective_chat
+    if context.args and context.args[0].lower() == "off":
+        async with write_lock:
+            set_setting("visit_report_chat", "")
+        await update.message.reply_text("Visit reports now go only to whoever booked the visit.")
+        return
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        await update.message.reply_text("Send this inside the SH group where reports should go.")
+        return
+    thread = update.message.message_thread_id if update.message.is_topic_message else None
+    async with write_lock:
+        set_setting("visit_report_chat", json.dumps({"chat": chat.id, "thread": thread}))
+    await update.message.reply_text("✅ On-Site visit reports will be posted here too.")

@@ -2894,6 +2894,8 @@ ADMIN_GROUPS = [
         ("channels", "Online team and the channels they cover"),
         ("departments", "Who's in which team; change someone's team"),
         ("specialists", "On-Site Specialists by country"),
+        ("visits", "On-Site visits and follow-ups"),
+        ("visitchat", "Post On-Site visit reports in this group"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -2952,11 +2954,16 @@ SH_HELP = (
     "👋 <b>SH</b>\n\n"
     "/cases — open cases: add a note, or close your side. Online requests "
     "from the ON team are marked 📣.\n"
+    "/visits — On-Site visits and follow-ups. Book visits in the <b>App</b>.\n"
     "/help — this list again"
 )
 
 SH_COMMANDS = [
     ("cases", "Open cases — notes and closing your side"),
+    ("visits", "On-Site visits and follow-ups"),
+]
+ONSITE_COMMANDS = [
+    ("visits", "My visits: arrive, leave, report"),
 ]
 
 ONLINE_COMMANDS = [
@@ -2978,8 +2985,10 @@ def menu_for(user_id: int) -> list:
         pairs = []
         if "ON" in depts:
             pairs += ONLINE_COMMANDS
-        if "SH" in depts:
+        if "SH" in depts or "FS" in depts:
             pairs += SH_COMMANDS
+        if "ONSITE" in depts:
+            pairs += ONSITE_COMMANDS
         pairs += [("help", "List commands")]
     if viewing_as(user_id):
         pairs = pairs + [("viewas", "Back to your own view")]
@@ -2999,10 +3008,15 @@ def team_help(user_id: int) -> str:
         parts.append(ONLINE_HELP)
     if "SH" in depts:
         parts.append(SH_HELP)
-    for d in ("ONSITE", "FS"):
-        if d in depts:
-            parts.append(f"👋 <b>{DEPT_NAMES[d]}</b>\n\nYour team's tools are on "
-                         "the way. You'll get a message here when they're ready.")
+    if "FS" in depts:
+        parts.append("👋 <b>FS</b>\n\nBook on-site visits in the <b>App</b> by the 📎: "
+                     "pick the country, the date and time, and the customer's details. "
+                     "The specialist is told straight away.\n/visits — upcoming visits "
+                     "and follow-ups")
+    if "ONSITE" in depts:
+        parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
+                     "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "
+                     "the 📎: your week, and Block out time when you're not free.")
     if not parts:
         parts.append("You're approved, and an admin is choosing your team. "
                      "You'll get a message here once that's done.")

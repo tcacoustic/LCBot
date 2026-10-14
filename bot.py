@@ -864,6 +864,20 @@ def main() -> None:
     app.add_handler(CommandHandler("specialists", cmd_specialists))
     app.add_handler(CallbackQueryHandler(on_country_pick, pattern=r"^vz:cy:\d+:[A-Z]{2}$"))
     app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:\d+$"))
+    app.add_handler(CommandHandler("visits", cmd_visits))
+    app.add_handler(CommandHandler("visitchat", cmd_visitchat))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(on_amount_start, pattern=r"^vz:am:\d+$")],
+            states={VISIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_amount_text)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(
+        on_visit_button, pattern=r"^vz:(lst|v|ar|sk|lv|oc|ok|nc|pm|fd)(:|$)"))
+    app.add_handler(MessageHandler(filters.LOCATION & filters.ChatType.PRIVATE, on_location))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))
