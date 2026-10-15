@@ -9,6 +9,7 @@ from people import *  # noqa: F401,F403
 from shifts import *  # noqa: F401,F403
 from timeclock import *  # noqa: F401,F403
 from handover import *  # noqa: F401,F403
+from onsite import *  # noqa: F401,F403
 from webapp import *  # noqa: F401,F403
 
 async def on_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -863,6 +864,24 @@ def main() -> None:
     app.add_handler(CommandHandler("departments", cmd_departments))
     app.add_handler(CallbackQueryHandler(on_dept_pick, pattern=r"^dp:\d+:"))
     app.add_handler(CommandHandler("viewas", cmd_viewas))
+    app.add_handler(CommandHandler("specialists", cmd_specialists))
+    app.add_handler(CallbackQueryHandler(on_country_pick, pattern=r"^vz:cy:\d+:[A-Z]{2}$"))
+    app.add_handler(CommandHandler("store", cmd_store))
+    app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^vz:(fc|fs):\d+:\w+$"))
+    app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:\d+$"))
+    app.add_handler(CommandHandler("visits", cmd_visits))
+    app.add_handler(CommandHandler("visitchat", cmd_visitchat))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(on_amount_start, pattern=r"^vz:am:\d+$")],
+            states={VISIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_amount_text)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(
+        on_visit_button, pattern=r"^vz:(lst|v|ar|lv|oc|ok|nc|pm|fd)(:|$)"))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))

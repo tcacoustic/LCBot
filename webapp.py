@@ -4,6 +4,7 @@ Part of the LC avails bot. Shared helpers live in core.py.
 """
 
 from core import *  # noqa: F401,F403
+from onsite import *  # noqa: F401,F403
 
 async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open the hours summary."""
@@ -593,6 +594,62 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
     return {"ok": True, "username": r["username"]}
 
 
+VISIT_POSTS = {"/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
+               "/api/block", "/api/block/remove", "/api/block/day"}
+
+
+def web_visit_post(user_id: int, path: str, b: dict) -> dict:
+    """Booking, reschedule requests and cancelling (SH, FS, admins); blocking
+    out times (the specialist themselves)."""
+    role = visit_role(user_id)
+    def num(k):
+        try:
+            return int(b.get(k) or 0)
+        except (TypeError, ValueError):
+            return 0
+    if path == "/api/visit":
+        if role != "booker":
+            return {"ok": False, "error": "Only SH, FS and admins book visits."}
+        vid, err = create_visit(user_id, b)
+        if err:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_booked(bot_ref(), vid))
+        return {"ok": True, "id": vid}
+    if path == "/api/visit/reschedule":
+        if role != "booker":
+            return {"ok": False, "error": "Only SH, FS and admins move visits."}
+        ok, err = request_reschedule(num("id"), user_id, str(b.get("date", "")),
+                                     str(b.get("time", "")))
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_reschedule(bot_ref(), num("id")))
+        return {"ok": True}
+    if path == "/api/visit/cancel":
+        if role != "booker":
+            return {"ok": False, "error": "Only SH, FS and admins cancel visits."}
+        reason = str(b.get("reason", "")).strip()[:200]
+        ok, err = cancel_visit(num("id"), user_id, reason)
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_cancelled(bot_ref(), num("id"), reason))
+        return {"ok": True}
+    if not is_specialist(user_id):
+        return {"ok": False, "error": "Only the specialist blocks out their own time."}
+    if path == "/api/block/day":
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        ok, err = set_day_part(user_id, (me["country"] if me else "") or "SG",
+                               str(b.get("date", "")), str(b.get("part", "")).upper())
+        return {"ok": True} if ok else {"ok": False, "error": err}
+    if path == "/api/block":
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        bid, err = add_block(user_id, (me["country"] if me else "") or "SG",
+                             str(b.get("date", "")), str(b.get("start", "")),
+                             str(b.get("end", "")), str(b.get("note", "")))
+        return {"ok": True, "id": bid} if bid else {"ok": False, "error": err}
+    return ({"ok": True} if remove_block(user_id, num("id"))
+            else {"ok": False, "error": "That time is already gone."})
+
+
 def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
     if not is_online(user_id):
         return {"ok": False, "error": "Only the Online team hands cases back."}
@@ -862,12 +919,34 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send(200, b'{"ok":true}')
             return
-        if path.startswith("/api/") and path not in ("/api/handover", "/api/home"):
+        if path.startswith("/api/") and path not in ("/api/handover", "/api/home",
+                                                     "/api/visits"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
                 self._send(403, b'{"error":"online team: handover only"}')
                 return
+        if path == "/api/visits":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid) or not visit_role(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                one = lambda k: (qs.get(k) or [""])[0]
+                self._send(200, json.dumps(visits_payload(
+                    uid, one("week"), one("country"), one("spec"), one("avail"))).encode())
+            except Exception as e:
+                log.warning("Visits view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
         if path == "/api/handover":
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
@@ -920,8 +999,12 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     # Their app is the handover view only.
                     self._send(200, json.dumps({"online": True}).encode())
                     return
+                if visit_role(uid) and not is_livechat(uid):
+                    # SH, FS and On-Site open on the visits calendar.
+                    self._send(200, json.dumps({"visits": True}).encode())
+                    return
                 if not is_livechat(uid):
-                    # SH, On-Site and FS: their screens are still to come.
+                    # Anyone else outside Livechat: their screens are still to come.
                     teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(uid)]
                     self._send(200, json.dumps({"comingSoon": True, "teams": teams}).encode())
                     return
@@ -1033,7 +1116,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if not web_has_access(uid):
             self._send(403, b'{"error":"no access"}')
             return
-        if not is_livechat(uid) and path not in ONLINE_POSTS:
+        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS:
             self._send(403, b'{"error":"online team: handover only"}')
             return
 
@@ -1063,6 +1146,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 cid = 0
             out = (web_case_toggle(uid, cid, bool(body.get("close", True)))
                    if cid else {"ok": False, "error": "No case given."})
+        elif path in VISIT_POSTS:
+            out = web_visit_post(uid, path, body if isinstance(body, dict) else {})
         elif path == "/api/case/handback":
             try:
                 cid = int(body.get("id", 0))
