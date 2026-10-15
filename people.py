@@ -74,7 +74,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if status == "active":
         touch_agent(user, dm_ok=1)
         await update.message.reply_text(
-            LIVECHAT_WELCOME, reply_markup=agent_keyboard(update.effective_user.id),
+            livechat_welcome(update.effective_user.id),
+            reply_markup=agent_keyboard(update.effective_user.id),
             parse_mode=constants.ParseMode.HTML,
         )
         return ConversationHandler.END
@@ -284,12 +285,18 @@ def dept_picker(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def livechat_welcome(user_id: int) -> str:
+    """The Livechat welcome, plus their other teams' tools if they have any."""
+    more = team_help(user_id, extra=True)
+    return LIVECHAT_WELCOME + ("\n\n" + more if more else "")
+
+
 async def welcome_to_team(bot, user_id: int) -> None:
     """Tell someone what they can now use, with the right buttons."""
     await refresh_menu_for(bot, user_id)
     try:
         if is_livechat(user_id):
-            await bot.send_message(user_id, LIVECHAT_WELCOME,
+            await bot.send_message(user_id, livechat_welcome(user_id),
                                    parse_mode=constants.ParseMode.HTML,
                                    reply_markup=agent_keyboard(user_id))
         else:

@@ -2921,10 +2921,10 @@ def menu_for(user_id: int) -> list:
     depts = depts_of(user_id)
     if is_admin(user_id):
         pairs = ADMIN_COMMANDS + (OWNER_EXTRA if is_owner(user_id) else [])
-    elif is_livechat(user_id):
-        pairs = list(AGENT_COMMANDS)
     else:
-        pairs = []
+        # Someone can be in more than one team (e.g. SH who also do Livechat):
+        # they get every team's commands, once each.
+        pairs = list(AGENT_COMMANDS) if is_livechat(user_id) else []
         if "ON" in depts:
             pairs += ONLINE_COMMANDS
         if "SH" in depts:
@@ -2940,8 +2940,10 @@ def menu_for(user_id: int) -> list:
     return out
 
 
-def team_help(user_id: int) -> str:
-    """/help and /start for people who aren't on the Livechat side."""
+def team_help(user_id: int, extra: bool = False) -> str:
+    """/help and /start for people who aren't on the Livechat side.
+    extra=True: only the other teams' parts, for Livechat people who are also
+    in another team ('' if there are none)."""
     depts = depts_of(user_id)
     parts = []
     if "ON" in depts:
@@ -2952,6 +2954,8 @@ def team_help(user_id: int) -> str:
         if d in depts:
             parts.append(f"👋 <b>{DEPT_NAMES[d]}</b>\n\nYour team's tools are on "
                          "the way. You'll get a message here when they're ready.")
+    if extra:
+        return "\n\n".join(parts)
     if not parts:
         parts.append("You're approved, and an admin is choosing your team. "
                      "You'll get a message here once that's done.")
