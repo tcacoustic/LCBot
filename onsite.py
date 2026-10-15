@@ -21,15 +21,15 @@ COUNTRIES = [
 COUNTRY_NAMES = {c: f"{flag} {name}" for c, flag, name, _ in COUNTRIES}
 COUNTRY_TZ = {c: ZoneInfo(tz) for c, _, _, tz in COUNTRIES}
 # FS stores: (code, country, name). FS staff pick theirs when they join.
-STORES = [
+FS_STORES = [
     ("SG_SONOS", "SG", "Sonos Flagship Store"),
     ("SG_ADELPHI", "SG", "TC Acoustic @ The Adelphi"),
     ("MY_SONOS", "MY", "Sonos Concept Store by TC Acoustic"),
     ("HK_EXPCENTRE", "HK", "TC Experience Centre HK"),
     ("TH_EMSPHERE", "TH", "Sonos Store EmSphere"),
 ]
-STORE_NAMES = {code: name for code, _, name in STORES}
-STORE_COUNTRY = {code: c for code, c, _ in STORES}
+FS_STORE_NAMES = {code: name for code, _, name in FS_STORES}
+FS_STORE_COUNTRY = {code: c for code, c, _ in FS_STORES}
 
 VISIT_TYPES = [("SETUP", "Set up"), ("TROUBLESHOOT", "Troubleshoot")]
 # Survey is no longer offered; the name stays so any old survey still shows.
@@ -117,7 +117,7 @@ async def on_country_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 def store_of(user_id: int) -> str:
     row = q1("SELECT store FROM agents WHERE user_id=?", (user_id,))
-    return STORE_NAMES.get(row["store"] or "", "") if row else ""
+    return FS_STORE_NAMES.get(row["store"] or "", "") if row else ""
 
 
 def booker_name(user_id: int) -> str:
@@ -139,7 +139,7 @@ def store_country_picker(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(f"{'✅' if c == have else '⬜️'} {flag} {name}",
                                callback_data=f"vz:fc:{user_id}:{c}")]
-         for c, flag, name, _ in COUNTRIES if c in STORE_COUNTRY.values()])
+         for c, flag, name, _ in COUNTRIES if c in FS_STORE_COUNTRY.values()])
 
 
 def store_picker(user_id: int, country: str) -> InlineKeyboardMarkup:
@@ -147,7 +147,7 @@ def store_picker(user_id: int, country: str) -> InlineKeyboardMarkup:
     have = row["store"] if row else None
     rows = [[InlineKeyboardButton(f"{'✅' if code == have else '⬜️'} {name}",
                                   callback_data=f"vz:fs:{user_id}:{code}")]
-            for code, c, name in STORES if c == country]
+            for code, c, name in FS_STORES if c == country]
     rows.append([InlineKeyboardButton("‹ Back", callback_data=f"vz:fc:{user_id}:back")])
     return InlineKeyboardMarkup(rows)
 
@@ -183,16 +183,16 @@ async def on_store_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                                       parse_mode=constants.ParseMode.HTML,
                                       reply_markup=store_picker(uid, value))
         return
-    if value not in STORE_NAMES:
+    if value not in FS_STORE_NAMES:
         await query.answer()
         return
     async with write_lock:
         run("UPDATE agents SET store=?, country=? WHERE user_id=?",
-            (value, STORE_COUNTRY[value], uid))
+            (value, FS_STORE_COUNTRY[value], uid))
     await query.answer()
     who = "You're" if query.from_user.id == uid else f"{display_name_of(uid, 'They')} is"
     await query.edit_message_text(
-        f"✅ {who} at {STORE_NAMES[value]} ({COUNTRY_NAMES[STORE_COUNTRY[value]]}).")
+        f"✅ {who} at {FS_STORE_NAMES[value]} ({COUNTRY_NAMES[FS_STORE_COUNTRY[value]]}).")
 
 
 async def cmd_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -241,7 +241,7 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
            "WHERE m.dept='FS' AND a.status='active' ORDER BY a.name")
     if fs:
         lines += ["", "<b>FS stores</b>"]
-        for code, c, name in STORES:
+        for code, c, name in FS_STORES:
             here = [r for r in fs if r["store"] == code]
             if here:
                 lines.append(f"{COUNTRY_NAMES[c]} {esc(name)}: " + ", ".join(
