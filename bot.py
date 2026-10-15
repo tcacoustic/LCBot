@@ -10,6 +10,7 @@ from shifts import *  # noqa: F401,F403
 from timeclock import *  # noqa: F401,F403
 from handover import *  # noqa: F401,F403
 from onsite import *  # noqa: F401,F403
+from ops import *  # noqa: F401,F403
 from webapp import *  # noqa: F401,F403
 
 async def on_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -541,6 +542,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         "<b>Anything else</b>",
         "  /support — who you list as Support",
+        "  /request — special request to Ops (delivery changes)",
         "  /payslip — open the app",
     ]
 
@@ -660,6 +662,14 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_daily(
         job_week_digest, time(dmins // 60, dmins % 60, tzinfo=TZ),
         name="week-digest",
+    )
+    cmins = parse_time_token(REQUEST_CARRY_TIME)
+    app.job_queue.run_daily(
+        job_carry_over, time(cmins // 60, cmins % 60, tzinfo=TZ), name="ops-carry-over",
+    )
+    app.job_queue.run_repeating(
+        job_sheet_retry, interval=timedelta(minutes=15), first=timedelta(minutes=2),
+        name="ops-sheet-retry",
     )
     rmins = parse_time_token(os.environ.get("REPORT_TIME", "").strip() or "09:00")
     app.job_queue.run_daily(
@@ -871,6 +881,29 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:\d+$"))
     app.add_handler(CommandHandler("visits", cmd_visits))
     app.add_handler(CommandHandler("visitchat", cmd_visitchat))
+    # Ops special requests (sr: buttons)
+    text_in = filters.TEXT & ~filters.COMMAND
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("request", cmd_request)],
+            states={
+                R_ORDER: [MessageHandler(text_in, on_request_order)],
+                R_CAT: [CallbackQueryHandler(on_request_category, pattern=r"^sr:c:[A-Z]+$")],
+                R_DETAILS: [MessageHandler(text_in, on_request_details)],
+                R_DATE: [CallbackQueryHandler(on_request_date, pattern=r"^sr:d:")],
+                R_DATE_TYPED: [MessageHandler(text_in, on_request_date_typed)],
+                R_TIME: [CallbackQueryHandler(on_request_time, pattern=r"^sr:t:[A-Z]+$")],
+                R_TIME_TYPED: [MessageHandler(text_in, on_request_time_typed)],
+                R_CONFIRM: [CallbackQueryHandler(on_request_confirm, pattern=r"^sr:(send|stop)$")],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(on_ops_button, pattern=r"^sr:(ok|no|bk):\d+$|^sr:nr:\d+:[A-Z]+$"))
+    app.add_handler(CommandHandler("opschat", cmd_opschat))
+    app.add_handler(CommandHandler("requests", cmd_requests))
     app.add_handler(
         ConversationHandler(
             entry_points=[CallbackQueryHandler(on_amount_start, pattern=r"^vz:am:\d+$")],
