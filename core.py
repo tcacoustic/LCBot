@@ -3334,6 +3334,7 @@ let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 // The Online team's app: handover cases only, sorted into platform tabs.
 let ONLINE = false, ON_GROUP = '', ON_REGION = '', ON_EDIT = {};
 // On-Site visits: SH and FS book, the specialist sees their week.
+let TABS = null;
 let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '' };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
@@ -3362,15 +3363,16 @@ function caseTags(c, extra) {
     '<span class="tag ' + k + '">' + t + '</span>').join('') + '</div>' : '';
 }
 
+// Tabs come from the server: every team someone is in brings its own.
+const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
+              ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'] };
 function navBar() {
-  if (ONLINE || VISITS_ONLY) return '';
-  const items = [['home', ICONS.home, 'Home'], ['week', ICONS.week, 'Week'],
-                 ['me', ICONS.hours, 'Hours'], ['ho', ICONS.cases, 'Handover']];
-  if (IS_ADMIN) items.push(['vis', ICONS.visits, 'Visits']);
-  if (IS_ADMIN) items.push(['team', ICONS.team, 'Team']);
+  if (ONLINE) return '';
+  const tabs = TABS || ['home', 'week', 'me', 'ho'].concat(IS_ADMIN ? ['vis', 'team'] : []);
+  if (tabs.length < 2) return '';
   return '<div class="nav-bar">'
-    + items.map(([v, i, t]) =>
-        `<div class="${VIEW === v ? 'on' : ''}" data-v="${v}">${icon(i)}${t}</div>`
+    + tabs.filter(v => NAV[v]).map(v =>
+        `<div class="${VIEW === v ? 'on' : ''}" data-v="${v}">${icon(NAV[v][0])}${NAV[v][1]}</div>`
       ).join('')
     + '</div>';
 }
@@ -3411,15 +3413,17 @@ async function loadHome() {
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
   if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
-  if (d.visits) { VISITS_ONLY = true; VIEW = 'vis'; return loadVisits(); }
+  if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; VIEW = 'vis'; return loadVisits(); }
   if (d.comingSoon) {
     app.innerHTML = `<h1>Hello</h1><div class="sub">${esc((d.teams || []).join(', ') || 'Your team')}</div>`
       + '<div class="note">Your team\u2019s screens are on the way. Until then, send /help to the bot to see what you can use.</div>';
     return;
   }
   IS_ADMIN = !!d.isAdmin;
+  TABS = d.tabs || null;
 
-  let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}</div>`;
+  let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}`
+    + `${d.teams && d.teams.length ? ' · ' + esc(d.teams.join(' + ')) : ''}</div>`;
 
   if (d.onShift) {
     h += '<div class="hero live">';
@@ -3437,6 +3441,16 @@ async function loadHome() {
   h += `<div class="card"><div class="n">${esc(d.weekHours)}</div><div class="l">This week</div></div>`;
   h += `<div class="card"><div class="n">${d.weekShifts}</div><div class="l">Shifts</div></div>`;
   h += '</div>';
+
+  if (d.booked && d.booked.length) {
+    h += '<h2>Appointments you booked</h2>';
+    for (const b of d.booked) {
+      h += '<div class="p tappable" data-gotovis="1"><div class="ptop">'
+         + `<div class="pn">${esc(b.day)} ${esc(b.start)} · ${esc(b.type)}</div><div class="t">›</div></div>`
+         + `<div class="t">${esc(b.customer)} · ${esc(b.specialist)}`
+         + `${b.status === 'ONSITE' ? ' · on site now' : ''}</div></div>`;
+    }
+  }
 
   if (d.openCases) {
     h += '<h2>Open cases</h2>';
@@ -3460,6 +3474,9 @@ async function loadHome() {
   wire();
   const btn = document.getElementById('act');
   if (btn) btn.onclick = () => d.onShift ? doClockOut(btn) : doClockIn(btn, d.slotsToday);
+  document.querySelectorAll('[data-gotovis]').forEach(el => {
+    el.onclick = () => { VIEW = 'vis'; render(); };
+  });
   document.querySelectorAll('[data-case]').forEach(el => {
     el.onclick = () => {
       HO_SHOWN[el.dataset.case] = true;   // open it already expanded
