@@ -485,6 +485,26 @@ if "pm_notified" not in _hc_cols:
 if "chat_posted" not in _hc_cols:
     # Only cases added from now on go to the store chats.
     db.execute("UPDATE ho_cases SET chat_posted=1")
+# Which department(s) each person works in. The source of truth for what
+# they see; agents.role now only says admin or not.
+db.execute("""CREATE TABLE IF NOT EXISTS memberships (
+    user_id    INTEGER NOT NULL,
+    dept       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, dept)
+)""")
+if not db.execute("SELECT 1 FROM settings WHERE key='memberships_moved'").fetchone():
+    # First start with departments: agents and admins into Livechat, the
+    # Online team into ON. Pending and declined people get theirs on approval.
+    _ts = datetime.now().isoformat()
+    db.execute("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
+               "SELECT user_id, 'ON', ? FROM agents WHERE role='online'", (_ts,))
+    db.execute("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
+               "SELECT user_id, 'LIVECHAT', ? FROM agents WHERE status='active' "
+               "AND role IN ('agent', 'admin')", (_ts,))
+    # agents.role 'online' is left as it is: the new code goes by memberships,
+    # and the previous version still reads it if we ever roll back.
+    db.execute("INSERT INTO settings (key, value) VALUES ('memberships_moved', ?)", (_ts,))
 # Who did what to a case, and any note they left.
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -759,7 +779,7 @@ def is_owner(user_id: int) -> bool:
 
 def is_admin(user_id: int) -> bool:
     if is_owner(user_id):
-        return True
+        return not viewing_as(user_id)     # admin powers pause while viewing as a team
     if not ADMIN_IDS:
         return True          # nothing configured yet — open until an owner is set
     row = q1(
@@ -1034,9 +1054,62 @@ def admin_ids() -> list:
     return sorted(ids)
 
 
+DEPARTMENTS = [
+    ("LIVECHAT", "Livechat"),
+    ("ON", "ON"),
+    ("ONSITE", "On-Site"),
+    ("SH", "SH"),
+    ("FS", "FS"),
+]
+DEPT_NAMES = dict(DEPARTMENTS)
+# Livechat people, for the lists that are about shifts, avails and pay.
+IN_LIVECHAT = "user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT')"
+
+
+def viewing_as(user_id: int) -> str:
+    """The department the owner is looking at the bot as (/viewas), or ''."""
+    return setting(f"view_as:{user_id}", "") if is_owner(user_id) else ""
+
+
+def depts_of(user_id: int) -> set:
+    view = viewing_as(user_id)
+    if view:
+        return {view}
+    return {r["dept"] for r in q("SELECT dept FROM memberships WHERE user_id=?",
+                                 (user_id,))}
+
+
+def set_depts(user_id: int, depts) -> None:
+    """Replace someone's departments. Off Livechat = off avails and shift calls."""
+    run("DELETE FROM memberships WHERE user_id=?", (user_id,))
+    for d in depts:
+        run("INSERT INTO memberships (user_id, dept, created_at) VALUES (?,?,?)",
+            (user_id, d, now().isoformat()))
+    if "LIVECHAT" not in depts:
+        run("UPDATE agents SET on_avails=0, tag_calls=0 WHERE user_id=?", (user_id,))
+    # Keep the old role label in step, so the previous version still works
+    # if this one is ever rolled back. Admins keep 'admin'.
+    run("UPDATE agents SET role=? WHERE user_id=? AND role<>'admin'",
+        ("online" if set(depts) == {"ON"} else "agent", user_id))
+
+
 def is_online(user_id: int) -> bool:
-    """The Online team: platform managers who only see handover cases."""
-    return role_of(user_id) == "online"
+    """In the ON team: platform managers working handover cases."""
+    return "ON" in depts_of(user_id)
+
+
+def is_livechat(user_id: int) -> bool:
+    """May use the Livechat side: avails, shifts, clock-in, handovers. Admins
+    always may, unless the owner is viewing as another team."""
+    view = viewing_as(user_id)
+    if view:
+        return view == "LIVECHAT"
+    return "LIVECHAT" in depts_of(user_id) or is_admin(user_id)
+
+
+def online_view(user_id: int) -> bool:
+    """Gets the ON team's screens: in ON and not on the Livechat side."""
+    return is_online(user_id) and not is_livechat(user_id)
 
 
 def online_channels(user_id: int) -> list:
@@ -1046,11 +1119,6 @@ def online_channels(user_id: int) -> list:
 
 def role_of(user_id: int) -> str:
     if is_owner(user_id):
-        if TEST_MODE:
-            # The owner trying out the Online team's side with /actas online.
-            row = q1("SELECT role FROM agents WHERE user_id=?", (user_id,))
-            if row and row["role"] == "online":
-                return "online"
         return "owner"
     row = q1("SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,))
     return row["role"] if row else "agent"
@@ -1197,7 +1265,7 @@ def apply_fixed_slots(week_id: int) -> int:
 
 
 def week_stats(week_id: int) -> dict:
-    roster = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND on_avails=1")
+    roster = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND on_avails=1")
     confirmed = {
         r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
     }
@@ -1726,17 +1794,16 @@ OT_WHEN = 260
 SWAP_PICK, SWAP_WHO, SWAP_REASON = 240, 241, 242
 
 
-ONLINE_ONLY = ("That's for the SH team. Use /cases to see your open cases, "
-               "or /help.")
+NOT_LIVECHAT = "That's for the Livechat team. /help shows what you can use."
 
 
 async def gate(update: Update) -> bool:
     """True if this person may use the bot. Replies if not."""
     uid = update.effective_user.id
     status = agent_status(uid)
-    if status == "active" and is_online(uid):
+    if status == "active" and not is_livechat(uid):
         if update.message:
-            await update.message.reply_text(ONLINE_ONLY)
+            await update.message.reply_text(NOT_LIVECHAT)
         return False
     if status == "active":
         return True
@@ -1752,8 +1819,8 @@ async def gate(update: Update) -> bool:
 async def gate_cb(query) -> bool:
     """Same, for button taps."""
     status = agent_status(query.from_user.id)
-    if status == "active" and is_online(query.from_user.id):
-        await query.answer(ONLINE_ONLY, show_alert=True)
+    if status == "active" and not is_livechat(query.from_user.id):
+        await query.answer(NOT_LIVECHAT, show_alert=True)
         return False
     if status == "active":
         return True
@@ -1984,7 +2051,8 @@ def online_team() -> list:
     """Everyone in the Online team. On the test bot (TEST_MODE) the owner
     counts too once they've picked channels, even while back on the SH side,
     so one person can test both sides."""
-    rows = q("SELECT * FROM agents WHERE role='online' AND status='active'")
+    rows = q("SELECT * FROM agents WHERE status='active' AND user_id IN "
+             "(SELECT user_id FROM memberships WHERE dept='ON')")
     if TEST_MODE:
         seen = {r["user_id"] for r in rows}
         rows += [r for r in q("SELECT * FROM agents WHERE channels IS NOT NULL "
@@ -2774,6 +2842,7 @@ ADMIN_GROUPS = [
         ("pmalerts", "New-case messages to the Online team on/off"),
         ("report", "Case report by channel, last 7 days"),
         ("channels", "Online team and the channels they cover"),
+        ("departments", "Who's in which team; change someone's team"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -2795,6 +2864,7 @@ ADMIN_GROUPS = [
     ]),
 ]
 OWNER_EXTRA = [
+    ("viewas", "See the bot as another team"),
     ("makeadmin", "Give someone admin rights"),
     ("removeadmin", "Take admin rights away"),
     ("setrate", "Set the hourly rate"),
@@ -2827,6 +2897,17 @@ ONLINE_HELP = (
     "<i>A case is fully closed once both SH and Online have ticked it.</i>"
 )
 
+SH_HELP = (
+    "👋 <b>SH</b>\n\n"
+    "/cases — open cases: add a note, or close your side. Online requests "
+    "from the ON team are marked 📣.\n"
+    "/help — this list again"
+)
+
+SH_COMMANDS = [
+    ("cases", "Open cases — notes and closing your side"),
+]
+
 ONLINE_COMMANDS = [
     ("cases", "Open cases for your channels"),
     ("report", "Your channels' cases, last 7 days"),
@@ -2834,14 +2915,56 @@ ONLINE_COMMANDS = [
 ]
 
 
+def menu_for(user_id: int) -> list:
+    """The / menu someone sees: their departments' commands, admin tools for
+    admins, and /viewas for the owner (who keeps it while viewing as a team)."""
+    depts = depts_of(user_id)
+    if is_admin(user_id):
+        pairs = ADMIN_COMMANDS + (OWNER_EXTRA if is_owner(user_id) else [])
+    else:
+        # Someone can be in more than one team (e.g. SH who also do Livechat):
+        # they get every team's commands, once each.
+        pairs = list(AGENT_COMMANDS) if is_livechat(user_id) else []
+        if "ON" in depts:
+            pairs += ONLINE_COMMANDS
+        if "SH" in depts:
+            pairs += SH_COMMANDS
+        pairs += [("help", "List commands")]
+    if viewing_as(user_id):
+        pairs = pairs + [("viewas", "Back to your own view")]
+    seen, out = set(), []
+    for c, d in pairs:
+        if c not in seen:
+            seen.add(c)
+            out.append((c, d))
+    return out
+
+
+def team_help(user_id: int, extra: bool = False) -> str:
+    """/help and /start for people who aren't on the Livechat side.
+    extra=True: only the other teams' parts, for Livechat people who are also
+    in another team ('' if there are none)."""
+    depts = depts_of(user_id)
+    parts = []
+    if "ON" in depts:
+        parts.append(ONLINE_HELP)
+    if "SH" in depts:
+        parts.append(SH_HELP)
+    for d in ("ONSITE", "FS"):
+        if d in depts:
+            parts.append(f"👋 <b>{DEPT_NAMES[d]}</b>\n\nYour team's tools are on "
+                         "the way. You'll get a message here when they're ready.")
+    if extra:
+        return "\n\n".join(parts)
+    if not parts:
+        parts.append("You're approved, and an admin is choosing your team. "
+                     "You'll get a message here once that's done.")
+    return "\n\n".join(parts)
+
+
 async def refresh_menu_for(bot, user_id: int) -> None:
-    """Re-publish one person's menu after their role changes."""
-    role = role_of(user_id)
-    pairs = ADMIN_COMMANDS if role in ("admin", "owner") else AGENT_COMMANDS
-    if role == "online":
-        pairs = ONLINE_COMMANDS
-    if role == "owner":
-        pairs = pairs + OWNER_EXTRA
+    """Re-publish one person's menu after their departments change."""
+    pairs = menu_for(user_id)
     try:
         await bot.set_my_commands(
             [BotCommand(c, d) for c, d in pairs],
@@ -2872,8 +2995,10 @@ async def publish_command_menus(app: Application) -> None:
             )
             elevated = set(ADMIN_IDS) | {
                 r["user_id"]
-                for r in q("SELECT user_id FROM agents WHERE role IN ('admin', "
-                           "'online') AND active=1")
+                for r in q("SELECT user_id FROM agents WHERE role='admin' AND active=1")
+            } | {
+                r["user_id"]            # anyone in a team other than Livechat
+                for r in q("SELECT user_id FROM memberships WHERE dept<>'LIVECHAT'")
             }
             for uid in elevated:
                 await refresh_menu_for(bot, uid)
@@ -3162,6 +3287,11 @@ async function loadHome() {
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
   if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
+  if (d.comingSoon) {
+    app.innerHTML = `<h1>Hello</h1><div class="sub">${esc((d.teams || []).join(', ') || 'Your team')}</div>`
+      + '<div class="note">Your team\u2019s screens are on the way. Until then, send /help to the bot to see what you can use.</div>';
+    return;
+  }
   IS_ADMIN = !!d.isAdmin;
 
   let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}</div>`;
