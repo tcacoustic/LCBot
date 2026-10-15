@@ -194,6 +194,38 @@ def team_payload(first: date, mode: str = "month") -> dict:
     }
 
 
+# The App's bottom bar: every team brings its tabs, shown once each and always
+# in this order. Someone in two teams (SH who also do Livechat) gets both sets.
+TAB_ORDER = ["home", "week", "me", "ho", "vis", "team"]
+
+
+def app_tabs(user_id: int) -> list:
+    depts, tabs = depts_of(user_id), set()
+    if is_livechat(user_id):
+        tabs |= {"home", "week", "me", "ho"}
+    if "SH" in depts:
+        tabs |= {"ho", "vis"}
+    if depts & {"FS", "ONSITE"}:
+        tabs.add("vis")
+    if is_admin(user_id):
+        tabs |= {"vis", "team"}
+    return [t for t in TAB_ORDER if t in tabs]
+
+
+def my_bookings(user_id: int, limit: int = 3) -> list:
+    """Appointments this person booked that haven't happened yet, soonest first."""
+    since = (now() - timedelta(hours=2)).isoformat()
+    rows = q("SELECT * FROM appointments WHERE created_by=? AND status IN ('SCHEDULED','ONSITE')"
+             " AND starts_at >= ? ORDER BY starts_at LIMIT ?", (user_id, since, limit))
+    out = []
+    for v in rows:
+        start, _ = span_of(v)
+        local_today = datetime.now(COUNTRY_TZ[v["country"]]).date()
+        out.append({**visit_item(v, "booker"),
+                    "day": "Today" if start.date() == local_today else start.strftime("%a %-d")})
+    return out
+
+
 def home_payload(user_id: int) -> dict:
     """What an agent needs to see mid-shift."""
     conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -1001,7 +1033,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     return
                 if visit_role(uid) and not is_livechat(uid):
                     # SH, FS and On-Site open on the visits calendar.
-                    self._send(200, json.dumps({"visits": True}).encode())
+                    self._send(200, json.dumps({"visits": True, "tabs": app_tabs(uid)}).encode())
                     return
                 if not is_livechat(uid):
                     # Anyone else outside Livechat: their screens are still to come.
@@ -1011,6 +1043,10 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 data = home_payload(uid)
                 data["slotsToday"] = todays_slots(uid)
                 data["isAdmin"] = is_admin(uid)
+                data["tabs"] = app_tabs(uid)
+                teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(uid)]
+                data["teams"] = teams if len(teams) > 1 else []
+                data["booked"] = my_bookings(uid) if visit_role(uid) == "booker" else []
                 self._send(200, json.dumps(data).encode())
             except Exception as e:
                 log.warning("Home view failed: %s", e)

@@ -3097,196 +3097,216 @@ MINIAPP_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>LC Bot</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: light dark; }
+  /* SH Bot look: black header, white cards with thick outlines, one orange action. */
+  :root { color-scheme: light; --bg:#EDEBE6; --ink:#101418; --muted:#3D444D; --soft:#5B626B;
+    --line:#C9CDD2; --card:#FFFFFF; --accent:#C4420E; --blue:#1D4ED8; --green:#1D6B3E;
+    --amber:#9A4A06; --red:#B42318; --headmuted:#C9CDD2; --pale:#F4F2EE; }
   * { box-sizing: border-box; }
-  body { margin:0; padding:16px 16px 40px;
-    font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--tg-theme-bg-color, #fff);
-    color: var(--tg-theme-text-color, #111); }
-  h1 { font-size:20px; margin:0 0 2px; }
-  .sub { color: var(--tg-theme-hint-color,#777); font-size:13px; margin-bottom:18px; }
-  .cards { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:22px; }
-  .card { background: var(--tg-theme-secondary-bg-color,#f4f4f5);
-          border-radius:14px; padding:14px; }
-  .card .n { font-size:22px; font-weight:650; letter-spacing:-0.02em; }
-  .card .l { font-size:12px; color: var(--tg-theme-hint-color,#777); margin-top:2px; }
-  .card.wide { grid-column: 1 / -1; }
-  .card.pay .n { color: var(--tg-theme-link-color,#2a7); }
-  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
-       color: var(--tg-theme-hint-color,#777); margin:0 0 8px; font-weight:600; }
-  .row { display:flex; justify-content:space-between; align-items:baseline;
-         padding:11px 0; border-bottom:1px solid var(--tg-theme-secondary-bg-color,#eee); }
-  .row:last-child { border-bottom:0; }
-  .d { font-weight:550; }
-  .t { font-size:12px; color: var(--tg-theme-hint-color,#777); margin-top:1px; }
-  .h { font-variant-numeric: tabular-nums; text-align:right; }
-  .flag { font-size:11px; color:#c60; }
-  .row { display:flex; align-items:center; justify-content:space-between;
-     padding:13px 2px; border-bottom:1px solid var(--tg-theme-secondary-bg-color,#eee); }
-  .row:last-child { border-bottom:0; }
-  .row .lbl { font-size:14px; }
-  .row .lbl small { display:block; font-size:11px;
-     color: var(--tg-theme-hint-color,#888); margin-top:2px; }
-  .sw { width:50px; height:30px; border-radius:15px; flex:0 0 auto; cursor:pointer;
-     background: var(--tg-theme-secondary-bg-color,#d8d8dc); position:relative;
-     transition:background .15s; }
-  .sw.on { background: var(--tg-theme-link-color,#2a7); }
-  .sw i { position:absolute; top:3px; left:3px; width:24px; height:24px;
-     border-radius:12px; background:#fff; transition:left .15s; }
-  .sw.on i { left:23px; }
-  .nameedit { display:flex; gap:8px; margin-top:10px; }
-  .nameedit input { flex:1; border:1px solid var(--tg-theme-secondary-bg-color,#e5e5e7);
-     border-radius:10px; padding:10px 12px; font-size:15px; font-family:inherit;
-     background: var(--tg-theme-bg-color,#fff); color: var(--tg-theme-text-color,#111); }
-  .nameedit button { border:0; border-radius:10px; padding:10px 16px; font-size:14px;
-     font-weight:600; background: var(--tg-theme-link-color,#2a7); color:#fff;
-     cursor:pointer; }
-  .back { font-size:13px; color: var(--tg-theme-link-color,#2a7);
-          cursor:pointer; margin-bottom:10px; }
-  .ref { float:right; font-variant-numeric:tabular-nums; opacity:.45;
-         font-size:11px; }
-  .empty { text-align:center; padding:40px 20px; color: var(--tg-theme-hint-color,#777); }
-  .note { margin-top:22px; font-size:12px; color: var(--tg-theme-hint-color,#777); }
-  .err { background:#fee; color:#900; padding:14px; border-radius:12px; }
-  .tabs { display:flex; gap:8px; margin-bottom:18px; }
-  .tab { flex:1; padding:9px; text-align:center; border-radius:10px; font-size:14px;
-         font-weight:600; background: var(--tg-theme-secondary-bg-color,#f4f4f5);
-         color: var(--tg-theme-hint-color,#777); cursor:pointer; }
-  .tab.on { background: var(--tg-theme-link-color,#2a7); color:#fff; }
-  .nav { display:flex; align-items:center; justify-content:space-between;
-         margin-bottom:16px; }
-  .nav button { background: var(--tg-theme-secondary-bg-color,#f4f4f5);
-     border:0; border-radius:9px; padding:7px 14px; font-size:16px;
-     color: var(--tg-theme-text-color,#111); cursor:pointer; }
-  .nav button[disabled] { opacity:.3; }
-  .nav .m { font-weight:650; }
-  .p { padding:12px 0; border-bottom:1px solid var(--tg-theme-secondary-bg-color,#eee); }
-  .p:last-child { border-bottom:0; }
-  .p.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
-  .p.tappable:active { opacity:.6; }
-  .p.quiet .pn { color: var(--tg-theme-hint-color,#888); font-weight:500; }
-  .p.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
-  .p.tappable:active { opacity:.6; }
-  .p.quiet .pn { color: var(--tg-theme-hint-color,#888); font-weight:500; }
-  .ptop { display:flex; justify-content:space-between; align-items:baseline; }
-  .pn { font-weight:600; }
-  .pp { font-variant-numeric:tabular-nums; font-weight:600; }
-  .track { height:5px; border-radius:3px; margin-top:7px;
-           background: var(--tg-theme-secondary-bg-color,#eee); overflow:hidden; }
-  .fill { height:100%; background: var(--tg-theme-link-color,#2a7); }
-  .warn { background:#fff6e5; color:#8a5a00; padding:11px 13px;
-          border-radius:11px; font-size:13px; margin-bottom:16px; }
-  body { padding-bottom: 84px; }
-  .nav-bar { position:fixed; left:0; right:0; bottom:0; display:flex;
-    background: var(--tg-theme-bg-color,#fff);
-    border-top:1px solid var(--tg-theme-secondary-bg-color,#eee);
-    padding:8px 4px calc(8px + env(safe-area-inset-bottom)); z-index:10; }
-  .nav-bar div { flex:1; text-align:center; font-size:11px; padding:4px 0;
-    color: var(--tg-theme-hint-color,#888); cursor:pointer; }
-  .nav-bar div span { display:block; font-size:19px; line-height:1.3; }
-  .nav-bar div.on { color: var(--tg-theme-link-color,#2a7); font-weight:600; }
-  .hero { border-radius:18px; padding:20px; margin-bottom:18px;
-          background: var(--tg-theme-secondary-bg-color,#f4f4f5); }
-  .hero.live { background: var(--tg-theme-link-color,#2a7); color:#fff; }
-  .hero .k { font-size:13px; opacity:.75; }
-  .hero .v { font-size:26px; font-weight:650; letter-spacing:-.02em; margin-top:2px; }
-  .big { width:100%; border:0; border-radius:14px; padding:16px;
-         font-size:17px; font-weight:650; cursor:pointer; margin-top:14px;
-         background: var(--tg-theme-link-color,#2a7); color:#fff; }
-  .big.stop { background:#c0392b; }
+  body { margin:0; padding:0 16px 100px; background:var(--bg); color:var(--ink);
+    font:15px/1.45 Archivo, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  button, input, textarea, select { font-family:inherit; }
+
+  /* The black header band: the first title (and its back link and subtitle). */
+  #app > .back, #app > h1, #app > h1 + .sub, #app > h2:first-child {
+    background:var(--ink); color:#fff; margin-left:-16px; margin-right:-16px;
+    padding-left:16px; padding-right:16px; }
+  #app > h1 { font-size:28px; font-weight:800; line-height:1.1; text-transform:uppercase;
+    margin-top:0; margin-bottom:16px; padding-top:20px; padding-bottom:18px; }
+  #app > .back + h1 { padding-top:2px; }
+  #app > h1:has(+ .sub) { margin-bottom:0; padding-bottom:4px; }
+  #app > h1 + .sub { color:var(--headmuted); font-size:13px; font-weight:700;
+    letter-spacing:.06em; text-transform:uppercase; margin:0 -16px 16px; padding-bottom:18px; }
+  #app > h2:first-child { font-size:24px; margin-top:0; margin-bottom:16px;
+    padding-top:20px; padding-bottom:18px; color:#fff; }
+  #app > .back { margin-bottom:0; padding-top:14px; padding-bottom:10px; color:var(--headmuted);
+    font-weight:800; letter-spacing:.06em; text-transform:uppercase; font-size:12px; }
+  #app > .seg:first-child, #app > .otabs:first-child { margin-top:16px; }
+
+  h1 { font-size:24px; font-weight:800; text-transform:uppercase; margin:0 0 4px; }
+  h2 { font-size:14px; font-weight:800; text-transform:uppercase; letter-spacing:.04em;
+    color:var(--ink); margin:20px 0 8px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .note { margin-top:14px; font-size:13px; color:var(--muted); }
+  .empty { text-align:center; padding:40px 20px; color:var(--muted); font-weight:600; }
+  .err { background:#FBE9E7; border:2px solid var(--red); color:#7A1A12; padding:14px;
+    border-radius:8px; margin-top:16px; }
+  .warn { background:#FBE9E7; border:2px solid var(--red); color:#7A1A12; padding:10px 12px;
+    border-radius:8px; font-size:13px; font-weight:700; margin-bottom:14px; }
+  .flag, .stale { color:var(--amber); font-weight:700; }
+  .t { font-size:12px; color:var(--muted); margin-top:2px; }
+  .d { font-weight:800; }
+  .h { font-variant-numeric:tabular-nums; text-align:right; font-weight:800; }
+  .ref { float:right; font-variant-numeric:tabular-nums; color:var(--soft); font-size:11px; }
+  .cap { font-variant-numeric:tabular-nums; }
+  code { font-size:12px; background:#E2E0DA; padding:1px 4px; border-radius:3px; }
+
+  /* Worded tags in place of coloured dots. */
+  .tags { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:4px; }
+  .tag { font-size:10px; font-weight:800; letter-spacing:.06em; color:#fff; padding:3px 6px;
+    border-radius:4px; background:var(--ink); }
+  .tag.red { background:var(--red); } .tag.amber { background:var(--amber); }
+  .tag.green { background:var(--green); } .tag.blue { background:var(--blue); }
+
+  .cards { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:16px; }
+  .card { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; }
+  .card .n { font-size:24px; font-weight:800; font-variant-numeric:tabular-nums; }
+  .card .l { font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase;
+    color:var(--muted); margin-top:2px; }
+  .card.wide { grid-column:1 / -1; }
+  .card.pay { background:var(--ink); color:#fff; }
+  .card.pay .l { color:var(--headmuted); }
+
+  .hero { background:var(--card); border:2px solid var(--ink); border-radius:8px;
+    padding:14px; margin-bottom:0; }
+  .hero.live { background:var(--green); border-color:var(--green); color:#fff; }
+  .hero .k { font-size:12px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; opacity:.85; }
+  .hero .v { font-size:24px; font-weight:800; margin-top:2px; }
+
+  .big { width:100%; min-height:56px; border:0; border-radius:8px; padding:14px;
+    font-size:16px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
+    cursor:pointer; margin-top:12px; background:var(--accent); color:#fff; }
+  .big.stop { background:var(--ink); }
+  /* Add a case sits above Post handover: only one orange button per screen. */
+  #newCase:has(~ #postHo), #newCase:has(~ #postOps) { background:var(--card); color:var(--ink); border:2px solid var(--ink); }
   .big[disabled] { opacity:.5; }
+  .big[style*="secondary-bg"] { background:var(--card) !important; color:var(--ink) !important;
+    border:2px solid var(--ink); min-height:48px; }
+
   .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
-  .chips button { border:0; border-radius:10px; padding:9px 14px; font-size:14px;
-    background: var(--tg-theme-secondary-bg-color,#f4f4f5);
-    color: var(--tg-theme-text-color,#111); cursor:pointer; }
-  .day { margin-top:20px; }
-  .day h3 { font-size:12px; font-weight:700; letter-spacing:.06em;
-     text-transform:uppercase; color: var(--tg-theme-hint-color,#888);
-     margin:0 0 8px; display:flex; justify-content:space-between; }
-  .day.is-today h3 { color: var(--tg-theme-link-color,#2a7); }
-  .slot { display:flex; align-items:center; justify-content:space-between;
-     padding:11px 14px; border-radius:11px; margin-bottom:7px; font-size:14px;
-     background: var(--tg-theme-secondary-bg-color,#f4f4f5); }
+  .chips button { border:2px solid var(--ink); border-radius:6px; padding:10px 14px; font-size:14px;
+    font-weight:800; background:var(--card); color:var(--ink); cursor:pointer; min-height:44px; }
+
+  /* Lists of people and shifts */
+  .p { background:var(--card); border:2px solid var(--ink); border-radius:8px;
+    padding:10px 14px; margin-bottom:8px; }
+  .p.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
+  .p.tappable:active { transform:scale(.99); }
+  .p.quiet { border-color:var(--line); }
+  .p.quiet .pn { color:var(--muted); }
+  .ptop { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .pn { font-weight:800; font-size:15px; }
+  .pp { font-variant-numeric:tabular-nums; font-weight:800; }
+  .track { height:8px; border-radius:2px; margin-top:8px; background:#E2E0DA; overflow:hidden; }
+  .fill { height:100%; background:var(--accent); }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px;
+    background:var(--card); border:2px solid var(--ink); border-radius:8px;
+    padding:10px 14px; margin-bottom:6px; }
+  .row .lbl { font-size:15px; font-weight:800; }
+  .row .lbl small { display:block; font-size:12px; font-weight:500; color:var(--muted); margin-top:2px; }
+  .sw { width:52px; height:30px; border-radius:6px; flex:0 0 auto; cursor:pointer;
+    border:2px solid var(--ink); background:var(--card); position:relative; }
+  .sw.on { background:var(--green); }
+  .sw i { position:absolute; top:2px; left:2px; width:22px; height:22px; border-radius:3px;
+    background:var(--ink); transition:left .15s; }
+  .sw.on i { left:24px; background:#fff; }
+  .nameedit { display:flex; gap:6px; margin-top:8px; }
+  .nameedit input { flex:1; min-height:48px; border:2px solid var(--ink); border-radius:6px;
+    padding:0 12px; font-size:16px; font-weight:700; background:var(--card); color:var(--ink); }
+  .nameedit button { min-width:80px; border:0; border-radius:6px; font-size:14px; font-weight:800;
+    background:var(--ink); color:#fff; cursor:pointer; }
+
+  /* Week / month and prev / next */
+  .seg { display:grid; grid-auto-flow:column; grid-auto-columns:1fr; gap:4px; padding:4px;
+    border-radius:8px; background:#DDDAD3; margin-bottom:12px; }
+  .seg div { text-align:center; padding:9px 12px; border-radius:6px; font-size:14px; font-weight:800;
+    text-transform:uppercase; color:var(--muted); cursor:pointer; }
+  .seg div.on { background:var(--card); color:var(--ink); box-shadow:0 1px 2px rgba(0,0,0,.15); }
+  .nav { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  .nav button { min-width:44px; min-height:44px; background:var(--card); border:2px solid var(--ink);
+    border-radius:6px; font-size:18px; font-weight:800; color:var(--ink); cursor:pointer; }
+  .nav button[disabled] { opacity:.3; }
+  .nav .m { font-weight:800; text-transform:uppercase; letter-spacing:.04em; }
+  .tabs { display:flex; gap:8px; margin-bottom:16px; }
+  .tab { flex:1; padding:10px; text-align:center; border-radius:6px; font-size:14px; font-weight:800;
+    border:2px solid var(--line); background:var(--card); color:var(--ink); cursor:pointer; }
+  .tab.on { background:var(--ink); border-color:var(--ink); color:#fff; }
+  .otabs { display:flex; gap:4px; margin:8px 0; flex-wrap:wrap; }
+  .otabs button { flex:1; min-height:44px; padding:8px 6px; border:2px solid var(--line); border-radius:6px;
+    font-size:14px; font-weight:800; background:var(--card); color:var(--ink); cursor:pointer; }
+  .otabs button.on { background:var(--ink); border-color:var(--ink); color:#fff; }
+  .otabs.small button { min-height:40px; font-size:13px; }
+
+  /* Bottom bar */
+  .nav-bar { position:fixed; left:0; right:0; bottom:0; display:flex; z-index:10;
+    background:var(--card); border-top:2px solid var(--ink);
+    padding:0 0 env(safe-area-inset-bottom); }
+  .nav-bar div { flex:1; min-height:62px; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:3px; font-size:10px; font-weight:800; letter-spacing:.03em;
+    text-transform:uppercase; color:var(--soft); cursor:pointer; }
+  .nav-bar div svg { width:22px; height:22px; }
+  .nav-bar div.on { color:var(--ink); box-shadow:inset 0 4px 0 var(--accent); }
+
+  /* Shift slots */
+  .day { margin-top:16px; }
+  .day h3 { font-size:14px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--ink); margin:0 0 6px; display:flex; justify-content:space-between; }
+  .day.is-today h3 { color:var(--accent); }
+  .slot { display:flex; align-items:center; justify-content:space-between; min-height:48px;
+    padding:8px 14px; border-radius:8px; margin-bottom:6px; font-size:15px; font-weight:800;
+    background:#E2E0DA; border:2px solid #E2E0DA; color:var(--muted); }
+  .slot .who { font-size:12px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
+    text-align:right; }
   .slot.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
   .slot.tappable:active { transform:scale(.985); }
   .slot.busy { opacity:.5; }
-  .case { border-radius:12px; padding:12px 14px; margin-bottom:8px;
-     background: var(--tg-theme-secondary-bg-color,#f4f4f5); }
-  .case.gone { opacity:.55; }
-  .case .top { display:flex; align-items:flex-start; gap:10px; }
-  .case .tick { width:22px; height:22px; border-radius:6px; flex:0 0 auto;
-     border:2px solid var(--tg-theme-hint-color,#bbb); margin-top:1px;
-     display:flex; align-items:center; justify-content:center; font-size:13px;
-     cursor:pointer; }
-  .case .tick.on { background: var(--tg-theme-link-color,#2a7); border-color:transparent;
-     color:#fff; }
-  .case .nm { font-weight:600; font-size:14px; }
-  .case .meta { font-size:11px; color: var(--tg-theme-hint-color,#888);
-     margin-top:2px; }
-  .case .body { font-size:12px; white-space:pre-wrap; margin-top:8px;
-     padding-top:8px; border-top:1px solid rgba(0,0,0,.07);
-     color: var(--tg-theme-text-color,#111); }
-  .case .more { font-size:11px; color: var(--tg-theme-link-color,#2a7);
-     margin-top:6px; cursor:pointer; }
-  .case .st { font-size:12px; font-weight:600; margin-top:6px; }
-  .case .nt { font-size:12px; margin-top:6px; padding:6px 8px; border-radius:8px;
-     background: var(--tg-theme-secondary-bg-color, rgba(0,0,0,.04)); }
-  .case .hist { font-size:11px; color: var(--tg-theme-hint-color,#888);
-     margin-top:8px; line-height:1.5; }
-  .case .addnote { margin-top:8px; display:flex; gap:6px; align-items:flex-end; }
-  .case .addnote textarea { flex:1; min-height:38px; font-size:13px; }
-  .case .acts { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-  .case .acts button { flex:1 1 auto; padding:8px 10px; border:0; border-radius:8px;
-     background: var(--tg-theme-button-color,#2a7);
-     color: var(--tg-theme-button-text-color,#fff); font-size:13px; }
-  .case .acts button.soft { background: var(--tg-theme-secondary-bg-color,#eee);
-     color: var(--tg-theme-text-color,#111); }
-  .otabs { display:flex; gap:6px; margin:10px 0 6px; }
-  .otabs button { flex:1; padding:8px 4px; border:0; border-radius:8px; font-size:13px;
-     background: var(--tg-theme-secondary-bg-color,#eee);
-     color: var(--tg-theme-text-color,#111); }
-  .otabs button.on { background: var(--tg-theme-button-color,#2a7);
-     color: var(--tg-theme-button-text-color,#fff); font-weight:600; }
-  .otabs.small button { padding:6px 4px; font-size:12px; }
-  .case .addnote button { flex:0 0 auto; padding:8px 12px; border:0; border-radius:8px;
-     background: var(--tg-theme-button-color,#2a7);
-     color: var(--tg-theme-button-text-color,#fff); font-size:13px; }
-  .stale { color:#b26a00; }
-  .fld { margin-bottom:14px; }
-  .fld label { display:block; font-size:11px; font-weight:700; letter-spacing:.05em;
-     text-transform:uppercase; color: var(--tg-theme-hint-color,#888);
-     margin-bottom:6px; }
-  .fld input, .fld textarea, .fld select { width:100%; box-sizing:border-box;
-     border:1px solid var(--tg-theme-secondary-bg-color,#e5e5e7); border-radius:10px;
-     padding:11px 12px; font-size:15px; font-family:inherit;
-     background: var(--tg-theme-bg-color,#fff); color: var(--tg-theme-text-color,#111); }
-  .fld textarea { min-height:150px; resize:vertical; }
+  .slot.mine { background:var(--ink); border-color:var(--ink); color:#fff; }
+  .slot.free { background:var(--card); border-color:var(--green); color:var(--ink); }
+  .slot.free .who { color:var(--green); }
+  .slot.part { background:var(--card); border-color:var(--amber); color:var(--ink); }
+  .slot.part .who { color:var(--amber); }
+  .slot.past { opacity:.5; }
+
+  /* Cases and visits */
+  .case { background:var(--card); border:2px solid var(--ink); border-radius:8px;
+    padding:12px 14px; margin-bottom:10px; }
+  .case.gone { background:var(--pale); border-color:var(--line); }
+  .case.gone .nm { color:var(--muted); }
+  .case .top { display:flex; align-items:flex-start; gap:12px; }
+  .case .tick { width:28px; height:28px; border-radius:6px; flex:0 0 auto; border:2px solid var(--soft);
+    background:var(--card); display:flex; align-items:center; justify-content:center;
+    font-size:15px; font-weight:800; cursor:pointer; }
+  .case .tick.on { background:var(--ink); border-color:var(--ink); color:#fff; }
+  .case .nm { font-weight:800; font-size:16px; }
+  .case .meta { font-size:12px; color:var(--muted); margin-top:2px; }
+  .case .body { font-size:14px; white-space:pre-wrap; margin-top:10px; padding-top:10px;
+    border-top:1px solid #E2E0DA; color:var(--ink); }
+  .case .more { margin:10px -14px -12px; padding:12px; border-top:2px solid var(--ink);
+    text-align:center; font-size:13px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--ink); cursor:pointer; }
+  .case.gone .more { border-top-color:var(--line); }
+  .case .st { font-size:12px; font-weight:700; color:var(--blue); margin-top:4px; }
+  .case .nt { font-size:13px; margin-top:8px; padding:10px 12px; border-radius:6px; background:var(--pale); }
+  .case .hist { font-size:12px; color:var(--muted); margin-top:8px; line-height:1.5; }
+  .case .addnote { margin-top:10px; display:flex; gap:6px; align-items:stretch; }
+  .case .addnote textarea { flex:1; min-height:44px; font-size:14px; border:2px solid #8A9099;
+    border-radius:6px; padding:10px; background:var(--card); color:var(--ink); }
+  .case .addnote button { flex:0 0 auto; min-width:64px; border:0; border-radius:6px;
+    background:var(--ink); color:#fff; font-size:13px; font-weight:800; }
+  .case .acts { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+  .case .acts button { flex:1 1 40%; min-height:44px; padding:8px 10px; border:2px solid var(--green);
+    border-radius:6px; background:var(--green); color:#fff; font-size:13px; font-weight:800;
+    text-transform:uppercase; cursor:pointer; }
+  .case .acts button.soft { background:var(--card); border-color:var(--ink); color:var(--ink); }
+
+  /* Forms */
+  .fld { margin-bottom:16px; }
+  .fld label { display:block; font-size:13px; font-weight:800; letter-spacing:.04em;
+    text-transform:uppercase; color:var(--ink); margin-bottom:6px; }
+  .fld input, .fld textarea, .fld select { width:100%; min-height:48px; border:2px solid #8A9099;
+    border-radius:6px; padding:10px 12px; font-size:16px; background:var(--card); color:var(--ink); }
+  .fld textarea { min-height:110px; resize:vertical; }
+  .fld .note { margin-top:4px; }
   .pick { display:flex; gap:6px; flex-wrap:wrap; }
-  .pick button { border:1px solid var(--tg-theme-secondary-bg-color,#e5e5e7);
-     background: var(--tg-theme-bg-color,#fff); border-radius:10px; padding:9px 13px;
-     font-size:14px; cursor:pointer; color: var(--tg-theme-text-color,#111); }
-  .pick button.on { background: var(--tg-theme-link-color,#2a7); color:#fff;
-     border-color:transparent; font-weight:600; }
-  .toast { position:fixed; left:16px; right:16px; bottom:96px; z-index:20;
-     background:#333; color:#fff; padding:12px 16px; border-radius:11px;
-     font-size:13px; text-align:center; }
-  .slot .who { font-size:12px; color: var(--tg-theme-hint-color,#888);
-     text-align:right; }
-  .slot.mine { background: var(--tg-theme-link-color,#2a7); color:#fff; }
-  .slot.mine .who { color:#dff1e9; }
-  .slot.free { background:transparent;
-     border:1px dashed var(--tg-theme-hint-color,#c9c9cf); }
-  .slot.free .who { color: var(--tg-theme-link-color,#2a7); }
-  .slot.part { background:#fff6e5; }
-  .slot.past { opacity:.45; }
-  .cap { font-variant-numeric:tabular-nums; }
-  .seg { display:inline-flex; gap:2px; padding:3px; border-radius:9px;
-         background: var(--tg-theme-secondary-bg-color,#f4f4f5); margin-bottom:14px; }
-  .seg div { padding:5px 16px; border-radius:7px; font-size:13px; font-weight:600;
-             color: var(--tg-theme-hint-color,#777); cursor:pointer; }
-  .seg div.on { background: var(--tg-theme-bg-color,#fff);
-                color: var(--tg-theme-text-color,#111); }
+  .pick button { flex:1 1 auto; min-height:48px; border:2px solid var(--line); background:var(--card);
+    border-radius:6px; padding:8px 12px; font-size:14px; font-weight:800; cursor:pointer; color:var(--ink); }
+  .pick button.on { background:var(--ink); border-color:var(--ink); color:#fff; }
+
+  .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
+  .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
+    color:#fff; padding:12px 16px; border-radius:8px; font-size:14px; font-weight:700; text-align:center; }
 </style>
 </head><body>
 <div id="app"><div class="empty">Loading…</div></div>
@@ -3306,23 +3326,53 @@ window.addEventListener('unhandledrejection', e =>
   showFatal('A request failed', e.reason && e.reason.message || e.reason));
 
 const tg = window.Telegram?.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) {
+  tg.ready(); tg.expand();
+  try { tg.setHeaderColor('#101418'); tg.setBackgroundColor('#EDEBE6'); } catch (e) {}
+}
 let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 // The Online team's app: handover cases only, sorted into platform tabs.
 let ONLINE = false, ON_GROUP = '', ON_REGION = '', ON_EDIT = {};
 // On-Site visits: SH and FS book, the specialist sees their week.
+let TABS = null;
 let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '' };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
+const ICONS = {
+  home: 'M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z',
+  week: 'M4 6h16v14H4zM4 10h16M8 3v4M16 3v4',
+  hours: 'M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zM12 7v5l3 2',
+  cases: 'M9 3h6v3H9zM7 4.5H5V21h14V4.5h-2M8 11h8M8 15h5',
+  visits: 'M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zM12 8a2 2 0 1 0 0 4a2 2 0 1 0 0-4',
+  team: 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6'
+};
+function icon(path) {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+    + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="' + path + '"/></svg>';
+}
+
+// Urgency and due date as worded tags rather than coloured dots.
+const PRIO_TAG = { '🔴': ['HIGH', 'red'], '🟠': ['MEDIUM', 'amber'], '🟢': ['LOW', 'green'] };
+function caseTags(c, extra) {
+  const out = (extra || []).slice();
+  if (c.sla === '🚨') out.push(['OVERDUE', 'red']);
+  else if (c.sla) out.push(['DUE TODAY', 'amber']);
+  const p = PRIO_TAG[c.prio];
+  if (p) out.push(p);
+  return out.length ? '<div class="tags">' + out.map(([t, k]) =>
+    '<span class="tag ' + k + '">' + t + '</span>').join('') + '</div>' : '';
+}
+
+// Tabs come from the server: every team someone is in brings its own.
+const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
+              ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'] };
 function navBar() {
-  if (ONLINE || VISITS_ONLY) return '';
-  const items = [['home','🏠','Home'], ['week','📅','Week'],
-                 ['me','🕐','Hours'], ['ho','📝','Handover']];
-  if (IS_ADMIN) items.push(['vis','📍','Visits']);
-  if (IS_ADMIN) items.push(['team','👥','Team']);
+  if (ONLINE) return '';
+  const tabs = TABS || ['home', 'week', 'me', 'ho'].concat(IS_ADMIN ? ['vis', 'team'] : []);
+  if (tabs.length < 2) return '';
   return '<div class="nav-bar">'
-    + items.map(([v, i, t]) =>
-        `<div class="${VIEW === v ? 'on' : ''}" data-v="${v}"><span>${i}</span>${t}</div>`
+    + tabs.filter(v => NAV[v]).map(v =>
+        `<div class="${VIEW === v ? 'on' : ''}" data-v="${v}">${icon(NAV[v][0])}${NAV[v][1]}</div>`
       ).join('')
     + '</div>';
 }
@@ -3363,15 +3413,17 @@ async function loadHome() {
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
   if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
-  if (d.visits) { VISITS_ONLY = true; VIEW = 'vis'; return loadVisits(); }
+  if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; VIEW = 'vis'; return loadVisits(); }
   if (d.comingSoon) {
     app.innerHTML = `<h1>Hello</h1><div class="sub">${esc((d.teams || []).join(', ') || 'Your team')}</div>`
       + '<div class="note">Your team\u2019s screens are on the way. Until then, send /help to the bot to see what you can use.</div>';
     return;
   }
   IS_ADMIN = !!d.isAdmin;
+  TABS = d.tabs || null;
 
-  let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}</div>`;
+  let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}`
+    + `${d.teams && d.teams.length ? ' · ' + esc(d.teams.join(' + ')) : ''}</div>`;
 
   if (d.onShift) {
     h += '<div class="hero live">';
@@ -3390,17 +3442,27 @@ async function loadHome() {
   h += `<div class="card"><div class="n">${d.weekShifts}</div><div class="l">Shifts</div></div>`;
   h += '</div>';
 
+  if (d.booked && d.booked.length) {
+    h += '<h2>Appointments you booked</h2>';
+    for (const b of d.booked) {
+      h += '<div class="p tappable" data-gotovis="1"><div class="ptop">'
+         + `<div class="pn">${esc(b.day)} ${esc(b.start)} · ${esc(b.type)}</div><div class="t">›</div></div>`
+         + `<div class="t">${esc(b.customer)} · ${esc(b.specialist)}`
+         + `${b.status === 'ONSITE' ? ' · on site now' : ''}</div></div>`;
+    }
+  }
+
   if (d.openCases) {
     h += '<h2>Open cases</h2>';
     for (const c of d.cases) {
       const bits = [];
-      if (c.platform) bits.push('▫️' + esc(c.platform));
+      if (c.platform) bits.push(esc(c.platform));
       if (c.store) bits.push(esc(c.flag) + esc(c.store));
       if (c.from) bits.push('from ' + esc(c.from));
       if (c.age) bits.push(c.age + 'd' + (c.age >= 3 ? ' ⏳' : ''));
-      h += `<div class="p tappable" data-case="${c.id}">`;
+      h += `<div class="p tappable" data-case="${c.id}">` + caseTags(c);
       h += '<div class="ptop">';
-      h += `<div class="pn">${esc(c.prio)} ${esc(c.username)}</div>`;
+      h += `<div class="pn">${esc(c.username)}</div>`;
       h += '<div class="t">›</div></div>';
       h += `<div class="t">${bits.join(' · ')}</div></div>`;
     }
@@ -3412,6 +3474,9 @@ async function loadHome() {
   wire();
   const btn = document.getElementById('act');
   if (btn) btn.onclick = () => d.onShift ? doClockOut(btn) : doClockIn(btn, d.slotsToday);
+  document.querySelectorAll('[data-gotovis]').forEach(el => {
+    el.onclick = () => { VIEW = 'vis'; render(); };
+  });
   document.querySelectorAll('[data-case]').forEach(el => {
     el.onclick = () => {
       HO_SHOWN[el.dataset.case] = true;   // open it already expanded
@@ -3492,10 +3557,11 @@ function caseCard(c, closed) {
   h += `<div class="tick${ticked ? '' : ' on'}" data-id="${c.id}" `
      + `data-close="${ticked ? '0' : '1'}">${ticked ? '' : '✓'}</div>`;
   h += '<div style="flex:1">';
-  h += `<div class="nm">${c.sla ? c.sla + ' ' : ''}${esc(c.prio)} ${esc(c.username)}</div>`;
+  h += caseTags(c, c.handedBack ? [['HANDED BACK', '']] : (c.request && !c.shClosed) ? [['ONLINE REQUEST', 'blue']] : []);
+  h += `<div class="nm">${esc(c.username)}</div>`;
   const bits = [];
   if (c.channelName) bits.push(esc(c.channelName));
-  if (c.platform) bits.push('▫️' + esc(c.platform));
+  if (c.platform) bits.push(esc(c.platform));
   if (c.store) bits.push(esc(c.flag) + esc(c.store));
   if (c.from) bits.push('from ' + esc(c.from));
   if (closed && c.closedBy) bits.push('closed by ' + esc(c.closedBy));
@@ -3505,7 +3571,7 @@ function caseCard(c, closed) {
     + `${esc(c.due)}</span>`);
   if (c.section === 'follow') bits.push('follow up');
   h += `<div class="meta">${bits.join(' · ')}</div>`;
-  if (c.request && !c.shClosed && !c.handedBack) h += `<div class="st">📣 Online request from ${esc(c.request)}</div>`;
+  if (c.request && !c.shClosed && !c.handedBack) h += `<div class="st">From ${esc(c.request)} (Online)</div>`;
   else if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
   h += '</div></div>';
   if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
@@ -3531,7 +3597,7 @@ function caseCard(c, closed) {
 function caseForm(d) {
   const f = HO_FORM;
   const req = ONLINE;   // the Online team's new cases are requests for SH
-  let h = req ? '<h2>📣 New Online request</h2>'
+  let h = req ? '<h2>New Online request</h2>'
        + '<div class="note" style="margin-top:0">Goes straight to SH in that store chat.</div>' : '<h2>New case</h2>';
   if (!req) {
     h += '<div class="fld"><label>When</label><div class="pick">'
@@ -3545,7 +3611,7 @@ function caseForm(d) {
       ).join('') + '</div></div>';
   h += '<div class="fld"><label>Where from</label><div class="pick">'
     + d.platforms.map(p =>
-        `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">▫️${esc(p)}</button>`
+        `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">${esc(p)}</button>`
       ).join('') + '</div></div>';
   const storeList = f.platform === 'LIVECHAT' ? d.webstores : d.stores;
   if (f.platform) {
@@ -3572,7 +3638,7 @@ function caseForm(d) {
       : `<input id="f_${fd.key}" value="${v}" placeholder="${eg ? 'e.g. ' + esc(eg) : ''}">`;
     h += '</div>';
   }
-  h += `<button class="big" id="saveCase">${req ? '📣 Send to SH' : 'Save this case'}</button>`;
+  h += `<button class="big" id="saveCase">${req ? 'Send to SH' : 'Save this case'}</button>`;
   h += '<button class="big" id="cancelCase" style="background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111);margin-top:8px">Cancel</button>';
   return h;
 }
@@ -3603,16 +3669,16 @@ async function loadHandover() {
     for (const c of order) h += caseCard(c, false);
   }
 
-  h += '<button class="big" id="newCase" style="margin-top:14px">+  Add a case</button>';
+  h += '<button class="big" id="newCase" style="margin-top:14px">Add a case</button>';
   if (HO_CHOOSE) {
     h += '<div class="note">TC Online always gets the full handover. Store chats get only their own new cases.</div>';
-    h += '<button class="big" id="postOps" style="margin-top:8px">📤  TC Online only</button>';
-    h += '<button class="big" id="postAll" style="margin-top:8px">📤  TC Online + store chats</button>';
+    h += '<button class="big" id="postOps" style="margin-top:8px">TC Online only</button>';
+    h += '<button class="big" id="postAll" style="margin-top:8px">TC Online + store chats</button>';
     h += '<button class="big" id="postBack" style="margin-top:8px;background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111)">Back</button>';
   } else if (n) {
-    h += '<button class="big" id="postHo" style="margin-top:8px">📤  Post handover</button>';
+    h += '<button class="big" id="postHo" style="margin-top:8px">Post handover</button>';
   } else {
-    h += '<button class="big" id="postHo" style="margin-top:8px">📤  Post "nothing open"</button>';
+    h += '<button class="big" id="postHo" style="margin-top:8px">Post "nothing open"</button>';
   }
 
   if (d.closedCases.length) {
@@ -3681,7 +3747,7 @@ function wireHandover() {
     keepForm();
     save.disabled = true; save.textContent = 'Saving…';
     const out = await post('/api/case', HO_FORM);
-    save.disabled = false; save.textContent = ONLINE ? '📣 Send to SH' : 'Save this case';
+    save.disabled = false; save.textContent = ONLINE ? 'Send to SH' : 'Save this case';
     if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
     toast(out.request ? (out.sent ? 'Sent to SH' : 'Saved — SH will see it in /handover')
                       : 'Added ' + out.username);
@@ -3740,7 +3806,8 @@ const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA'
 
 function onlineCard(c, mine) {
   let h = '<div class="case"><div class="top"><div style="flex:1">';
-  h += `<div class="nm">${c.sla ? c.sla + ' ' : ''}${esc(c.prio)} ${esc(c.username)}`
+  h += caseTags(c);
+  h += `<div class="nm">${esc(c.username)}`
      + `${mine ? '' : ' <span class="meta">· not your channel</span>'}</div>`;
   const bits = [];
   if (c.store) bits.push(esc(c.flag) + esc(c.store));
@@ -3762,10 +3829,10 @@ function onlineCard(c, mine) {
     h += `<div class="addnote"><textarea id="note_${c.id}" rows="2" `
        + `placeholder="A note, or what you need from SH"></textarea></div>`;
     h += '<div class="acts">';
-    if (!c.onClosed) h += `<button data-onclose="${c.id}">✅ Close (Online)</button>`;
-    h += `<button class="soft" data-addnote="${c.id}">📝 Add note</button>`;
-    h += `<button class="soft" data-handback="${c.id}">↩️ Hand back to SH</button>`;
-    h += `<button class="soft" data-edit="${c.id}">✏️ Edit</button>`;
+    if (!c.onClosed) h += `<button data-onclose="${c.id}">Close (Online)</button>`;
+    h += `<button class="soft" data-addnote="${c.id}">Add note</button>`;
+    h += `<button class="soft" data-handback="${c.id}">Hand back to SH</button>`;
+    h += `<button class="soft" data-edit="${c.id}">Edit</button>`;
     h += '</div>';
     h += `<div class="more" data-hide="${c.id}">Hide</div>`;
   } else {
@@ -3830,7 +3897,7 @@ function renderOnline(d) {
   let h = '<h1>Handover cases</h1>';
   h += `<div class="sub">${open.length} open`
      + `${mine.size ? ' · ' + nMine + ' on your channels' : ''}</div>`;
-  h += '<button class="big" id="newCase" style="margin:10px 0 0">📣  New Online request</button>';
+  h += '<button class="big" id="newCase" style="margin:10px 0 0">+ New Online request</button>';
 
   h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
     const n = open.filter(c => c.group === g).length;
@@ -3969,7 +4036,7 @@ function visitCard(it, d) {
 function bookForm(d) {
   const f = VS.form;
   const team = (d.countries.find(c => c.code === f.country) || {}).specialists || [];
-  let h = '<h1>Book a visit</h1>';
+  let h = '<h1>Book an appointment</h1>';
   h += '<div class="fld"><label>Country</label><div class="pick">' + d.countries.map(c =>
       '<button data-bf="country" data-v="' + c.code + '" class="' + (f.country === c.code ? 'on' : '') + '">' + esc(c.name) + '</button>').join('') + '</div></div>';
   if (!team.length) {
@@ -3980,7 +4047,7 @@ function bookForm(d) {
   } else {
     h += '<div class="note" style="margin-top:0">Specialist: ' + esc(team[0].name) + '</div>';
   }
-  h += '<div class="fld"><label>Visit type</label><div class="pick">' + d.types.map(t =>
+  h += '<div class="fld"><label>Appointment type</label><div class="pick">' + d.types.map(t =>
       '<button data-bf="visit_type" data-v="' + t.key + '" class="' + (f.visit_type === t.key ? 'on' : '') + '">' + esc(t.name) + '</button>').join('') + '</div></div>';
   h += '<div class="fld"><label>Date and start time (local time there)</label><input type="date" id="bf_date" value="' + esc(f.date || '') + '">'
      + '<input type="time" id="bf_time" value="' + esc(f.time || '') + '" style="margin-top:6px">'
@@ -3993,7 +4060,7 @@ function bookForm(d) {
       ? '<textarea id="bf_' + k + '" rows="2">' + esc(f[k] || '') + '</textarea>'
       : '<input id="bf_' + k + '" value="' + esc(f[k] || '') + '">') + '</div>';
   }
-  h += '<button class="big" id="bfSave">Book the visit</button>';
+  h += '<button class="big" id="bfSave">Book the appointment</button>';
   h += '<button class="big" id="bfCancel" style="margin-top:8px;background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111)">Back</button>';
   return h;
 }
@@ -4016,10 +4083,10 @@ async function loadVisits() {
     wireVisits(d);
     return;
   }
-  let h = '<h1>' + (d.role === 'booker' ? 'On-Site visits' : 'My visits') + '</h1>';
+  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
-        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + esc(c.name) + '</button>').join('') + '</div>';
+        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + esc(c.code) + '</button>').join('') + '</div>';
     const team = d.countries.find(c => c.code === d.country).specialists;
     if (team.length > 1) {
       h += '<div class="otabs small">' + team.map(s =>
@@ -4027,7 +4094,7 @@ async function loadVisits() {
     } else if (!team.length) {
       h += '<div class="note">No On-Site Specialist in this country yet.</div>';
     }
-    h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+  Book a visit</button>';
+    h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+ Book an appointment</button>';
   } else {
     h += '<h2>My availability</h2>'
        + '<div class="note" style="margin-top:0">Tap a day. AM = not free 10am–2pm, '
@@ -4129,7 +4196,7 @@ function wireVisits(d) {
     const body = Object.assign({}, VS.form, { specialist_id: VS.form.spec || (team.length === 1 ? team[0].id : '') });
     bs.disabled = true; bs.textContent = 'Booking…';
     const out = await post('/api/visit', body);
-    bs.disabled = false; bs.textContent = 'Book the visit';
+    bs.disabled = false; bs.textContent = 'Book the appointment';
     if (!out.ok) { toast(out.error || 'Could not book that.'); return; }
     const when = VS.form.date;
     VS.form = null; VS.week = when; toast('Booked. The specialist has been told.'); loadVisits();
@@ -4349,7 +4416,7 @@ async function loadTeam() {
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
 
-  let h = '<div class="seg">'
+  let h = '<h1>Team</h1><div class="seg">'
     + `<div data-p="week" class="${MODE === 'week' ? 'on' : ''}">Week</div>`
     + `<div data-p="month" class="${MODE === 'month' ? 'on' : ''}">Month</div>`
     + '</div>';
