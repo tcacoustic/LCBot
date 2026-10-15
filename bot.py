@@ -552,6 +552,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if role == "owner":
         lines += ["", "<b>Owner</b>"]
         lines += [f"  /{c} — {d}" for c, d in OWNER_EXTRA]
+    more = team_help(user.id, extra=True)
+    if more:
+        lines += ["", "━━━━━━━━━━━━━━", more]
 
     await reply_long(
         update.message, "\n".join(lines),
