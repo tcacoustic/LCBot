@@ -2985,10 +2985,10 @@ def menu_for(user_id: int) -> list:
     depts = depts_of(user_id)
     if is_admin(user_id):
         pairs = ADMIN_COMMANDS + (OWNER_EXTRA if is_owner(user_id) else [])
-    elif is_livechat(user_id):
-        pairs = list(AGENT_COMMANDS)
     else:
-        pairs = []
+        # Someone can be in more than one team (e.g. SH who also do Livechat):
+        # they get every team's commands, once each.
+        pairs = list(AGENT_COMMANDS) if is_livechat(user_id) else []
         if "ON" in depts:
             pairs += ONLINE_COMMANDS
         if "SH" in depts or "FS" in depts:
@@ -3008,8 +3008,10 @@ def menu_for(user_id: int) -> list:
     return out
 
 
-def team_help(user_id: int) -> str:
-    """/help and /start for people who aren't on the Livechat side."""
+def team_help(user_id: int, extra: bool = False) -> str:
+    """/help and /start for people who aren't on the Livechat side.
+    extra=True: only the other teams' parts, for Livechat people who are also
+    in another team ('' if there are none)."""
     depts = depts_of(user_id)
     parts = []
     if "ON" in depts:
@@ -3024,7 +3026,9 @@ def team_help(user_id: int) -> str:
     if "ONSITE" in depts:
         parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
                      "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "
-                     "the 📎: your week, and Block out time when you're not free.")
+                     "the 📎: your week, and mark the half-days you're not free.")
+    if extra:
+        return "\n\n".join(parts)
     if not parts:
         parts.append("You're approved, and an admin is choosing your team. "
                      "You'll get a message here once that's done.")
