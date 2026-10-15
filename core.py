@@ -3165,6 +3165,8 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:16px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
     cursor:pointer; margin-top:12px; background:var(--accent); color:#fff; }
   .big.stop { background:var(--ink); }
+  /* Add a case sits above Post handover: only one orange button per screen. */
+  #newCase:has(~ #postHo), #newCase:has(~ #postOps) { background:var(--card); color:var(--ink); border:2px solid var(--ink); }
   .big[disabled] { opacity:.5; }
   .big[style*="secondary-bg"] { background:var(--card) !important; color:var(--ink) !important;
     border:2px solid var(--ink); min-height:48px; }
@@ -4063,7 +4065,7 @@ async function loadVisits() {
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
-        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + esc(c.name) + '</button>').join('') + '</div>';
+        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + esc(c.code) + '</button>').join('') + '</div>';
     const team = d.countries.find(c => c.code === d.country).specialists;
     if (team.length > 1) {
       h += '<div class="otabs small">' + team.map(s =>
