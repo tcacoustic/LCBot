@@ -26,7 +26,7 @@ FS_STORES = [
     ("SG_ADELPHI", "SG", "TC Acoustic @ The Adelphi"),
     ("MY_SONOS", "MY", "Sonos Concept Store by TC Acoustic"),
     ("HK_EXPCENTRE", "HK", "TC Experience Centre HK"),
-    ("TH_EMSPHERE", "TH", "Sonos Store EmSphere"),
+    ("TH_EMSPHERE", "TH", "Sonos Store EMSPHERE"),
 ]
 FS_STORE_NAMES = {code: name for code, _, name in FS_STORES}
 FS_STORE_COUNTRY = {code: c for code, c, _ in FS_STORES}
