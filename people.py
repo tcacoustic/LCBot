@@ -420,7 +420,7 @@ async def cmd_viewas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     arg = re.sub(r"[^a-z]", "", " ".join(context.args).lower())
     pick = {"off": "", "me": "", "livechat": "LIVECHAT", "lc": "LIVECHAT", "on": "ON",
-            "online": "ON", "onsite": "ONSITE", "sh": "SH", "fs": "FS"}
+            "online": "ON", "onsite": "ONSITE", "sh": "SH", "fs": "FS", "ops": "OPS"}
     if arg not in pick:
         now_view = viewing_as(uid)
         await update.message.reply_text(

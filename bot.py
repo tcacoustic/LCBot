@@ -900,7 +900,8 @@ def main() -> None:
                 R_TIME_TYPED: [MessageHandler(text_in, on_request_time_typed)],
                 R_CONFIRM: [CallbackQueryHandler(on_request_confirm, pattern=r"^sr:(send|stop)$")],
             },
-            fallbacks=[CommandHandler("cancel", cancel)],
+            fallbacks=[CommandHandler("cancel", cancel),
+                       CallbackQueryHandler(on_request_back, pattern=r"^sr:back$")],
             allow_reentry=True,
             conversation_timeout=1800,
         )

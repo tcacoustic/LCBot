@@ -102,7 +102,7 @@ def request_text(r, head: str = "") -> str:
         f"<b>{esc(CATEGORY_NAMES[r['category']])}</b>",
         "",
         f"Order: <code>{esc(r['order_no'])}</code>",
-        f"Delivery: {d:%a %-d %b} · {esc(timeframe_text(r))}",
+        f"Delivery: {date_label(d)} · {esc(timeframe_text(r))}",
         "",
         esc(r["details"]),
         "",
@@ -245,39 +245,37 @@ async def mark_dirty_and_sync(rid: int) -> None:
 # --------------------------------------------------------------------------
 # Sending a request: /request
 # --------------------------------------------------------------------------
+# Every step after the order number has a ‹ Back button. Each step's prompt is
+# built in one place (step_prompt) so going forward and back look the same.
 
-def country_buttons() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(name, callback_data=f"sr:y:{key}")]
-                                 for key, name in REQUEST_COUNTRIES])
-
-
-def category_buttons() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(name, callback_data=f"sr:c:{key}")]
-                                 for key, name in REQUEST_CATEGORIES])
-
-
-def date_buttons() -> InlineKeyboardMarkup:
-    today = now().date()
-    btns = []
-    for i in range(DATE_CHOICES):
-        d = today + timedelta(days=i)
-        label = "Today" if i == 0 else "Tomorrow" if i == 1 else f"{d:%a %-d %b}"
-        btns.append(InlineKeyboardButton(label, callback_data=f"sr:d:{d.isoformat()}"))
-    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
-    rows.append([InlineKeyboardButton("Another date…", callback_data="sr:d:typed")])
-    return InlineKeyboardMarkup(rows)
+BACK = InlineKeyboardButton("‹ Back", callback_data="sr:back")
+CATEGORY_HINTS = {
+    "DATE": "e.g. Customer wants it moved to Saturday afternoon.",
+    "ADDRESS": "Write the full new address, with unit number and postal code.",
+    "PRODUCT": "Which item, and what it should change to (model and colour).",
+    "STOP": "Why it should be stopped, and what happens next (refund, cancel).",
+    "OTHER": "What Ops need to do.",
+}
+# Where ‹ Back goes from each step.
+PREVIOUS = {R_COUNTRY: R_ORDER, R_CAT: R_COUNTRY, R_DETAILS: R_CAT, R_DATE: R_DETAILS,
+            R_DATE_TYPED: R_DATE, R_TIME: R_DATE, R_TIME_TYPED: R_TIME, R_CONFIRM: R_TIME}
 
 
-def time_buttons() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(name, callback_data=f"sr:t:{key}")]
-                                 for key, name in TIMEFRAMES])
+def rows_with_back(rows: list) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(rows + [[BACK]])
+
+
+def date_label(d: date) -> str:
+    """One way of writing a date everywhere in requests: Fri 16 Oct."""
+    return f"{d:%a %-d %b}"
 
 
 def confirm_buttons() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📤 Send to Ops", callback_data="sr:send"),
-        InlineKeyboardButton("✖️ Cancel", callback_data="sr:stop"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Send to Ops", callback_data="sr:send"),
+         InlineKeyboardButton("✖️ Cancel", callback_data="sr:stop")],
+        [BACK],
+    ])
 
 
 def read_date(text: str) -> date | None:
@@ -301,17 +299,83 @@ def read_date(text: str) -> date | None:
     return None
 
 
+def cutoff_note() -> str:
+    if not after_cutoff(now()):
+        return ""
+    return (f"\n\n⏰ <i>It's past the {cutoff_text()} cut-off: Ops will still see it, "
+            "and it's at the top of their list next working day.</i>")
+
+
 def draft_text(d: dict) -> str:
-    dd = date.fromisoformat(d["delivery_date"])
     tf = d.get("timeframe_other") if d["timeframe"] == "OTHER" else TIMEFRAME_NAMES[d["timeframe"]]
     lines = ["📦 <b>Check your special request</b>", "",
              f"Order: <code>{esc(d['order_no'])}</code> · {esc(REQUEST_COUNTRY_NAMES[d['country']])}",
              f"Request: <b>{esc(CATEGORY_NAMES[d['category']])}</b>",
-             f"Delivery: {dd:%a %-d %b} · {esc(tf)}", "", esc(d["details"])]
+             f"Delivery: {date_label(date.fromisoformat(d['delivery_date']))} · {esc(tf)}",
+             "", esc(d["details"])]
     if after_cutoff(now()):
         lines += ["", f"⏰ <b>It's past the {cutoff_text()} cut-off.</b> Ops will still see it now, "
                   "marked AFTER CUT-OFF, and it comes back to the top of their list next working day."]
     return "\n".join(lines)
+
+
+def step_prompt(step: int, d: dict) -> tuple:
+    """(text, buttons) for one step of /request."""
+    if step == R_ORDER:
+        now_order = f"\n\nSo far: <code>{esc(d['order_no'])}</code>. Send it again or a new one." \
+            if d.get("order_no") else ""
+        return ("📦 <b>Special request to Ops</b>\n\nWhat's the <b>order number</b>?" + now_order
+                + cutoff_note() + "\n\n<i>/cancel to stop</i>"), None
+    if step == R_COUNTRY:
+        return (f"Order: <code>{esc(d['order_no'])}</code>\n\n<b>Which country is the delivery in?</b>",
+                rows_with_back([[InlineKeyboardButton(name, callback_data=f"sr:y:{key}")]
+                                for key, name in REQUEST_COUNTRIES]))
+    if step == R_CAT:
+        return (f"{esc(REQUEST_COUNTRY_NAMES[d['country']])}\n\n<b>What's the request?</b>",
+                rows_with_back([[InlineKeyboardButton(name, callback_data=f"sr:c:{key}")]
+                                for key, name in REQUEST_CATEGORIES]))
+    if step == R_DETAILS:
+        return (f"<b>{esc(CATEGORY_NAMES[d['category']])}</b>\n\nNow the <b>details</b>, as fully as you can.\n"
+                f"<i>{esc(CATEGORY_HINTS[d['category']])}</i>\n\nPlease don't include phone or ID numbers.",
+                rows_with_back([]))
+    if step == R_DATE:
+        today = now().date()
+        btns = [InlineKeyboardButton(date_label(today + timedelta(days=i)),
+                                     callback_data=f"sr:d:{(today + timedelta(days=i)).isoformat()}")
+                for i in range(DATE_CHOICES)]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        rows.append([InlineKeyboardButton("Another date…", callback_data="sr:d:typed")])
+        label = "the new delivery date" if d.get("category") == "DATE" else "the delivery date"
+        return f"<b>What's {label}?</b>", rows_with_back(rows)
+    if step == R_DATE_TYPED:
+        return "Type the date, e.g. <code>24/10</code>.", rows_with_back([])
+    if step == R_TIME:
+        return (f"Delivery: <b>{date_label(date.fromisoformat(d['delivery_date']))}</b>\n\n<b>What time frame?</b>",
+                rows_with_back([[InlineKeyboardButton(name, callback_data=f"sr:t:{key}")]
+                                for key, name in TIMEFRAMES]))
+    if step == R_TIME_TYPED:
+        return "Type the time frame, e.g. <code>after 7pm</code>.", rows_with_back([])
+    return draft_text(d), confirm_buttons()
+
+
+async def show_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step: int) -> int:
+    """Show a step: in place when it came from a button, as a new message after typing."""
+    context.user_data["sr_step"] = step
+    text, kb = step_prompt(step, context.user_data["sr"])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+    return step
+
+
+async def on_request_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """sr:back — the step before this one, with what was picked kept."""
+    await update.callback_query.answer()
+    if "sr" not in context.user_data:
+        return ConversationHandler.END
+    step = PREVIOUS.get(context.user_data.get("sr_step"), R_ORDER)
+    return await show_step(update, context, step)
 
 
 async def cmd_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -323,14 +387,13 @@ async def cmd_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("Special requests are for SH, Livechat and FS.")
         return ConversationHandler.END
     context.user_data["sr"] = {}
-    note = ""
-    if after_cutoff(now()):
-        note = (f"\n\n⏰ <i>It's past the {cutoff_text()} cut-off: Ops will still see it, "
-                "and it's at the top of their list next working day.</i>")
-    await update.message.reply_text(
-        "📦 <b>Special request to Ops</b>\n\nWhat's the <b>order number</b>?" + note
-        + "\n\n<i>/cancel to stop</i>", parse_mode=constants.ParseMode.HTML)
-    return R_ORDER
+    return await show_step(update, context, R_ORDER)
+
+
+def picked(update: Update, context: ContextTypes.DEFAULT_TYPE, choices: dict) -> str | None:
+    """The key from an sr:<x>:<KEY> button, if it's a real choice and a request is going."""
+    key = update.callback_query.data.split(":", 2)[2]
+    return key if key in choices and "sr" in context.user_data else None
 
 
 async def on_request_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -339,42 +402,25 @@ async def on_request_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("That looks too short. Send the full order number.")
         return R_ORDER
     context.user_data.setdefault("sr", {})["order_no"] = text[:80]
-    await update.message.reply_text("<b>Which country is the delivery in?</b>",
-                                    parse_mode=constants.ParseMode.HTML, reply_markup=country_buttons())
-    return R_COUNTRY
+    return await show_step(update, context, R_COUNTRY)
 
 
 async def on_request_country(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    key = query.data.split(":")[2]
-    await query.answer()
-    if key not in REQUEST_COUNTRY_NAMES or "sr" not in context.user_data:
+    await update.callback_query.answer()
+    key = picked(update, context, REQUEST_COUNTRY_NAMES)
+    if not key:
         return ConversationHandler.END
     context.user_data["sr"]["country"] = key
-    await query.edit_message_text(f"{esc(REQUEST_COUNTRY_NAMES[key])}\n\n<b>What's the request?</b>",
-                                  parse_mode=constants.ParseMode.HTML, reply_markup=category_buttons())
-    return R_CAT
+    return await show_step(update, context, R_CAT)
 
 
 async def on_request_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    key = query.data.split(":")[2]
-    await query.answer()
-    if key not in CATEGORY_NAMES or "sr" not in context.user_data:
+    await update.callback_query.answer()
+    key = picked(update, context, CATEGORY_NAMES)
+    if not key:
         return ConversationHandler.END
     context.user_data["sr"]["category"] = key
-    hint = {
-        "DATE": "e.g. Customer wants it moved to Saturday afternoon.",
-        "ADDRESS": "Write the full new address, with unit number and postal code.",
-        "PRODUCT": "Which item, and what it should change to (model and colour).",
-        "STOP": "Why it should be stopped, and what happens next (refund, cancel).",
-        "OTHER": "What Ops need to do.",
-    }[key]
-    await query.edit_message_text(
-        f"<b>{esc(CATEGORY_NAMES[key])}</b>\n\nNow the <b>details</b>, as fully as you can.\n"
-        f"<i>{esc(hint)}</i>\n\nPlease don't include phone or ID numbers.",
-        parse_mode=constants.ParseMode.HTML)
-    return R_DETAILS
+    return await show_step(update, context, R_DETAILS)
 
 
 async def on_request_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -383,28 +429,18 @@ async def on_request_details(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("A bit more detail please, so Ops can act on it.")
         return R_DETAILS
     context.user_data["sr"]["details"] = text[:2000]
-    label = "the new delivery date" if context.user_data["sr"].get("category") == "DATE" \
-        else "the delivery date"
-    await update.message.reply_text(f"<b>What's {label}?</b>", parse_mode=constants.ParseMode.HTML,
-                                    reply_markup=date_buttons())
-    return R_DATE
+    return await show_step(update, context, R_DATE)
 
 
 async def on_request_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    value = query.data.split(":", 2)[2]
-    await query.answer()
+    await update.callback_query.answer()
     if "sr" not in context.user_data:
         return ConversationHandler.END
+    value = update.callback_query.data.split(":", 2)[2]
     if value == "typed":
-        await query.edit_message_text("Type the date, e.g. <code>24/10</code>.",
-                                      parse_mode=constants.ParseMode.HTML)
-        return R_DATE_TYPED
+        return await show_step(update, context, R_DATE_TYPED)
     context.user_data["sr"]["delivery_date"] = value
-    await query.edit_message_text(f"Delivery: <b>{date.fromisoformat(value):%a %-d %b}</b>\n\n"
-                                  "<b>What time frame?</b>", parse_mode=constants.ParseMode.HTML,
-                                  reply_markup=time_buttons())
-    return R_TIME
+    return await show_step(update, context, R_TIME)
 
 
 async def on_request_date_typed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -413,25 +449,16 @@ async def on_request_date_typed(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("I couldn't read that as a date from today on. Try e.g. 24/10.")
         return R_DATE_TYPED
     context.user_data["sr"]["delivery_date"] = d.isoformat()
-    await update.message.reply_text(f"Delivery: <b>{d:%a %-d %b}</b>\n\n<b>What time frame?</b>",
-                                    parse_mode=constants.ParseMode.HTML, reply_markup=time_buttons())
-    return R_TIME
+    return await show_step(update, context, R_TIME)
 
 
 async def on_request_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    key = query.data.split(":")[2]
-    await query.answer()
-    if key not in TIMEFRAME_NAMES or "sr" not in context.user_data:
+    await update.callback_query.answer()
+    key = picked(update, context, TIMEFRAME_NAMES)
+    if not key:
         return ConversationHandler.END
     context.user_data["sr"]["timeframe"] = key
-    if key == "OTHER":
-        await query.edit_message_text("Type the time frame, e.g. <code>after 7pm</code>.",
-                                      parse_mode=constants.ParseMode.HTML)
-        return R_TIME_TYPED
-    await query.edit_message_text(draft_text(context.user_data["sr"]),
-                                  parse_mode=constants.ParseMode.HTML, reply_markup=confirm_buttons())
-    return R_CONFIRM
+    return await show_step(update, context, R_TIME_TYPED if key == "OTHER" else R_CONFIRM)
 
 
 async def on_request_time_typed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -439,9 +466,7 @@ async def on_request_time_typed(update: Update, context: ContextTypes.DEFAULT_TY
     if not text:
         return R_TIME_TYPED
     context.user_data["sr"]["timeframe_other"] = text[:80]
-    await update.message.reply_text(draft_text(context.user_data["sr"]),
-                                    parse_mode=constants.ParseMode.HTML, reply_markup=confirm_buttons())
-    return R_CONFIRM
+    return await show_step(update, context, R_CONFIRM)
 
 
 async def post_to_ops(bot, rid: int, head: str = "") -> bool:
@@ -726,7 +751,7 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         flags = ("⏰ " if r["after_cutoff"] else "") + ("🙋 " if r["status"] == "TAKEN" else "")
         lines.append(f"{flags}<b>#{r['id']}</b> {esc(CATEGORY_NAMES[r['category']])} · "
                      f"<code>{esc(r['order_no'])}</code> · "
-                     f"{date.fromisoformat(r['delivery_date']):%a %-d %b}, {esc(timeframe_text(r))}"
+                     f"{date_label(date.fromisoformat(r['delivery_date']))}, {esc(timeframe_text(r))}"
                      + (f" · {esc(display_name_of(r['taken_by'], ''))}" if r["status"] == "TAKEN" else ""))
     lines += ["", "⏰ after cut-off · 🙋 someone's on it. Answer them in the Ops chat."]
     await reply_long(update.message, "\n".join(lines), parse_mode=constants.ParseMode.HTML)
