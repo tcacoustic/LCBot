@@ -1,38 +1,28 @@
 /**
- * Ops special requests: the bot sends each request here, and this adds a row
- * to the "Requests" tab (or updates it when Ops answer).
+ * Ops special requests from the Telegram bot, written into the "Special Req"
+ * tab the same way the Paperform does, so both can be used at once.
  *
- * Setup (once), in the Ops Google Sheet:
+ * New request  -> a new row, columns A-G:
+ *   A Person Submitted · B Timestamp · C PO # · D Category · E Description
+ *   · F Delivery Date · G Delivery Time
+ * Ops answer in Telegram -> that row's H (Ops tick) is ticked, and the
+ *   reason or note is added to J (Remarks). Anything already in J is kept.
+ * Columns I (SO #), K (Pending?) and L (Appears in Cancellation?) are never
+ * touched, and nothing outside this tab is read or changed.
+ *
+ * Setup (once), by someone with edit access to the Ops sheet:
  *   1. Extensions > Apps Script, paste this file, Save.
  *   2. Project Settings > Script Properties > Add property:
- *        SECRET = a long random password (the same value goes in the bot's
- *        REQUEST_SHEET_SECRET setting on Railway; never paste it in a chat).
+ *        SECRET = a long random password. The same value goes in the bot's
+ *        REQUEST_SHEET_SECRET setting on Railway. Never paste it in a chat.
  *   3. Deploy > New deployment > Web app.
  *        Execute as: Me.  Who has access: Anyone.
  *      (Anyone can reach the address, but nothing is written without SECRET.)
  *   4. Copy the Web app URL into the bot's REQUEST_SHEET_URL setting on Railway.
  */
 
-const SHEET_NAME = 'Requests';
-const COLUMNS = [
-  ['id', 'Request #'],
-  ['submitted_at', 'Submitted at'],
-  ['submitted_by', 'Submitted by'],
-  ['team', 'Team'],
-  ['country', 'Country'],
-  ['order_no', 'Order number'],
-  ['category', 'Request'],
-  ['details', 'Details'],
-  ['delivery_date', 'Delivery date'],
-  ['timeframe', 'Time frame'],
-  ['after_cutoff', 'After cut-off'],
-  ['status', 'Status'],
-  ['taken_by', 'Picked up by'],
-  ['handled_by', 'Handled by'],
-  ['handled_at', 'Handled at'],
-  ['reason', "Can't do reason"],
-  ['ops_note', 'Ops note'],
-];
+const SHEET_NAME = 'Special Req';
+const COL_PERSON = 1, COL_TIMESTAMP = 2, COL_PO = 3, COL_TICK = 8, COL_REMARKS = 10;
 
 function doPost(e) {
   const secret = PropertiesService.getScriptProperties().getProperty('SECRET');
@@ -45,46 +35,70 @@ function doPost(e) {
   if (!secret || body.secret !== secret) {
     return reply({ ok: false, error: 'not allowed' });
   }
-  const row = body.row || {};
-  if (!row.id) return reply({ ok: false, error: 'no id' });
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) return reply({ ok: false, error: 'no tab called ' + SHEET_NAME });
 
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
-    const sheet = getSheet();
-    const values = COLUMNS.map(([key]) => (row[key] === undefined ? '' : String(row[key])));
-    // Find this request's row by its number in column A; add a new line if it's new.
-    const last = sheet.getLastRow();
-    let at = 0;
-    if (last > 1) {
-      const ids = sheet.getRange(2, 1, last - 1, 1).getValues();
-      for (let i = 0; i < ids.length; i++) {
-        if (String(ids[i][0]) === String(row.id)) { at = i + 2; break; }
-      }
-    }
-    if (at) {
-      sheet.getRange(at, 1, 1, values.length).setValues([values]);
-    } else {
-      sheet.appendRow(values);
-    }
-    return reply({ ok: true });
+    if (body.action === 'add') return reply(addRow(sheet, body.values));
+    if (body.action === 'update') return reply(updateRow(sheet, body));
+    return reply({ ok: false, error: 'unknown action' });
   } finally {
     lock.releaseLock();
   }
 }
 
-function getSheet() {
-  const book = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = book.getSheetByName(SHEET_NAME);
-  if (!sheet) sheet = book.insertSheet(SHEET_NAME);
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(COLUMNS.map(([, title]) => title));
-    sheet.setFrozenRows(1);
-    sheet.getRange(1, 1, 1, COLUMNS.length).setFontWeight('bold');
-    // Keep order numbers and dates as typed, not turned into numbers.
-    sheet.getRange(1, 1, sheet.getMaxRows(), COLUMNS.length).setNumberFormat('@');
+function addRow(sheet, values) {
+  if (!Array.isArray(values) || values.length !== 7) return { ok: false, error: 'need 7 values' };
+  const row = lastFilledRow(sheet) + 1;
+  const range = sheet.getRange(row, 1, 1, 7);
+  range.setNumberFormat('@');            // keep PO #, dates and times exactly as sent
+  range.setValues([values.map(String)]);
+  return { ok: true, row: row };
+}
+
+function updateRow(sheet, body) {
+  const row = findRow(sheet, body.row, body.po, body.timestamp);
+  if (!row) return { ok: false, error: 'row not found' };
+  if (body.ticked) {
+    const tick = sheet.getRange(row, COL_TICK);
+    if (tick.isChecked() !== null) tick.check();   // a checkbox column
+    else if (!tick.getValue()) tick.setValue('Done');
   }
-  return sheet;
+  if (body.remarks) {
+    const cell = sheet.getRange(row, COL_REMARKS);
+    const now = String(cell.getValue() || '');
+    if (now.indexOf(body.remarks) === -1) cell.setValue(now ? now + ' | ' + body.remarks : body.remarks);
+  }
+  return { ok: true };
+}
+
+// The bot remembers each request's row, but rows can move (sorting, deleting),
+// so it's checked against the PO # and timestamp, and searched for if it moved.
+function findRow(sheet, hint, po, timestamp) {
+  const matches = r => String(sheet.getRange(r, COL_PO).getDisplayValue()) === String(po)
+    && String(sheet.getRange(r, COL_TIMESTAMP).getDisplayValue()) === String(timestamp);
+  const last = lastFilledRow(sheet);
+  if (hint && hint <= last && matches(hint)) return hint;
+  if (last < 2) return 0;
+  const data = sheet.getRange(2, COL_TIMESTAMP, last - 1, 2).getDisplayValues();
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (String(data[i][0]) === String(timestamp) && String(data[i][1]) === String(po)) return i + 2;
+  }
+  return 0;
+}
+
+// The last row with something in column A or B: checkboxes further down
+// don't count as filled.
+function lastFilledRow(sheet) {
+  const last = sheet.getLastRow();
+  if (last < 1) return 0;
+  const ab = sheet.getRange(1, COL_PERSON, last, 2).getDisplayValues();
+  for (let i = ab.length - 1; i >= 0; i--) {
+    if (ab[i][0] !== '' || ab[i][1] !== '') return i + 1;
+  }
+  return 0;
 }
 
 function reply(obj) {

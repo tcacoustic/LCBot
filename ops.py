@@ -150,52 +150,85 @@ def get_request(rid: int):
 # Google Sheet: one row per request, kept up to date by request number
 # --------------------------------------------------------------------------
 
-def sheet_row(r) -> dict:
-    return {
-        "id": r["id"],
-        "submitted_at": datetime.fromisoformat(r["created_at"]).strftime("%Y-%m-%d %H:%M"),
-        "submitted_by": display_name_of(r["created_by"], ""),
-        "team": team_of(r["created_by"]),
-        "country": r["country"] or "",
-        "order_no": r["order_no"],
-        "category": CATEGORY_NAMES[r["category"]],
-        "details": r["details"],
-        "delivery_date": r["delivery_date"],
-        "timeframe": timeframe_text(r),
-        "after_cutoff": "Yes" if r["after_cutoff"] else "No",
-        "status": STATUS_NAMES.get(r["status"], r["status"]),
-        "taken_by": display_name_of(r["taken_by"], "") if r["taken_by"] else "",
-        "handled_by": display_name_of(r["handled_by"], "") if r["handled_by"] else "",
-        "handled_at": datetime.fromisoformat(r["handled_at"]).strftime("%Y-%m-%d %H:%M") if r["handled_at"] else "",
-        "reason": CANT_NAMES.get(r["reason"], r["reason"] or ""),
-        "ops_note": r["ops_note"] or "",
-    }
+# The Ops team's "Special Req" tab, filled the same way their Paperform does:
+# A person · B timestamp · C PO # · D category · E description · F delivery date
+# · G delivery time. H (Ops tick) and J (remarks) are filled when Ops answer
+# here; I, K and L stay Ops' own.
+SHEET_CATEGORY = {
+    "DATE": "Change Delivery Date/Time",
+    "ADDRESS": "Change Delivery Address",
+    "PRODUCT": "Change Product/Colour",
+    "STOP": "Stop Delivery",
+    "OTHER": "Others",
+}
+SHEET_TIME = {"ANY": "Anytime", "AM": "10am-2pm", "PM": "2pm-6pm"}
 
 
-def _post_to_sheet(payload: dict) -> bool:
+def sheet_values(r) -> list:
+    """Columns A to G, as Paperform writes them."""
+    return [
+        display_name_of(r["created_by"], ""),
+        datetime.fromisoformat(r["created_at"]).strftime("%d-%m-%Y, %H:%M:%S"),
+        r["order_no"],
+        SHEET_CATEGORY[r["category"]],
+        r["details"],
+        date.fromisoformat(r["delivery_date"]).strftime("%d-%b-%Y"),
+        SHEET_TIME.get(r["timeframe"]) or (r["timeframe_other"] or "Other"),
+    ]
+
+
+def sheet_remarks(r) -> str:
+    """What the bot adds to Remarks (J) once Ops answer."""
+    bits = []
+    if r["status"] == "CANT":
+        bits.append("Can't do: " + CANT_NAMES.get(r["reason"], r["reason"] or ""))
+    if r["ops_note"]:
+        bits.append("Ops note: " + r["ops_note"])
+    return " · ".join(bits)
+
+
+def sheet_payload(r) -> dict:
+    if not r["sheet_row"]:
+        return {"secret": REQUEST_SHEET_SECRET, "action": "add", "values": sheet_values(r)}
+    return {"secret": REQUEST_SHEET_SECRET, "action": "update", "row": r["sheet_row"],
+            "po": r["order_no"], "timestamp": sheet_values(r)[1],
+            "ticked": r["status"] in ("DONE", "CANT"), "remarks": sheet_remarks(r)}
+
+
+def _post_to_sheet(payload: dict) -> dict:
     req = urllib.request.Request(
         REQUEST_SHEET_URL, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=20) as resp:
-        out = json.loads(resp.read().decode() or "{}")
-    return bool(out.get("ok"))
+        return json.loads(resp.read().decode() or "{}")
 
 
 async def sync_to_sheet(rid: int) -> None:
-    """Add or update this request's row. Left marked for the retry job if it fails."""
+    """Add this request's row, or bring its tick and remarks up to date.
+    Left marked for the retry job if the sheet can't be reached."""
     if not (REQUEST_SHEET_URL and REQUEST_SHEET_SECRET):
         return
     r = get_request(rid)
     if not r:
         return
     try:
-        ok = await asyncio.to_thread(_post_to_sheet, {"secret": REQUEST_SHEET_SECRET, "row": sheet_row(r)})
+        out = await asyncio.to_thread(_post_to_sheet, sheet_payload(r))
     except Exception as e:
         log.info("Ops sheet: couldn't write request %s: %s", rid, e)
-        ok = False
-    if ok:
+        return
+    if not out.get("ok"):
+        log.info("Ops sheet refused request %s: %s", rid, out.get("error"))
+        return
+    async with write_lock:
+        if out.get("row"):
+            run("UPDATE special_requests SET sheet_row=? WHERE id=?", (int(out["row"]), rid))
+        run("UPDATE special_requests SET sheet_dirty=0 WHERE id=?", (rid,))
+    # A new row and an answer that came before it reached the sheet: send that too.
+    r = get_request(rid)
+    if out.get("row") and (r["status"] in ("DONE", "CANT") or r["ops_note"]):
         async with write_lock:
-            run("UPDATE special_requests SET sheet_dirty=0 WHERE id=?", (rid,))
+            run("UPDATE special_requests SET sheet_dirty=1 WHERE id=?", (rid,))
+        await sync_to_sheet(rid)
 
 
 async def job_sheet_retry(context: ContextTypes.DEFAULT_TYPE) -> None:
