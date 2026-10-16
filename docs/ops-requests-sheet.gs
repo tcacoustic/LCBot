@@ -5,7 +5,7 @@
  * New request  -> a new row, columns A-G:
  *   A Person Submitted · B Timestamp · C PO # · D Category · E Description
  *   · F Delivery Date · G Delivery Time
- * Ops answer in Telegram -> that row's H (Ops tick) is ticked, and the
+ * Ops answer in Telegram -> that row's H checkbox (Ops tick) is ticked, and the
  *   reason or note is added to J (Remarks). Anything already in J is kept.
  * Columns I (SO #), K (Pending?) and L (Appears in Cancellation?) are never
  * touched, and nothing outside this tab is read or changed.

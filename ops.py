@@ -151,7 +151,7 @@ def get_request(rid: int):
 # --------------------------------------------------------------------------
 
 # The Ops team's "Special Req" tab, filled the same way their Paperform does:
-# A person · B timestamp · C PO # · D category · E description · F delivery date
+# A person · B timestamp (yyyy-mm-dd hh:mm:ss) · C PO # · D category · E description · F delivery date
 # · G delivery time. H (Ops tick) and J (remarks) are filled when Ops answer
 # here; I, K and L stay Ops' own.
 SHEET_CATEGORY = {
@@ -168,7 +168,7 @@ def sheet_values(r) -> list:
     """Columns A to G, as Paperform writes them."""
     return [
         display_name_of(r["created_by"], ""),
-        datetime.fromisoformat(r["created_at"]).strftime("%d-%m-%Y, %H:%M:%S"),
+        datetime.fromisoformat(r["created_at"]).strftime("%Y-%m-%d %H:%M:%S"),
         r["order_no"],
         SHEET_CATEGORY[r["category"]],
         r["details"],
