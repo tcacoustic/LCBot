@@ -19,6 +19,7 @@ const COLUMNS = [
   ['submitted_at', 'Submitted at'],
   ['submitted_by', 'Submitted by'],
   ['team', 'Team'],
+  ['country', 'Country'],
   ['order_no', 'Order number'],
   ['category', 'Request'],
   ['details', 'Details'],
@@ -26,9 +27,11 @@ const COLUMNS = [
   ['timeframe', 'Time frame'],
   ['after_cutoff', 'After cut-off'],
   ['status', 'Status'],
+  ['taken_by', 'Picked up by'],
   ['handled_by', 'Handled by'],
   ['handled_at', 'Handled at'],
   ['reason', "Can't do reason"],
+  ['ops_note', 'Ops note'],
 ];
 
 function doPost(e) {
@@ -79,7 +82,7 @@ function getSheet() {
     sheet.setFrozenRows(1);
     sheet.getRange(1, 1, 1, COLUMNS.length).setFontWeight('bold');
     // Keep order numbers and dates as typed, not turned into numbers.
-    sheet.getRange('A:N').setNumberFormat('@');
+    sheet.getRange(1, 1, sheet.getMaxRows(), COLUMNS.length).setNumberFormat('@');
   }
   return sheet;
 }

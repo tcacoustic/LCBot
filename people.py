@@ -47,6 +47,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     status = agent_status(user.id)
 
+    # From 📝 Note to sender under a special request in an Ops chat.
+    if context.args and context.args[0].startswith("srn_"):
+        from ops import start_ops_note
+        return await start_ops_note(update, context, context.args[0][4:])
+
     # From 📝 Note under a case in a store chat: take the note here, privately.
     if context.args and context.args[0].startswith("note_") and (
             status == "active" or is_owner(user.id)):

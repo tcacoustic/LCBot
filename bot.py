@@ -727,6 +727,9 @@ def main() -> None:
                 CASE_NOTE: [   # /start note_<id> from a store chat's 📝 Note
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text)
                 ],
+                SR_NOTE: [     # /start srn_<id> from 📝 Note to sender in an Ops chat
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_ops_note_text)
+                ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
@@ -888,6 +891,7 @@ def main() -> None:
             entry_points=[CommandHandler("request", cmd_request)],
             states={
                 R_ORDER: [MessageHandler(text_in, on_request_order)],
+                R_COUNTRY: [CallbackQueryHandler(on_request_country, pattern=r"^sr:y:[A-Z]{2}$")],
                 R_CAT: [CallbackQueryHandler(on_request_category, pattern=r"^sr:c:[A-Z]+$")],
                 R_DETAILS: [MessageHandler(text_in, on_request_details)],
                 R_DATE: [CallbackQueryHandler(on_request_date, pattern=r"^sr:d:")],
@@ -901,7 +905,7 @@ def main() -> None:
             conversation_timeout=1800,
         )
     )
-    app.add_handler(CallbackQueryHandler(on_ops_button, pattern=r"^sr:(ok|no|bk):\d+$|^sr:nr:\d+:[A-Z]+$"))
+    app.add_handler(CallbackQueryHandler(on_ops_button, pattern=r"^sr:(tk|ok|no|bk):\d+$|^sr:nr:\d+:[A-Z]+$"))
     app.add_handler(CommandHandler("opschat", cmd_opschat))
     app.add_handler(CommandHandler("requests", cmd_requests))
     app.add_handler(

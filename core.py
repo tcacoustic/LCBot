@@ -162,7 +162,7 @@ OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
 # re-posted at the top of the next working morning. The sheet URL is the Apps
 # Script web app on the Ops sheet; the secret must match its Script Property.
 REQUEST_CUTOFF = os.environ.get("REQUEST_CUTOFF", "").strip() or "14:00"
-REQUEST_CARRY_TIME = os.environ.get("REQUEST_CARRY_TIME", "").strip() or "09:00"
+REQUEST_CARRY_TIME = os.environ.get("REQUEST_CARRY_TIME", "").strip() or "10:00"
 REQUEST_SHEET_URL = os.environ.get("REQUEST_SHEET_URL", "").strip()
 REQUEST_SHEET_SECRET = os.environ.get("REQUEST_SHEET_SECRET", "").strip()
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
@@ -570,6 +570,7 @@ if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
 db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     order_no        TEXT NOT NULL,
+    country         TEXT,
     category        TEXT NOT NULL,
     details         TEXT NOT NULL,
     delivery_date   TEXT NOT NULL,
@@ -580,12 +581,19 @@ db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
     after_cutoff    INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'OPEN',
     reason          TEXT,
+    taken_by        INTEGER,
+    taken_at        TEXT,
+    ops_note        TEXT,
     handled_by      INTEGER,
     handled_at      TEXT,
     ops_chat_id     INTEGER,
     ops_msg_id      INTEGER,
     sheet_dirty     INTEGER NOT NULL DEFAULT 1
 )""")
+_cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
+for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT"):
+    if _col.split()[0] not in _cols:
+        db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     case_id    INTEGER NOT NULL,
@@ -3068,7 +3076,8 @@ def team_help(user_id: int, extra: bool = False) -> str:
                      "/request — special request to Ops (delivery changes)")
     if "OPS" in depts:
         parts.append("👋 <b>Ops</b>\n\nSpecial requests from SH, Livechat and FS post in the "
-                     "Ops group: tap ✅ Done or 🚫 Can't do and the sender is told. Requests "
+                     "Ops chat: tap 🙋 I'm on it, then ✅ Done or 🚫 Can't do, and the sender is told. "
+                     "📝 Note to sender sends them a short message. Requests "
                      "after the cut-off are marked ⏰ and come back first thing the next "
                      "working day.\n/requests — the ones still open")
     if "ONSITE" in depts:
