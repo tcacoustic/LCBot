@@ -62,9 +62,21 @@ def ops_target(country: str = "") -> dict | None:
     return None
 
 
-def after_cutoff(when: datetime) -> bool:
-    """Sent at or after the cut-off, or on a weekend: Ops pick it up next working day."""
+def past_cutoff(when: datetime) -> bool:
+    """At or after today's cut-off, or a weekend (the cut-off was Friday's)."""
     return when.weekday() >= 5 or when.hour * 60 + when.minute >= parse_time_token(REQUEST_CUTOFF)
+
+
+def cutoff_kind(when: datetime, delivery: date) -> str:
+    """'URGENT' for a delivery today, 'LATE' for one on the next working day (or a
+    weekend before it) asked for after the cut-off, '' otherwise. The cut-off is
+    for next-day deliveries: anything further out is on time whenever it's sent."""
+    if delivery <= when.date():
+        return "URGENT"
+    if past_cutoff(when) and delivery <= next_working_day(when.date()):
+        return "LATE"
+    return ""
+
 
 
 def clock_text(token: str) -> str:
@@ -96,7 +108,7 @@ def request_text(r, head: str = "") -> str:
     """The request as Ops see it in their chat (HTML)."""
     d = date.fromisoformat(r["delivery_date"])
     lines = [head] if head else []
-    tag = "⏰ <b>AFTER CUT-OFF</b> · " if r["after_cutoff"] else ""
+    tag = "🔴 <b>URGENT · SAME DAY</b> · " if r["urgent"] else "⏰ <b>AFTER CUT-OFF</b> · " if r["after_cutoff"] else ""
     lines += [
         f"{tag}📦 <b>Special request #{r['id']}</b> · {esc(REQUEST_COUNTRY_NAMES.get(r['country'] or '', ''))}",
         f"<b>{esc(CATEGORY_NAMES[r['category']])}</b>",
@@ -300,10 +312,26 @@ def read_date(text: str) -> date | None:
 
 
 def cutoff_note() -> str:
-    if not after_cutoff(now()):
-        return ""
-    return (f"\n\n⏰ <i>It's past the {cutoff_text()} cut-off: Ops will still see it, "
-            "and it's at the top of their list next working day.</i>")
+    """Under the date buttons: what today's date and the next working day mean."""
+    today = now().date()
+    lines = [f"<i>{date_label(today)} is today: a same-day request, marked 🔴 URGENT.</i>"]
+    if past_cutoff(now()):
+        nwd = next_working_day(today)
+        lines.append(f"<i>⏰ It's past the {cutoff_text()} cut-off, so deliveries up to "
+                     f"{date_label(nwd)} are after cut-off.</i>")
+    return "\n\n" + "\n".join(lines)
+
+
+def cutoff_warning(d: dict) -> str:
+    kind = cutoff_kind(now(), date.fromisoformat(d["delivery_date"]))
+    if kind == "URGENT":
+        return "🔴 <b>Same-day delivery.</b> Ops will see it marked URGENT."
+    if kind == "LATE":
+        day = date.fromisoformat(d["delivery_date"])
+        later = next_working_day(max(day, next_working_day(now().date())) )
+        return (f"⏰ <b>After the {cutoff_text()} cut-off for {date_label(day)}.</b> Ops will try, but it "
+                f"may move to {date_label(later)}: check the customer is OK with that.")
+    return ""
 
 
 def draft_text(d: dict) -> str:
@@ -313,9 +341,9 @@ def draft_text(d: dict) -> str:
              f"Request: <b>{esc(CATEGORY_NAMES[d['category']])}</b>",
              f"Delivery: {date_label(date.fromisoformat(d['delivery_date']))} · {esc(tf)}",
              "", esc(d["details"])]
-    if after_cutoff(now()):
-        lines += ["", f"⏰ <b>It's past the {cutoff_text()} cut-off.</b> Ops will still see it now, "
-                  "marked AFTER CUT-OFF, and it comes back to the top of their list next working day."]
+    warn = cutoff_warning(d)
+    if warn:
+        lines += ["", warn]
     return "\n".join(lines)
 
 
@@ -325,7 +353,7 @@ def step_prompt(step: int, d: dict) -> tuple:
         now_order = f"\n\nSo far: <code>{esc(d['order_no'])}</code>. Send it again or a new one." \
             if d.get("order_no") else ""
         return ("📦 <b>Special request to Ops</b>\n\nWhat's the <b>order number</b>?" + now_order
-                + cutoff_note() + "\n\n<i>/cancel to stop</i>"), None
+                + "\n\n<i>/cancel to stop</i>"), None
     if step == R_COUNTRY:
         return (f"Order: <code>{esc(d['order_no'])}</code>\n\n<b>Which country is the delivery in?</b>",
                 rows_with_back([[InlineKeyboardButton(name, callback_data=f"sr:y:{key}")]
@@ -346,7 +374,7 @@ def step_prompt(step: int, d: dict) -> tuple:
         rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
         rows.append([InlineKeyboardButton("Another date…", callback_data="sr:d:typed")])
         label = "the new delivery date" if d.get("category") == "DATE" else "the delivery date"
-        return f"<b>What's {label}?</b>", rows_with_back(rows)
+        return f"<b>What's {label}?</b>" + cutoff_note(), rows_with_back(rows)
     if step == R_DATE_TYPED:
         return "Type the date, e.g. <code>24/10</code>.", rows_with_back([])
     if step == R_TIME:
@@ -524,16 +552,18 @@ async def on_request_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("Cancelled. Nothing was sent.")
         return ConversationHandler.END
     created = now()
+    kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]))
     async with write_lock:
         rid = run(
             "INSERT INTO special_requests (order_no, country, category, details, delivery_date, timeframe,"
-            " timeframe_other, created_by, created_at, after_cutoff, status, sheet_dirty)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?, 'OPEN', 1)",
+            " timeframe_other, created_by, created_at, after_cutoff, urgent, status, sheet_dirty)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?, 'OPEN', 1)",
             (d["order_no"], d["country"], d["category"], d["details"], d["delivery_date"], d["timeframe"],
              d.get("timeframe_other"), query.from_user.id, created.isoformat(),
-             1 if after_cutoff(created) else 0)).lastrowid
+             1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0)).lastrowid
     posted = await post_to_ops(context.bot, rid)
-    late = " It's after the cut-off, so it's marked for Ops' next working day." if after_cutoff(created) else ""
+    late = {"LATE": " It's after the cut-off, so it may move to a later day.",
+            "URGENT": " It's same-day, so Ops see it as URGENT."}.get(kind, "")
     if posted:
         await query.edit_message_text(
             f"✅ Sent to Ops as <b>request #{rid}</b>.{late}\nI'll message you when they pick it up.",
@@ -729,8 +759,9 @@ async def cmd_opschat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     where = REQUEST_COUNTRY_NAMES[country] if country else "any country without its own chat"
     await update.message.reply_text(
         f"✅ Special requests for {where} will be posted here"
-        f"{' (this topic)' if thread else ''}. Requests after {cutoff_text()} are marked AFTER "
-        f"CUT-OFF and come back at {clock_text(REQUEST_CARRY_TIME)} the next working day.")
+        f"{' (this topic)' if thread else ''}. Next-working-day deliveries asked for after "
+        f"{cutoff_text()} are marked ⏰ AFTER CUT-OFF and come back at {clock_text(REQUEST_CARRY_TIME)} "
+        "the next working day; same-day ones are marked 🔴 URGENT.")
 
 
 async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -738,7 +769,7 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if update.effective_chat.type != constants.ChatType.PRIVATE or not is_ops(update.effective_user.id):
         return
     rows = q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN')"
-             " ORDER BY country, after_cutoff, delivery_date, id")
+             " ORDER BY country, urgent DESC, after_cutoff DESC, delivery_date, id")
     if not rows:
         await update.message.reply_text("No special requests open. 🎉")
         return
@@ -748,10 +779,10 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if r["country"] != last:
             last = r["country"]
             lines += ["", f"<b>{esc(REQUEST_COUNTRY_NAMES.get(last or '', 'No country'))}</b>"]
-        flags = ("⏰ " if r["after_cutoff"] else "") + ("🙋 " if r["status"] == "TAKEN" else "")
+        flags = ("🔴 " if r["urgent"] else "⏰ " if r["after_cutoff"] else "") + ("🙋 " if r["status"] == "TAKEN" else "")
         lines.append(f"{flags}<b>#{r['id']}</b> {esc(CATEGORY_NAMES[r['category']])} · "
                      f"<code>{esc(r['order_no'])}</code> · "
                      f"{date_label(date.fromisoformat(r['delivery_date']))}, {esc(timeframe_text(r))}"
                      + (f" · {esc(display_name_of(r['taken_by'], ''))}" if r["status"] == "TAKEN" else ""))
-    lines += ["", "⏰ after cut-off · 🙋 someone's on it. Answer them in the Ops chat."]
+    lines += ["", "🔴 same day · ⏰ after cut-off · 🙋 someone's on it. Answer them in the Ops chat."]
     await reply_long(update.message, "\n".join(lines), parse_mode=constants.ParseMode.HTML)

@@ -578,7 +578,8 @@ db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
     timeframe_other TEXT,
     created_by      INTEGER NOT NULL,
     created_at      TEXT NOT NULL,
-    after_cutoff    INTEGER NOT NULL DEFAULT 0,
+    after_cutoff    INTEGER NOT NULL DEFAULT 0,   -- next working day's delivery, asked after 2pm
+    urgent          INTEGER NOT NULL DEFAULT 0,   -- same-day delivery
     status          TEXT NOT NULL DEFAULT 'OPEN',
     reason          TEXT,
     taken_by        INTEGER,
@@ -592,7 +593,8 @@ db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
     sheet_row       INTEGER
 )""")
 _cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
-for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER"):
+for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER",
+             "urgent INTEGER NOT NULL DEFAULT 0"):
     if _col.split()[0] not in _cols:
         db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
@@ -3078,9 +3080,9 @@ def team_help(user_id: int, extra: bool = False) -> str:
     if "OPS" in depts:
         parts.append("👋 <b>Ops</b>\n\nSpecial requests from SH, Livechat and FS post in the "
                      "Ops chat: tap 🙋 I'm on it, then ✅ Done or 🚫 Can't do, and the sender is told. "
-                     "📝 Note to sender sends them a short message. Requests "
-                     "after the cut-off are marked ⏰ and come back first thing the next "
-                     "working day.\n/requests — the ones still open")
+                     "📝 Note to sender sends them a short message. Next-working-day "
+                     "deliveries asked for after the 2pm cut-off are marked ⏰ and come back "
+                     "at 10am the next working day; same-day ones are 🔴 URGENT.\n/requests — the ones still open")
     if "ONSITE" in depts:
         parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
                      "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "
