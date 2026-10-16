@@ -158,6 +158,13 @@ GROUP_THREAD_ID = env_int("GROUP_THREAD_ID") or None
 # the text to copy instead.
 OPS_CHAT_ID = env_int("OPS_CHAT_ID")
 OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
+# Ops special requests (ops.py). Requests at or after the cut-off are tagged and
+# re-posted at the top of the next working morning. The sheet URL is the Apps
+# Script web app on the Ops sheet; the secret must match its Script Property.
+REQUEST_CUTOFF = os.environ.get("REQUEST_CUTOFF", "").strip() or "14:00"
+REQUEST_CARRY_TIME = os.environ.get("REQUEST_CARRY_TIME", "").strip() or "10:00"
+REQUEST_SHEET_URL = os.environ.get("REQUEST_SHEET_URL", "").strip()
+REQUEST_SHEET_SECRET = os.environ.get("REQUEST_SHEET_SECRET", "").strip()
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
 # Set TEST_MODE=on only on the test bot: lets the owner try the Online team's
@@ -559,6 +566,37 @@ if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
 if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
 # Who did what to a case, and any note they left.
+# Special requests to Ops (ops.py): one row each, mirrored to the Ops sheet.
+db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no        TEXT NOT NULL,
+    country         TEXT,
+    category        TEXT NOT NULL,
+    details         TEXT NOT NULL,
+    delivery_date   TEXT NOT NULL,
+    timeframe       TEXT NOT NULL,
+    timeframe_other TEXT,
+    created_by      INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    after_cutoff    INTEGER NOT NULL DEFAULT 0,   -- next working day's delivery, asked after 2pm
+    urgent          INTEGER NOT NULL DEFAULT 0,   -- same-day delivery
+    status          TEXT NOT NULL DEFAULT 'OPEN',
+    reason          TEXT,
+    taken_by        INTEGER,
+    taken_at        TEXT,
+    ops_note        TEXT,
+    handled_by      INTEGER,
+    handled_at      TEXT,
+    ops_chat_id     INTEGER,
+    ops_msg_id      INTEGER,
+    sheet_dirty     INTEGER NOT NULL DEFAULT 1,
+    sheet_row       INTEGER
+)""")
+_cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
+for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER",
+             "urgent INTEGER NOT NULL DEFAULT 0"):
+    if _col.split()[0] not in _cols:
+        db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     case_id    INTEGER NOT NULL,
@@ -1113,6 +1151,7 @@ DEPARTMENTS = [
     ("ONSITE", "On-Site"),
     ("SH", "SH"),
     ("FS", "FS"),
+    ("OPS", "Ops"),
 ]
 DEPT_NAMES = dict(DEPARTMENTS)
 # Livechat people, for the lists that are about shifts, avails and pay.
@@ -2899,6 +2938,9 @@ ADMIN_GROUPS = [
         ("specialists", "On-Site Specialists by country"),
         ("visits", "On-Site visits and follow-ups"),
         ("visitchat", "Post On-Site visit reports in this group"),
+        ("request", "Send a special request to Ops"),
+        ("requests", "Special requests still open"),
+        ("opschat", "Post special requests in this group (Ops)"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -2958,6 +3000,7 @@ SH_HELP = (
     "/cases — open cases: add a note, or close your side. Online requests "
     "from the ON team are marked 📣.\n"
     "/visits — On-Site visits and follow-ups. Book visits in the <b>App</b>.\n"
+    "/request — special request to Ops (delivery changes)\n"
     "/help — this list again"
 )
 
@@ -2970,6 +3013,12 @@ ONSITE_COMMANDS = [
 ]
 FS_COMMANDS = [
     ("store", "Change the store you're at"),
+]
+REQUEST_COMMANDS = [
+    ("request", "Special request to Ops: delivery changes"),
+]
+OPS_COMMANDS = [
+    ("requests", "Special requests still open"),
 ]
 
 ONLINE_COMMANDS = [
@@ -2997,6 +3046,10 @@ def menu_for(user_id: int) -> list:
             pairs += FS_COMMANDS
         if "ONSITE" in depts:
             pairs += ONSITE_COMMANDS
+        if depts & {"SH", "LIVECHAT", "FS"}:
+            pairs += REQUEST_COMMANDS
+        if "OPS" in depts:
+            pairs += OPS_COMMANDS
         pairs += [("help", "List commands")]
     if viewing_as(user_id):
         pairs = pairs + [("viewas", "Back to your own view")]
@@ -3022,7 +3075,14 @@ def team_help(user_id: int, extra: bool = False) -> str:
         parts.append("👋 <b>FS</b>\n\nBook on-site visits in the <b>App</b> by the 📎: "
                      "pick the country, the date and time, and the customer's details. "
                      "The specialist is told straight away.\n/visits — upcoming visits "
-                     "and follow-ups\n/store — change the store you're at")
+                     "and follow-ups\n/store — change the store you're at\n"
+                     "/request — special request to Ops (delivery changes)")
+    if "OPS" in depts:
+        parts.append("👋 <b>Ops</b>\n\nSpecial requests from SH, Livechat and FS post in the "
+                     "Ops chat: tap 🙋 I'm on it, then ✅ Done or 🚫 Can't do, and the sender is told. "
+                     "📝 Note to sender sends them a short message. Next-working-day "
+                     "deliveries asked for after the 2pm cut-off are marked ⏰ and come back "
+                     "at 10am the next working day; same-day ones are 🔴 URGENT.\n/requests — the ones still open")
     if "ONSITE" in depts:
         parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
                      "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "

@@ -220,9 +220,8 @@ def my_bookings(user_id: int, limit: int = 3) -> list:
     out = []
     for v in rows:
         start, _ = span_of(v)
-        local_today = datetime.now(COUNTRY_TZ[v["country"]]).date()
         out.append({**visit_item(v, "booker"),
-                    "day": "Today" if start.date() == local_today else start.strftime("%a %-d")})
+                    "day": start.strftime("%a %-d %b")})
     return out
 
 
