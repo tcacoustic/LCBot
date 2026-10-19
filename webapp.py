@@ -5,6 +5,7 @@ Part of the LC avails bot. Shared helpers live in core.py.
 
 from core import *  # noqa: F401,F403
 from onsite import *  # noqa: F401,F403
+from ops import may_request, request_form_payload, web_request_add
 
 async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open the hours summary."""
@@ -631,7 +632,7 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
     return {"ok": True, "username": r["username"]}
 
 
-VISIT_POSTS = {"/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
+VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
                "/api/block", "/api/block/remove", "/api/block/day"}
 
 
@@ -957,7 +958,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true}')
             return
         if path.startswith("/api/") and path not in ("/api/handover", "/api/home",
-                                                     "/api/visits", "/api/cases/search"):
+                                                     "/api/visits", "/api/cases/search",
+                                                     "/api/requests"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
@@ -979,6 +981,25 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     uid, one("week"), one("country"), one("spec"), one("avail"))).encode())
             except Exception as e:
                 log.warning("Visits view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
+        if path == "/api/requests":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid) or not may_request(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._send(200, json.dumps(request_form_payload(uid, (qs.get("country") or [""])[0])).encode())
+            except Exception as e:
+                log.warning("Request form failed: %s", e)
                 try:
                     self._send(500, b'{"error":"server"}')
                 except Exception:
@@ -1059,7 +1080,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     return
                 if visit_role(uid) and not is_livechat(uid):
                     # SH, FS and On-Site open on the visits calendar.
-                    self._send(200, json.dumps({"visits": True, "tabs": app_tabs(uid)}).encode())
+                    self._send(200, json.dumps({"visits": True, "tabs": app_tabs(uid),
+                                                "canRequest": may_request(uid)}).encode())
                     return
                 if not is_livechat(uid):
                     # Anyone else outside Livechat: their screens are still to come.
@@ -1073,6 +1095,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(uid)]
                 data["teams"] = teams if len(teams) > 1 else []
                 data["booked"] = my_bookings(uid) if visit_role(uid) == "booker" else []
+                data["canRequest"] = may_request(uid)
                 self._send(200, json.dumps(data).encode())
             except Exception as e:
                 log.warning("Home view failed: %s", e)
@@ -1228,6 +1251,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 cid = 0
             out = (web_case_toggle(uid, cid, bool(body.get("close", True)))
                    if cid else {"ok": False, "error": "No case given."})
+        elif path == "/api/request":
+            out = web_request_add(uid, body)
         elif path in VISIT_POSTS:
             out = web_visit_post(uid, path, body if isinstance(body, dict) else {})
         elif path == "/api/case/handback":

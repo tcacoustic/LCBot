@@ -3322,6 +3322,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:16px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
     cursor:pointer; margin-top:12px; background:var(--accent); color:#fff; }
   .big.stop { background:var(--ink); }
+  .big.ghost { background:var(--card); color:var(--ink); border:2px solid var(--ink); min-height:50px; }
   /* Add a case sits above Post handover: only one orange button per screen. */
   #newCase:has(~ #postHo), #newCase:has(~ #postOps) { background:var(--card); color:var(--ink); border:2px solid var(--ink); }
   .big[disabled] { opacity:.5; }
@@ -3574,7 +3575,7 @@ async function loadHome() {
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
   if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
-  if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; VIEW = 'vis'; return loadVisits(); }
+  if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; CAN_REQUEST = !!d.canRequest; VIEW = 'vis'; return loadVisits(); }
   if (d.comingSoon) {
     app.innerHTML = `<h1>Hello</h1><div class="sub">${esc((d.teams || []).join(', ') || 'Your team')}</div>`
       + '<div class="note">Your team\u2019s screens are on the way. Until then, send /help to the bot to see what you can use.</div>';
@@ -3582,6 +3583,7 @@ async function loadHome() {
   }
   IS_ADMIN = !!d.isAdmin;
   TABS = d.tabs || null;
+  CAN_REQUEST = !!d.canRequest;
 
   let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}`
     + `${d.teams && d.teams.length ? ' · ' + esc(d.teams.join(' + ')) : ''}</div>`;
@@ -3602,6 +3604,8 @@ async function loadHome() {
   h += `<div class="card"><div class="n">${esc(d.weekHours)}</div><div class="l">This week</div></div>`;
   h += `<div class="card"><div class="n">${d.weekShifts}</div><div class="l">Shifts</div></div>`;
   h += '</div>';
+
+  h += requestButton();
 
   if (d.booked && d.booked.length) {
     h += '<h2>Appointments you booked</h2>';
@@ -3635,6 +3639,7 @@ async function loadHome() {
   wire();
   const btn = document.getElementById('act');
   if (btn) btn.onclick = () => d.onShift ? doClockOut(btn) : doClockIn(btn, d.slotsToday);
+  wireRequestButton();
   document.querySelectorAll('[data-gotovis]').forEach(el => {
     el.onclick = () => { VIEW = 'vis'; render(); };
   });
@@ -4289,6 +4294,7 @@ async function loadVisits() {
       h += '<div class="note">No On-Site Specialist in this country yet.</div>';
     }
     h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+ Book an appointment</button>';
+    h += requestButton();
   } else {
     h += '<h2>My availability</h2>'
        + '<div class="note" style="margin-top:0">Tap a day. AM = not free 10am–2pm, '
@@ -4321,6 +4327,7 @@ async function loadVisits() {
 
 function wireVisits(d) {
   wire();
+  wireRequestButton();
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
   on('[data-vc]', el => { VS.country = el.dataset.vc; VS.spec = ''; loadVisits(); });
   on('[data-vsp]', el => { VS.spec = el.dataset.vsp; loadVisits(); });
@@ -4659,6 +4666,85 @@ async function loadTeam() {
   wire();
 }
 
+// Special request to Ops: the same steps as /request in the bot, on one screen.
+let RQ = { form: {}, back: 'home' };
+let CAN_REQUEST = false;
+function requestButton() {
+  return CAN_REQUEST ? '<button class="big ghost" id="openRequest">Special request to Ops</button>' : '';
+}
+function wireRequestButton() {
+  const b = document.getElementById('openRequest');
+  if (b) b.onclick = () => { RQ.back = VIEW; RQ.form = RQ.form || {}; VIEW = 'req'; render(); };
+}
+function keepRequest() {
+  for (const k of ['order_no', 'details', 'timeframe_other']) {
+    const el = document.getElementById('rq_' + k);
+    if (el) RQ.form[k] = el.value;
+  }
+}
+async function loadRequest() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/requests?country=' + encodeURIComponent(RQ.form.country || ''));
+  const f = RQ.form;
+  f.country = d.country;
+  if (f.delivery_date && !d.days.some(x => x.iso === f.delivery_date)) f.delivery_date = '';
+  const pick = (attr, items, cur) => '<div class="pick">' + items.map(it =>
+    '<button data-' + attr + '="' + it.key + '" class="' + (cur === it.key ? 'on' : '') + '">' + esc(it.name) + '</button>').join('') + '</div>';
+  let h = '<div class="back" id="rqBack">‹ Back</div><h1>Special request</h1><div class="sub">To Ops</div>';
+  h += '<div class="fld"><label>Order number</label><input id="rq_order_no" value="' + esc(f.order_no || '') + '"></div>';
+  h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: c.key })), f.country) + '</div>';
+  h += '<div class="fld"><label>What is the request?</label>' + pick('rqcat', d.categories, f.category) + '</div>';
+  const cat = d.categories.find(c => c.key === f.category);
+  h += '<div class="fld"><label>Details</label>'
+     + '<div class="note" style="margin:0 0 6px">' + esc(cat ? cat.hint : 'As fully as you can.') + ' No phone or ID numbers.</div>'
+     + '<textarea id="rq_details" rows="3">' + esc(f.details || '') + '</textarea></div>';
+  h += '<div class="fld"><label>' + (f.category === 'DATE' ? 'New delivery date' : 'Delivery date') + '</label><div class="pick">'
+     + d.days.map(x => '<button data-rqd="' + x.iso + '" class="' + (f.delivery_date === x.iso ? 'on' : '') + '">'
+       + esc(x.label) + (x.kind === 'URGENT' ? ' · URGENT' : x.kind === 'LATE' ? ' · late' : '') + '</button>').join('')
+     + '</div><div class="note" style="margin-top:6px">Public holidays are left out (no deliveries). '
+     + 'Next-working-day deliveries asked for after ' + esc(d.cutoff) + ' are after cut-off.</div></div>';
+  h += '<div class="fld"><label>Time frame</label>' + pick('rqt', d.timeframes, f.timeframe);
+  if (f.timeframe === 'OTHER') h += '<input id="rq_timeframe_other" placeholder="e.g. after 7pm" style="margin-top:6px" value="' + esc(f.timeframe_other || '') + '">';
+  h += '</div>';
+  const day = d.days.find(x => x.iso === f.delivery_date);
+  if (day && day.kind === 'URGENT') h += '<div class="warn">Same-day delivery: Ops will see it marked URGENT.</div>';
+  if (day && day.kind === 'LATE') h += '<div class="warn">After the ' + esc(d.cutoff) + ' cut-off for ' + esc(day.label)
+    + '. Ops will try, but it may move to the next working day: check the customer is OK with that.</div>';
+  h += '<button class="big" id="rqSend">Send to Ops</button>';
+  if (d.mine.length) {
+    h += '<h2>Your recent requests</h2>';
+    for (const r of d.mine) {
+      const tags = [];
+      if (r.urgent) tags.push(['URGENT', 'red']); else if (r.late) tags.push(['AFTER CUT-OFF', 'amber']);
+      tags.push([r.status.toUpperCase(), r.statusKey === 'DONE' ? 'green' : r.statusKey === 'CANT' ? 'red' : 'blue']);
+      h += '<div class="p"><div class="tags">' + tags.map(([t, k]) => '<span class="tag ' + k + '">' + t + '</span>').join('') + '</div>'
+         + '<div class="pn">#' + r.id + ' · ' + esc(r.category) + '</div>'
+         + '<div class="t">' + esc(r.order) + ' · ' + esc(r.delivery) + '</div>'
+         + (r.reason ? '<div class="t">Reason: ' + esc(r.reason) + '</div>' : '')
+         + (r.note ? '<div class="t">Ops note: ' + esc(r.note) + '</div>' : '') + '</div>';
+    }
+  }
+  app.innerHTML = h + navBar();
+  wire();
+  const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => { keepRequest(); fn(el); }; });
+  on('[data-rqc]', el => { f.country = el.dataset.rqc; f.delivery_date = ''; loadRequest(); });
+  on('[data-rqcat]', el => { f.category = el.dataset.rqcat; loadRequest(); });
+  on('[data-rqd]', el => { f.delivery_date = el.dataset.rqd; loadRequest(); });
+  on('[data-rqt]', el => { f.timeframe = el.dataset.rqt; loadRequest(); });
+  document.getElementById('rqBack').onclick = () => { keepRequest(); VIEW = RQ.back || 'home'; render(); };
+  const send = document.getElementById('rqSend');
+  send.onclick = async () => {
+    keepRequest();
+    send.disabled = true; send.textContent = 'Sending…';
+    const out = await post('/api/request', f);
+    send.disabled = false; send.textContent = 'Send to Ops';
+    if (!out.ok) { toast(out.error || 'Could not send that.'); return; }
+    toast(out.message);
+    RQ.form = { country: f.country };
+    loadRequest();
+  };
+}
+
 async function render() {
   if (VIEW === 'home') {
     try { await loadHome(); }
@@ -4673,6 +4759,11 @@ async function render() {
   if (VIEW === 'ho') {
     try { await loadHandover(); }
     catch (e) { showFatal('The handover would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'req') {
+    try { await loadRequest(); }
+    catch (e) { showFatal('The request form would not load', e.message || e); }
     return;
   }
   if (VIEW === 'vis') {

@@ -958,3 +958,71 @@ def web_sheet_tick(body: dict) -> dict:
         " WHERE id=? AND status IN ('OPEN','TAKEN')", (now().isoformat(), r["id"]))
     on_bot_loop(after_sheet_tick(bot_ref(), r["id"]))
     return {"ok": True, "matched": True, "id": r["id"]}
+
+
+# --------------------------------------------------------------------------
+# The App's Special request form (webapp.py: GET /api/requests, POST /api/request)
+# --------------------------------------------------------------------------
+
+def request_form_payload(user_id: int, country: str = "") -> dict:
+    """The form's choices for one country, and this person's recent requests."""
+    if country not in REQUEST_COUNTRY_NAMES:
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        country = (me["country"] if me and me["country"] in REQUEST_COUNTRY_NAMES else "") or "SG"
+    days, day, when = [], now().date(), now()
+    while len(days) < DATE_CHOICES:
+        if not holiday_name(country, day):
+            days.append({"iso": day.isoformat(), "label": date_label(day), "kind": cutoff_kind(when, day, country)})
+        day += timedelta(days=1)
+    mine = q("SELECT * FROM special_requests WHERE created_by=? ORDER BY id DESC LIMIT 8", (user_id,))
+    return {
+        "country": country,
+        "countries": [{"key": k, "name": n} for k, n in REQUEST_COUNTRIES],
+        "categories": [{"key": k, "name": n, "hint": CATEGORY_HINTS[k]} for k, n in REQUEST_CATEGORIES],
+        "timeframes": [{"key": k, "name": n} for k, n in TIMEFRAMES],
+        "days": days,
+        "cutoff": cutoff_text(),
+        "mine": [{
+            "id": r["id"], "order": r["order_no"], "category": CATEGORY_NAMES[r["category"]],
+            "delivery": f"{date_label(date.fromisoformat(r['delivery_date']))} · {timeframe_text(r)}",
+            "status": STATUS_NAMES.get(r["status"], r["status"]), "statusKey": r["status"],
+            "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]),
+            "reason": CANT_NAMES.get(r["reason"], r["reason"] or "") if r["status"] == "CANT" else "",
+            "note": r["ops_note"] or "",
+        } for r in mine],
+    }
+
+
+def web_request_add(user_id: int, body: dict) -> dict:
+    """The App form: checked the same way as the bot's steps, then sent the same way."""
+    if not may_request(user_id):
+        return {"ok": False, "error": "Special requests are for SH, Livechat and FS."}
+    get = lambda k: str(body.get(k) or "").strip()
+    d = {"order_no": get("order_no")[:80], "country": get("country"), "category": get("category"),
+         "details": get("details")[:2000], "delivery_date": get("delivery_date"),
+         "timeframe": get("timeframe"), "timeframe_other": get("timeframe_other")[:80] or None}
+    if len(d["order_no"]) < 3:
+        return {"ok": False, "error": "Add the full order number."}
+    if d["country"] not in REQUEST_COUNTRY_NAMES:
+        return {"ok": False, "error": "Pick the country."}
+    if d["category"] not in CATEGORY_NAMES:
+        return {"ok": False, "error": "Pick what the request is."}
+    if len(d["details"]) < 5:
+        return {"ok": False, "error": "A bit more detail please, so Ops can act on it."}
+    try:
+        day = date.fromisoformat(d["delivery_date"])
+    except ValueError:
+        return {"ok": False, "error": "Pick the delivery date."}
+    if day < now().date():
+        return {"ok": False, "error": "That delivery date has passed."}
+    if holiday_name(d["country"], day):
+        return {"ok": False, "error": f"{date_label(day)} is a public holiday there: no deliveries."}
+    if d["timeframe"] not in TIMEFRAME_NAMES:
+        return {"ok": False, "error": "Pick the time frame."}
+    if d["timeframe"] == "OTHER" and not d["timeframe_other"]:
+        return {"ok": False, "error": "Type the time frame."}
+    out = on_bot_loop(create_request(bot_ref(), d, user_id), timeout=20)
+    if not out:
+        return {"ok": False, "error": "Couldn't send that just now. Try again in a minute."}
+    rid, posted, kind = out
+    return {"ok": True, "id": rid, "message": re.sub(r"<[^>]+>", "", sent_text(rid, posted, kind))}
