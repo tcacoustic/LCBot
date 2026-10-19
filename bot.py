@@ -542,6 +542,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         "<b>Anything else</b>",
         "  /support — who you list as Support",
+        "  /find — search any case: name, order no., product or date",
         "  /request — special request to Ops (delivery changes)",
         "  /payslip — open the app",
     ]
@@ -958,6 +959,7 @@ def main() -> None:
     app.add_handler(CommandHandler("linkchat", cmd_linkchat))
     app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
     app.add_handler(CommandHandler("cases", cmd_cases))
+    app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(

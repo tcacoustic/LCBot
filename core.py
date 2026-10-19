@@ -2111,6 +2111,56 @@ def case_label(key: str, origin: str = "sh") -> str:
     return REQUEST_LABELS.get(key, base) if origin == "on" else base
 
 
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def read_day(text: str) -> date | None:
+    """A date typed any usual way: 16/10, 16/10/2026, 2026-10-16, 16 Oct, Oct 16 2026."""
+    t = text.strip().lower().replace(",", " ")
+    try:
+        m = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", t)
+        if m:
+            return date(int(m[1]), int(m[2]), int(m[3]))
+        m = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{2,4}))?", t)
+        if m:
+            y = int(m[3]) if m[3] else now().year
+            return date(y + 2000 if y < 100 else y, int(m[2]), int(m[1]))
+        m = (re.fullmatch(r"(\d{1,2})\s+([a-z]{3})[a-z]*(?:\s+(\d{4}))?", t)
+             or re.fullmatch(r"([a-z]{3})[a-z]*\s+(\d{1,2})(?:\s+(\d{4}))?", t))
+        if m:
+            day, mon = (m[1], m[2]) if m[1].isdigit() else (m[2], m[1])
+            if mon in MONTHS:
+                return date(int(m[3]) if m[3] else now().year, MONTHS[mon], int(day))
+    except ValueError:
+        return None
+    return None
+
+
+# The parts of a case a search looks through.
+SEARCH_FIELDS = ("username", "order_no", "product", "store", "happened", "done", "need", "body")
+
+
+def search_cases(text: str, limit: int = 20) -> list:
+    """Cases, open and closed, newest first: everything from a date, or every
+    case where each word turns up somewhere (name, order number, product…)."""
+    text = text.strip()
+    if not text:
+        return []
+    day = read_day(text)
+    if day:
+        return q("SELECT * FROM ho_cases WHERE the_date=? OR substr(created_at, 1, 10)=?"
+                 " ORDER BY id DESC LIMIT ?", (day.isoformat(), day.isoformat(), limit))
+    words = text.split()[:5]
+    clause = "(" + " OR ".join(f"COALESCE({f}, '') LIKE ? ESCAPE '\\'" for f in SEARCH_FIELDS) + ")"
+    params = []
+    for w in words:
+        w = w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params += [f"%{w}%"] * len(SEARCH_FIELDS)
+    return q(f"SELECT * FROM ho_cases WHERE {' AND '.join([clause] * len(words))}"
+             " ORDER BY id DESC LIMIT ?", (*params, limit))
+
+
 def compose_body(d: dict, origin: str = "sh") -> str:
     """The case in the same shape agents have always written it."""
     lines = [d["order_no"], d["product"], "", f"• {d['happened']}"]
@@ -2905,6 +2955,7 @@ AGENT_COMMANDS = [
     ("clockout", "End my shift"),
     ("handover", "Add or update handover cases"),
     ("cases", "Open cases — notes and closing your side"),
+    ("find", "Search cases: name, order no., product or date"),
     ("payslip", "Open the app"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
@@ -3001,6 +3052,7 @@ ONLINE_HELP = (
     "  ✏️ edit it if a detail is wrong\n"
     "  ➕ New Online request: ask SH to do something with a customer\n"
     "/report — how your channels' cases went this past week\n"
+    "/find — search any case, open or closed: name, order no., product or date\n"
     "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
     "Shopee, Lazada and Webstore.\n"
     "/help — this list again\n\n"
@@ -3011,6 +3063,7 @@ SH_HELP = (
     "👋 <b>SH</b>\n\n"
     "/cases — open cases: add a note, or close your side. Online requests "
     "from the ON team are marked 📣.\n"
+    "/find — search any case, open or closed: name, order no., product or date\n"
     "/visits — On-Site visits and follow-ups. Book visits in the <b>App</b>.\n"
     "/request — special request to Ops (delivery changes)\n"
     "/help — this list again"
@@ -3018,6 +3071,7 @@ SH_HELP = (
 
 SH_COMMANDS = [
     ("cases", "Open cases — notes and closing your side"),
+    ("find", "Search cases: name, order no., product or date"),
     ("visits", "On-Site visits and follow-ups"),
 ]
 ONSITE_COMMANDS = [
@@ -3035,6 +3089,7 @@ OPS_COMMANDS = [
 
 ONLINE_COMMANDS = [
     ("cases", "Open cases for your channels"),
+    ("find", "Search cases: name, order no., product or date"),
     ("report", "Your channels' cases, last 7 days"),
     ("help", "List commands"),
 ]
@@ -3401,6 +3456,13 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:6px; padding:8px 12px; font-size:14px; font-weight:800; cursor:pointer; color:var(--ink); }
   .pick button.on { background:var(--ink); border-color:var(--ink); color:#fff; }
 
+  /* Search all cases */
+  .search { display:flex; gap:6px; margin:0 0 12px; }
+  .search input { flex:1; min-height:46px; border:2px solid var(--ink); border-radius:6px; padding:0 12px;
+    font-size:16px; background:var(--card); color:var(--ink); }
+  .search button { min-width:84px; border:0; border-radius:6px; background:var(--ink); color:#fff;
+    font-size:14px; font-weight:800; text-transform:uppercase; cursor:pointer; }
+  .search-clear { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin:-4px 0 12px; }
   .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
   .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
     color:#fff; padding:12px 16px; border-radius:8px; font-size:14px; font-weight:700; text-align:center; }
@@ -3432,6 +3494,7 @@ let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 let ONLINE = false, ON_GROUP = '', ON_REGION = '', ON_EDIT = {};
 // On-Site visits: SH and FS book, the specialist sees their week.
 let TABS = null;
+let CS_Q = '';   // what the case search box holds; '' = the normal lists
 let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '' };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
@@ -3740,11 +3803,41 @@ function caseForm(d) {
   return h;
 }
 
+// Search every case, open or closed: a name, order number, product or a date.
+function searchBar() {
+  return '<div class="search"><input id="csq" type="search" enterkeyhint="search" '
+    + 'placeholder="Name, order, product, date" value="' + esc(CS_Q) + '">'
+    + '<button id="csGo">Search</button></div>'
+    + (CS_Q ? '<div class="search-clear" id="csClear">✕ Clear search</div>' : '');
+}
+function wireSearch() {
+  const go = () => { CS_Q = (document.getElementById('csq').value || '').trim(); loadHandover(); };
+  const btn = document.getElementById('csGo'), box = document.getElementById('csq');
+  if (btn) btn.onclick = go;
+  if (box) box.onkeydown = e => { if (e.key === 'Enter') go(); };
+  const clear = document.getElementById('csClear');
+  if (clear) clear.onclick = () => { CS_Q = ''; loadHandover(); };
+}
+async function renderSearch(d) {
+  const app = document.getElementById('app');
+  const out = await getJSON('/api/cases/search?q=' + encodeURIComponent(CS_Q));
+  const res = out.results || [];
+  let h = '<h1>' + (d.isOnline ? 'Handover cases' : 'Handover') + '</h1>';
+  h += '<div class="sub">Search: ' + res.length + (res.length === 30 ? '+' : '') + ' found</div>';
+  h += searchBar();
+  if (!res.length) h += '<div class="empty">No cases found. Try part of the name, order number or product, or a date like 16/10.</div>';
+  for (const c of res) h += (d.isOnline && !c.closed) ? onlineCard(c, (d.myChannels || []).includes(c.channel)) : caseCard(c, c.closed);
+  app.innerHTML = h + navBar();
+  wireHandover();
+}
+
 async function loadHandover() {
   const app = document.getElementById('app');
   const d = await getJSON('/api/handover');
   HO = d;
-  if (d.isOnline) { ONLINE = true; renderOnline(d); return; }
+  if (d.isOnline) ONLINE = true;
+  if (CS_Q && !HO_FORM) return renderSearch(d);
+  if (d.isOnline) { renderOnline(d); return; }
 
   let h = '<h1>Handover</h1>';
   const n = d.openCases.length;
@@ -3755,6 +3848,7 @@ async function loadHandover() {
     wireHandover();
     return;
   }
+  h += searchBar();
 
   if (n) {
     h += '<h2>Still open</h2>';
@@ -3790,6 +3884,7 @@ async function loadHandover() {
 
 function wireHandover() {
   wire();
+  wireSearch();
   document.querySelectorAll('.tick').forEach(el => {
     el.onclick = async () => {
       const out = await post('/api/case/toggle',
@@ -3994,6 +4089,7 @@ function renderOnline(d) {
   let h = '<h1>Handover cases</h1>';
   h += `<div class="sub">${open.length} open`
      + `${mine.size ? ' · ' + nMine + ' on your channels' : ''}</div>`;
+  h += searchBar();
   h += '<button class="big" id="newCase" style="margin:10px 0 0">+ New Online request</button>';
 
   h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
