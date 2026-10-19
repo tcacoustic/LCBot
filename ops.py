@@ -13,6 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import urllib.request
+from functools import lru_cache
+
+import holidays
 
 from core import *
 
@@ -62,18 +65,45 @@ def ops_target(country: str = "") -> dict | None:
     return None
 
 
-def past_cutoff(when: datetime) -> bool:
-    """At or after today's cut-off, or a weekend (the cut-off was Friday's)."""
-    return when.weekday() >= 5 or when.hour * 60 + when.minute >= parse_time_token(REQUEST_CUTOFF)
+# Public holidays: no courier deliveries and no Ops, so they're skipped like
+# weekends. Built-in yearly lists (Malaysia: national holidays only).
+@lru_cache(maxsize=32)
+def _holidays(country: str, year: int) -> dict:
+    try:
+        return dict(holidays.country_holidays(country, years=year, language="en_US"))
+    except Exception:
+        return {}
 
 
-def cutoff_kind(when: datetime, delivery: date) -> str:
+def holiday_name(country: str, d: date) -> str:
+    return _holidays(country, d.year).get(d, "") if country else ""
+
+
+def is_working_day(country: str, d: date) -> bool:
+    return d.weekday() < 5 and not holiday_name(country, d)
+
+
+def next_working(country: str, d: date) -> date:
+    """The next Mon-Fri after d that isn't a public holiday there."""
+    d += timedelta(days=1)
+    while not is_working_day(country, d):
+        d += timedelta(days=1)
+    return d
+
+
+def past_cutoff(when: datetime, country: str = "") -> bool:
+    """At or after today's cut-off, or a day off (the cut-off was the last working day's)."""
+    return (not is_working_day(country, when.date())
+            or when.hour * 60 + when.minute >= parse_time_token(REQUEST_CUTOFF))
+
+
+def cutoff_kind(when: datetime, delivery: date, country: str = "") -> str:
     """'URGENT' for a delivery today, 'LATE' for one on the next working day (or a
-    weekend before it) asked for after the cut-off, '' otherwise. The cut-off is
+    day off before it) asked for after the cut-off, '' otherwise. The cut-off is
     for next-day deliveries: anything further out is on time whenever it's sent."""
     if delivery <= when.date():
         return "URGENT"
-    if past_cutoff(when) and delivery <= next_working_day(when.date()):
+    if past_cutoff(when, country) and delivery <= next_working(country, when.date()):
         return "LATE"
     return ""
 
@@ -311,24 +341,24 @@ def read_date(text: str) -> date | None:
     return None
 
 
-def cutoff_note() -> str:
+def cutoff_note(country: str) -> str:
     """Under the date buttons: what today's date and the next working day mean."""
     today = now().date()
     lines = [f"<i>{date_label(today)} is today: a same-day request, marked 🔴 URGENT.</i>"]
-    if past_cutoff(now()):
-        nwd = next_working_day(today)
+    if past_cutoff(now(), country):
+        nwd = next_working(country, today)
         lines.append(f"<i>⏰ It's past the {cutoff_text()} cut-off, so deliveries up to "
                      f"{date_label(nwd)} are after cut-off.</i>")
     return "\n\n" + "\n".join(lines)
 
 
 def cutoff_warning(d: dict) -> str:
-    kind = cutoff_kind(now(), date.fromisoformat(d["delivery_date"]))
+    kind = cutoff_kind(now(), date.fromisoformat(d["delivery_date"]), d["country"])
     if kind == "URGENT":
         return "🔴 <b>Same-day delivery.</b> Ops will see it marked URGENT."
     if kind == "LATE":
         day = date.fromisoformat(d["delivery_date"])
-        later = next_working_day(max(day, next_working_day(now().date())) )
+        later = next_working(d["country"], max(day, next_working(d["country"], now().date())))
         return (f"⏰ <b>After the {cutoff_text()} cut-off for {date_label(day)}.</b> Ops will try, but it "
                 f"may move to {date_label(later)}: check the customer is OK with that.")
     return ""
@@ -367,14 +397,17 @@ def step_prompt(step: int, d: dict) -> tuple:
                 f"<i>{esc(CATEGORY_HINTS[d['category']])}</i>\n\nPlease don't include phone or ID numbers.",
                 rows_with_back([]))
     if step == R_DATE:
-        today = now().date()
-        btns = [InlineKeyboardButton(date_label(today + timedelta(days=i)),
-                                     callback_data=f"sr:d:{(today + timedelta(days=i)).isoformat()}")
-                for i in range(DATE_CHOICES)]
+        # The next few delivery days: public holidays are left out (no courier).
+        days, day = [], now().date()
+        while len(days) < DATE_CHOICES:
+            if not holiday_name(d["country"], day):
+                days.append(day)
+            day += timedelta(days=1)
+        btns = [InlineKeyboardButton(date_label(x), callback_data=f"sr:d:{x.isoformat()}") for x in days]
         rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
         rows.append([InlineKeyboardButton("Another date…", callback_data="sr:d:typed")])
         label = "the new delivery date" if d.get("category") == "DATE" else "the delivery date"
-        return f"<b>What's {label}?</b>" + cutoff_note(), rows_with_back(rows)
+        return f"<b>What's {label}?</b>" + cutoff_note(d["country"]), rows_with_back(rows)
     if step == R_DATE_TYPED:
         return "Type the date, e.g. <code>24/10</code>.", rows_with_back([])
     if step == R_TIME:
@@ -476,6 +509,12 @@ async def on_request_date_typed(update: Update, context: ContextTypes.DEFAULT_TY
     if not d or d < now().date():
         await update.message.reply_text("I couldn't read that as a date from today on. Try e.g. 24/10.")
         return R_DATE_TYPED
+    country = context.user_data["sr"]["country"]
+    if holiday_name(country, d):
+        await update.message.reply_text(
+            f"{date_label(d)} is a public holiday in {REQUEST_COUNTRY_NAMES[country][3:]} "
+            f"({holiday_name(country, d)}): no deliveries. Type another date.")
+        return R_DATE_TYPED
     context.user_data["sr"]["delivery_date"] = d.isoformat()
     return await show_step(update, context, R_TIME)
 
@@ -552,7 +591,7 @@ async def on_request_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("Cancelled. Nothing was sent.")
         return ConversationHandler.END
     created = now()
-    kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]))
+    kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]), d["country"])
     async with write_lock:
         rid = run(
             "INSERT INTO special_requests (order_no, country, category, details, delivery_date, timeframe,"
@@ -696,6 +735,8 @@ async def job_carry_over(context: ContextTypes.DEFAULT_TYPE) -> None:
              " AND created_at < ? ORDER BY delivery_date, id", (start,))
     groups: dict = {}
     for r in rows:
+        if not is_working_day(r["country"] or "", today.date()):
+            continue   # a public holiday there: they come back on the next working morning
         target = ops_target(r["country"] or "")
         if target:
             groups.setdefault(json.dumps(target, sort_keys=True), []).append(r)
