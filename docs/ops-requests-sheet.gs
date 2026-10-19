@@ -159,3 +159,20 @@ function reply(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
 }
+
+// Run this from the editor (choose checkSetup, press ▶ Run, then open the
+// Execution log) to see what the script sees. It changes nothing and logs no
+// row contents: only row numbers and whether H has checkboxes.
+function checkSetup() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  if (!sheet) { Logger.log('No tab called "' + SHEET_NAME + '". Tabs: ' +
+    SpreadsheetApp.getActiveSpreadsheet().getSheets().map(s => s.getName()).join(', ')); return; }
+  const last = lastFilledRow(sheet);
+  Logger.log('Last filled row (A or B): ' + last + ' · next new row: ' + (last + 1));
+  for (let r = Math.max(2, last - 4); r <= last + 1; r++) {
+    const rule = sheet.getRange(r, COL_TICK).getDataValidation();
+    Logger.log('Row ' + r + ' H: ' + (rule ? String(rule.getCriteriaType()) : 'no rule (plain cell)'));
+  }
+  Logger.log('Checkboxes above the next row: ' + checkboxesAbove(sheet, last + 1));
+  Logger.log('SECRET set: ' + !!PropertiesService.getScriptProperties().getProperty('SECRET'));
+}
