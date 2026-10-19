@@ -919,6 +919,46 @@ async def cmd_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                     reply_markup=kb)
 
 
+def find_button_label(r) -> str:
+    mark = "✅" if r["closed"] else "🟢"
+    added = date.fromisoformat(r["the_date"]).strftime("%-d %b")
+    bits = [r["username"] or "?", r["product"] or r["order_no"] or ""]
+    return f"{mark} {added} · " + " · ".join(b for b in bits if b)[:48]
+
+
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/find <name, order number, product or date> — search every case, open or closed."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if not may_see_cases(uid):
+        await gate(update)
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "🔎 <b>Search cases</b>, open and closed. Send /find and then any of:\n"
+            "• a customer name: <code>/find kelvin</code>\n"
+            "• an order number: <code>/find 2609046GFY4T9B</code>\n"
+            "• a product: <code>/find sonos arc</code>\n"
+            "• a date: <code>/find 16/10</code> or <code>/find 16 Oct</code>",
+            parse_mode=constants.ParseMode.HTML)
+        return
+    rows = search_cases(text, limit=11)
+    if not rows:
+        await update.message.reply_text(f"🔎 No cases found for “{text}”. Try part of the name, "
+                                        "order number or product, or a date like 16/10.")
+        return
+    more = len(rows) > 10
+    rows = rows[:10]
+    head = (f"🔎 <b>{'10 newest' if more else len(rows)} case{'' if len(rows) == 1 else 's'}</b> "
+            f"for “{esc(text)}”" + (" · add a word to narrow it down" if more else "")
+            + "\n🟢 open · ✅ closed. Tap one to open it.")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(find_button_label(r), callback_data=f"cs:v:{r['id']}")]
+                               for r in rows])
+    await update.message.reply_text(head, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+
+
 async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """cs:l list · cs:v view · cs:x Online closes · cs:s SH closes ·
     cs:f admin force-closes"""
