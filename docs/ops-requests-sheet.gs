@@ -62,17 +62,8 @@ function addRow(sheet, values) {
   const range = sheet.getRange(row, 1, 1, 7);
   range.setNumberFormat('@');            // keep PO #, dates and times exactly as sent
   range.setValues([values.map(String)]);
-  const tick = sheet.getRange(row, COL_TICK);
-  if (tick.isChecked() === null && checkboxesAbove(sheet, row)) tick.insertCheckboxes();
+  sheet.getRange(row, COL_TICK).insertCheckboxes();   // H is the Ops tick box
   return { ok: true, row: row };
-}
-
-// H is a checkbox column if the rows just above this one have checkboxes in H.
-function checkboxesAbove(sheet, row) {
-  const from = Math.max(2, row - 20);
-  if (row <= from) return false;
-  return sheet.getRange(from, COL_TICK, row - from, 1).getDataValidations()
-    .some(r => r[0] && r[0].getCriteriaType() === SpreadsheetApp.DataValidationCriteria.CHECKBOX);
 }
 
 function updateRow(sheet, body) {
@@ -82,12 +73,11 @@ function updateRow(sheet, body) {
   if (!row) return { ok: false, error: 'row not found' };
   if (body.ticked) {
     const tick = sheet.getRange(row, COL_TICK);
-    if (tick.isChecked() === null && checkboxesAbove(sheet, row)) {
-      tick.clearContent();          // e.g. an earlier "Done" typed before the checkbox existed
+    if (tick.isChecked() === null) {   // no checkbox there yet (e.g. a row from before)
+      tick.clearContent();
       tick.insertCheckboxes();
     }
-    if (tick.isChecked() !== null) tick.check();   // a checkbox column
-    else if (!tick.getValue()) tick.setValue('Done');
+    tick.check();
   }
   if (body.remarks) {
     const cell = sheet.getRange(row, COL_REMARKS);
@@ -173,6 +163,6 @@ function checkSetup() {
     const rule = sheet.getRange(r, COL_TICK).getDataValidation();
     Logger.log('Row ' + r + ' H: ' + (rule ? String(rule.getCriteriaType()) : 'no rule (plain cell)'));
   }
-  Logger.log('Checkboxes above the next row: ' + checkboxesAbove(sheet, last + 1));
+  Logger.log('Script version: always-checkbox (no "Done" text)');
   Logger.log('SECRET set: ' + !!PropertiesService.getScriptProperties().getProperty('SECRET'));
 }
