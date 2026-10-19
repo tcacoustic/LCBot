@@ -507,6 +507,54 @@ def web_claim(user_id: int, slot_id: int, want: bool) -> dict:
     }
 
 
+def case_shape(r, today: date, closed: bool = False) -> dict:
+    """One case as the App draws it (handover list and search results)."""
+    added = date.fromisoformat(r["the_date"])
+    age = (today - added).days
+    due = case_due(added, r["prio"])
+    out = {
+        "id": r["id"],
+        "prio": r["prio"] or "",
+        "username": r["username"] or "",
+        "platform": r["platform"] or "",
+        "store": r["store"] or "",
+        "flag": r["flag"] or "",
+        "section": r["section"] or "open",
+        "body": r["body"] or "",
+        "from": display_name_of(r["agent_id"], ""),
+        "age": age,
+        "stale": age >= 3,
+        "channel": r["channel"] or "",
+        "channelName": CHANNEL_NAMES.get(r["channel"] or "", ""),
+        "due": due.strftime("%a %-d %b"),
+        "sla": "" if closed else sla_mark(due, today),
+        "shClosed": bool(r["sh_closed"]),
+        "onClosed": bool(r["on_closed"]),
+        "handedBack": bool(r["handed_back"]),
+        "waiting": (not closed) and bool(r["sh_closed"] or r["on_closed"]
+                                         or r["handed_back"] or r["origin"] == "on"),
+        "status": case_status_line(r),
+        "request": (display_name_of(r["agent_id"], "Online")
+                    if r["origin"] == "on" else ""),
+        "group": order_kind(r["platform"], r["store"]),
+        "region": {"TH": "TH", "WEBSTORE": "SG", "WEBSTORE_MY": "MY"}.get(
+            r["channel"] or "", (r["channel"] or "").split("_")[-1]),
+        "note": note_line(r["id"]),
+        "history": case_history_lines(r["id"]),
+        # The parts of the case, for editing. Older cases only have free text.
+        "fields": ({k: r[k] or "" for k, _, _ in CASE_FIELDS}
+                   if r["order_no"] is not None else {"username": r["username"] or ""}),
+    }
+    out["closed"] = closed
+    if closed:
+        out["closedBy"] = display_name_of(r["closed_by"], "") if r["closed_by"] else ""
+        when = r["closed_at"]
+        out["closedWhen"] = (
+            datetime.fromisoformat(when).strftime("%-d %b %H:%M") if when else ""
+        )
+    return out
+
+
 def handover_payload(user_id: int) -> dict:
     """Open cases, recently closed ones, and the pickers for a new case."""
     today = now().date()
@@ -515,56 +563,12 @@ def handover_payload(user_id: int) -> dict:
         "SELECT * FROM ho_cases WHERE closed=1 ORDER BY closed_at DESC LIMIT 12"
     )
 
-    def shape(r, closed=False):
-        added = date.fromisoformat(r["the_date"])
-        age = (today - added).days
-        due = case_due(added, r["prio"])
-        out = {
-            "id": r["id"],
-            "prio": r["prio"] or "",
-            "username": r["username"] or "",
-            "platform": r["platform"] or "",
-            "store": r["store"] or "",
-            "flag": r["flag"] or "",
-            "section": r["section"] or "open",
-            "body": r["body"] or "",
-            "from": display_name_of(r["agent_id"], ""),
-            "age": age,
-            "stale": age >= 3,
-            "channel": r["channel"] or "",
-            "channelName": CHANNEL_NAMES.get(r["channel"] or "", ""),
-            "due": due.strftime("%a %-d %b"),
-            "sla": "" if closed else sla_mark(due, today),
-            "shClosed": bool(r["sh_closed"]),
-            "onClosed": bool(r["on_closed"]),
-            "handedBack": bool(r["handed_back"]),
-            "waiting": (not closed) and bool(r["sh_closed"] or r["on_closed"]
-                                             or r["handed_back"] or r["origin"] == "on"),
-            "status": case_status_line(r),
-            "request": (display_name_of(r["agent_id"], "Online")
-                        if r["origin"] == "on" else ""),
-            "group": order_kind(r["platform"], r["store"]),
-            "region": {"TH": "TH", "WEBSTORE": "SG", "WEBSTORE_MY": "MY"}.get(
-                r["channel"] or "", (r["channel"] or "").split("_")[-1]),
-            "note": note_line(r["id"]),
-            "history": case_history_lines(r["id"]),
-            # The parts of the case, for editing. Older cases only have free text.
-            "fields": ({k: r[k] or "" for k, _, _ in CASE_FIELDS}
-                       if r["order_no"] is not None else {"username": r["username"] or ""}),
-        }
-        if closed:
-            out["closedBy"] = display_name_of(r["closed_by"], "") if r["closed_by"] else ""
-            when = r["closed_at"]
-            out["closedWhen"] = (
-                datetime.fromisoformat(when).strftime("%-d %b %H:%M") if when else ""
-            )
-        return out
 
     return {
         "isOnline": online_view(user_id),
         "myChannels": online_channels(user_id),
-        "openCases": [shape(r) for r in open_rows],
-        "closedCases": [shape(r, True) for r in closed_rows],
+        "openCases": [case_shape(r, today) for r in open_rows],
+        "closedCases": [case_shape(r, today, True) for r in closed_rows],
         "stores": [{"flag": f, "store": st,
                     "channel": CHANNEL_NAMES.get(STORE_CHANNEL.get(st, ""), ""),
                     "orderExample": case_example("order_no", "DUOKE", st)}
@@ -954,7 +958,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true}')
             return
         if path.startswith("/api/") and path not in ("/api/handover", "/api/home",
-                                                     "/api/visits"):
+                                                     "/api/visits", "/api/cases/search"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
@@ -976,6 +980,27 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     uid, one("week"), one("country"), one("spec"), one("avail"))).encode())
             except Exception as e:
                 log.warning("Visits view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
+        if path == "/api/cases/search":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                if not web_has_access(int(user["id"])):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                today = now().date()
+                rows = search_cases((qs.get("q") or [""])[0], limit=30)
+                self._send(200, json.dumps({"results": [case_shape(r, today, bool(r["closed"]))
+                                                        for r in rows]}).encode())
+            except Exception as e:
+                log.warning("Case search failed: %s", e)
                 try:
                     self._send(500, b'{"error":"server"}')
                 except Exception:
