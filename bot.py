@@ -546,7 +546,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if role in ("admin", "owner"):
         lines += ["", "━━━━━━━━━━━━━━", "<b>ADMIN</b>"]
-        for title, group in ADMIN_GROUPS:
+        for title, group in admin_groups_for(user.id):
             lines += ["", f"<b>{title}</b>"]
             lines += [f"  /{c} — {d}" for c, d in group]
     if role == "owner":
