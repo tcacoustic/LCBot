@@ -126,11 +126,35 @@ function onTickEdit(e) {
   for (let r = range.getRow(); r < range.getRow() + range.getNumRows(); r++) {
     if (r < 2 || sheet.getRange(r, COL_TICK).getValue() !== true) continue;
     const row = sheet.getRange(r, 1, 1, 4).getDisplayValues()[0];   // A-D
-    UrlFetchApp.fetch(url.replace(/\/$/, '') + '/api/ops/sheet-tick', {
-      method: 'post', contentType: 'application/json', muteHttpExceptions: true,
-      payload: JSON.stringify({ secret: secret, timestamp: row[1], po: row[2], category: row[3] }),
-    });
+    const res = tellBot(url, secret, { timestamp: row[1], po: row[2], category: row[3] });
+    // Shows under Executions: matched=true means the request was closed in Telegram.
+    Logger.log('Row ' + r + ' ticked -> bot answered ' + res.getResponseCode() + ' ' + res.getContentText());
   }
+}
+
+function tellBot(url, secret, fields) {
+  return UrlFetchApp.fetch(String(url).trim().replace(/\/+$/, '') + '/api/ops/sheet-tick', {
+    method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+    payload: JSON.stringify(Object.assign({ secret: secret }, fields)),
+  });
+}
+
+// Run this from the editor to test the link to the bot (changes nothing):
+//   200 {"ok": true, "matched": false}  -> the link works
+//   403 -> the SECRET here doesn't match REQUEST_SHEET_SECRET on Railway
+//   404 or an error -> BOT_URL is wrong (it's the bot's https://... address)
+function checkBotLink() {
+  const props = PropertiesService.getScriptProperties();
+  const url = props.getProperty('BOT_URL'), secret = props.getProperty('SECRET');
+  if (!url) { Logger.log('No BOT_URL in Script Properties yet.'); return; }
+  try {
+    const res = tellBot(url, secret, { po: 'CONNECTION-TEST', timestamp: '', category: '' });
+    Logger.log('Bot answered ' + res.getResponseCode() + ' ' + res.getContentText());
+  } catch (err) {
+    Logger.log('Could not reach the bot at ' + url + ': ' + err);
+  }
+  const triggers = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'onTickEdit');
+  Logger.log('onTickEdit triggers installed: ' + triggers.length);
 }
 
 // The last row with something in column A or B: checkboxes further down
