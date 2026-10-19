@@ -860,7 +860,8 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(new_btn + buttons)
 
 
-def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+def case_view(case_id: int, user_id: int, back: str = "list") -> tuple[str, InlineKeyboardMarkup]:
+    """A case to read. back='find' when it came from /find, so ◀️ goes to the results."""
     r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if not r:
         return "That case is gone.", InlineKeyboardMarkup(
@@ -903,7 +904,12 @@ def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if admin_for(user_id, "ON", "SH", "LIVECHAT"):
             buttons.append([InlineKeyboardButton("🔒 Force close (both sides)",
                                                  callback_data=f"cs:f:{case_id}")])
-    buttons.append([InlineKeyboardButton("◀️ All cases", callback_data="cs:l")])
+    else:
+        buttons.append([InlineKeyboardButton("↩️ Reopen this case", callback_data=f"cs:ro:{case_id}")])
+    if back == "find":
+        buttons.append([InlineKeyboardButton("◀️ Back to results", callback_data="cs:fr")])
+    else:
+        buttons.append([InlineKeyboardButton("◀️ All cases", callback_data="cs:l")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
@@ -944,19 +950,24 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "• a date: <code>/find 16/10</code> or <code>/find 16 Oct</code>",
             parse_mode=constants.ParseMode.HTML)
         return
+    context.user_data["find_q"] = text
+    head, kb = find_results(text)
+    await update.message.reply_text(head, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+
+
+def find_results(text: str) -> tuple:
+    """The /find message: what matched, as buttons that show each case."""
     rows = search_cases(text, limit=11)
     if not rows:
-        await update.message.reply_text(f"🔎 No cases found for “{text}”. Try part of the name, "
-                                        "order number or product, or a date like 16/10.")
-        return
+        return (f"🔎 No cases found for “{esc(text)}”. Try part of the name, order number or "
+                "product, or a date like 16/10."), None
     more = len(rows) > 10
     rows = rows[:10]
     head = (f"🔎 <b>{'10 newest' if more else len(rows)} case{'' if len(rows) == 1 else 's'}</b> "
             f"for “{esc(text)}”" + (" · add a word to narrow it down" if more else "")
-            + "\n🟢 open · ✅ closed. Tap one to open it.")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(find_button_label(r), callback_data=f"cs:v:{r['id']}")]
-                               for r in rows])
-    await update.message.reply_text(head, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+            + "\n🟢 open · ✅ closed. Tap one to see it: nothing changes until you choose.")
+    return head, InlineKeyboardMarkup(
+        [[InlineKeyboardButton(find_button_label(r), callback_data=f"cs:fv:{r['id']}")] for r in rows])
 
 
 async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -987,6 +998,13 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             force_close_case(case_id, uid)
         await refresh_case_post(context.bot, case_id)
         await query.answer("Force closed ✓")
+    elif action == "ro":
+        r = q1("SELECT closed FROM ho_cases WHERE id=?", (case_id,))
+        if r and r["closed"]:
+            async with write_lock:
+                reopen_case(case_id, uid)
+            await refresh_case_post(context.bot, case_id)
+        await query.answer("Reopened: it's back in the open cases.")
     else:
         await query.answer()
 
@@ -1004,11 +1022,23 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 save_case_edit(case_id, uid, "prio", prio)
             await refresh_case_post(context.bot, case_id)
 
+    if action == "fr":
+        context.user_data["case_back"] = ""
+        head, kb = find_results(context.user_data.get("find_q", ""))
+        try:
+            await query.edit_message_text(head, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+        except BadRequest:
+            pass
+        return
+    if action in ("fv", "v", "l"):
+        # Where ◀️ goes from this case: back to the /find results, or the case list.
+        context.user_data["case_back"] = "find" if action == "fv" else ""
+
     if action == "l":
         text, kb = cases_list(uid, page=case_id)
         parse = constants.ParseMode.HTML
     else:
-        text, kb = case_view(case_id, uid)
+        text, kb = case_view(case_id, uid, back=context.user_data.get("case_back") or "list")
         parse = None
     try:
         await query.edit_message_text(text, parse_mode=parse, reply_markup=kb)
