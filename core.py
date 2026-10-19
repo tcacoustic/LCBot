@@ -594,7 +594,8 @@ db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
 )""")
 _cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
 for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER",
-             "urgent INTEGER NOT NULL DEFAULT 0"):
+             "urgent INTEGER NOT NULL DEFAULT 0", "source TEXT NOT NULL DEFAULT 'bot'",
+             "submitted_name TEXT"):
     if _col.split()[0] not in _cols:
         db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (

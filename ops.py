@@ -148,14 +148,16 @@ def request_text(r, head: str = "") -> str:
         "",
         esc(r["details"]),
         "",
-        f"<i>From {esc(display_name_of(r['created_by'], 'someone'))}"
-        f"{' (' + esc(team_of(r['created_by'])) + ')' if team_of(r['created_by']) else ''}"
+        f"<i>From {esc(sender_name(r))}"
+        f"{' (' + esc(team_of(r['created_by'])) + ')' if r['created_by'] and team_of(r['created_by']) else ''}"
+        f"{' · via Paperform' if r['source'] == 'paperform' else ''}"
         f" · {stamp(r['created_at'])}</i>",
     ]
     if r["status"] == "TAKEN":
         lines += ["", f"🙋 <b>{esc(display_name_of(r['taken_by'], 'Ops'))} is on it</b> · {stamp(r['taken_at'])}"]
     elif r["status"] == "DONE":
-        lines += ["", f"✅ <b>Done</b> by {esc(display_name_of(r['handled_by'], 'Ops'))} · {stamp(r['handled_at'])}"]
+        by = "ticked in the Ops sheet" if r["handled_by"] == 0 else "by " + display_name_of(r["handled_by"], "Ops")
+        lines += ["", f"✅ <b>Done</b> {esc(by)} · {stamp(r['handled_at'])}"]
     elif r["status"] == "CANT":
         lines += ["", f"🚫 <b>Can't do</b>: {esc(CANT_NAMES.get(r['reason'], r['reason'] or ''))}"
                   f" · {esc(display_name_of(r['handled_by'], 'Ops'))} · {stamp(r['handled_at'])}"]
@@ -206,10 +208,14 @@ SHEET_CATEGORY = {
 SHEET_TIME = {"ANY": "Anytime", "AM": "10am-2pm", "PM": "2pm-6pm"}
 
 
+def sender_name(r) -> str:
+    return r["submitted_name"] or display_name_of(r["created_by"], "someone")
+
+
 def sheet_values(r) -> list:
     """Columns A to G, as Paperform writes them."""
     return [
-        display_name_of(r["created_by"], ""),
+        sender_name(r),
         datetime.fromisoformat(r["created_at"]).strftime("%Y-%m-%d %H:%M:%S"),
         r["order_no"],
         SHEET_CATEGORY[r["category"]],
@@ -230,10 +236,13 @@ def sheet_remarks(r) -> str:
 
 
 def sheet_payload(r) -> dict:
-    if not r["sheet_row"]:
+    """A new row for the bot's own requests; Paperform already wrote its row,
+    so those are only ever updated (found by PO # and category)."""
+    if not r["sheet_row"] and r["source"] != "paperform":
         return {"secret": REQUEST_SHEET_SECRET, "action": "add", "values": sheet_values(r)}
-    return {"secret": REQUEST_SHEET_SECRET, "action": "update", "row": r["sheet_row"],
-            "po": r["order_no"], "timestamp": sheet_values(r)[1],
+    return {"secret": REQUEST_SHEET_SECRET, "action": "update", "row": r["sheet_row"] or 0,
+            "po": r["order_no"], "timestamp": "" if r["source"] == "paperform" else sheet_values(r)[1],
+            "category": SHEET_CATEGORY[r["category"]],
             "ticked": r["status"] in ("DONE", "CANT"), "remarks": sheet_remarks(r)}
 
 
@@ -572,6 +581,8 @@ async def refresh_ops_message(bot, rid: int) -> None:
 
 
 async def tell_sender(bot, r, text: str) -> None:
+    if not r["created_by"]:
+        return   # from the Paperform: nobody to message in Telegram
     try:
         await bot.send_message(r["created_by"], text, parse_mode=constants.ParseMode.HTML)
     except Exception as e:
@@ -590,36 +601,47 @@ async def on_request_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.data == "sr:stop" or not d:
         await query.edit_message_text("Cancelled. Nothing was sent.")
         return ConversationHandler.END
-    created = now()
-    kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]), d["country"])
-    async with write_lock:
-        rid = run(
-            "INSERT INTO special_requests (order_no, country, category, details, delivery_date, timeframe,"
-            " timeframe_other, created_by, created_at, after_cutoff, urgent, status, sheet_dirty)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?, 'OPEN', 1)",
-            (d["order_no"], d["country"], d["category"], d["details"], d["delivery_date"], d["timeframe"],
-             d.get("timeframe_other"), query.from_user.id, created.isoformat(),
-             1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0)).lastrowid
-    posted = await post_to_ops(context.bot, rid)
+    rid, posted, kind = await create_request(context.bot, d, query.from_user.id)
+    await query.edit_message_text(sent_text(rid, posted, kind), parse_mode=constants.ParseMode.HTML)
+    return ConversationHandler.END
+
+
+def sent_text(rid: int, posted: bool, kind: str) -> str:
     late = {"LATE": " It's after the cut-off, so it may move to a later day.",
             "URGENT": " It's same-day, so Ops see it as URGENT."}.get(kind, "")
     if posted:
-        await query.edit_message_text(
-            f"✅ Sent to Ops as <b>request #{rid}</b>.{late}\nI'll message you when they pick it up.",
-            parse_mode=constants.ParseMode.HTML)
-    else:
-        await query.edit_message_text(
-            f"✅ Saved as <b>request #{rid}</b>, but there's no Ops chat for that country yet, "
-            "so an admin has been told.", parse_mode=constants.ParseMode.HTML)
+        return f"✅ Sent to Ops as <b>request #{rid}</b>.{late}\nI'll message you when they pick it up."
+    return (f"✅ Saved as <b>request #{rid}</b>, but there's no Ops chat for that country yet, "
+            "so an admin has been told.")
+
+
+async def create_request(bot, d: dict, created_by: int, source: str = "bot",
+                         submitted_name: str = "") -> tuple:
+    """Save a request, post it to Ops and copy it to the sheet. The same for the
+    bot chat, the App form and the Paperform. Returns (id, posted, cut-off kind)."""
+    created = now()
+    kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]), d.get("country") or "")
+    async with write_lock:
+        rid = run(
+            "INSERT INTO special_requests (order_no, country, category, details, delivery_date, timeframe,"
+            " timeframe_other, created_by, created_at, after_cutoff, urgent, status, sheet_dirty,"
+            " source, submitted_name) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'OPEN', ?, ?, ?)",
+            (d["order_no"], d.get("country") or "", d["category"], d["details"], d["delivery_date"],
+             d["timeframe"], d.get("timeframe_other"), created_by, created.isoformat(),
+             1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0,
+             0 if source == "paperform" else 1, source, submitted_name or None)).lastrowid
+    posted = await post_to_ops(bot, rid)
+    if not posted:
         for admin in ADMIN_IDS:
             try:
-                await context.bot.send_message(
-                    admin, f"⚠️ Special request #{rid} ({d['country']}) couldn't reach Ops: link "
-                    f"their chat with /opschat {d['country']} inside it.")
+                await bot.send_message(
+                    admin, f"⚠️ Special request #{rid} ({d.get('country') or 'no country'}) couldn't "
+                    f"reach Ops: link their chat with /opschat {d.get('country') or ''} inside it.")
             except Exception:
                 pass
-    await sync_to_sheet(rid)
-    return ConversationHandler.END
+    if source != "paperform":
+        await sync_to_sheet(rid)
+    return rid, posted, kind
 
 
 # --------------------------------------------------------------------------
@@ -827,3 +849,112 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                      + (f" · {esc(display_name_of(r['taken_by'], ''))}" if r["status"] == "TAKEN" else ""))
     lines += ["", "🔴 same day · ⏰ after cut-off · 🙋 someone's on it. Answer them in the Ops chat."]
     await reply_long(update.message, "\n".join(lines), parse_mode=constants.ParseMode.HTML)
+
+
+# --------------------------------------------------------------------------
+# From outside Telegram: the Paperform, and ticks made in the Ops sheet.
+# Both arrive at the App's web server (webapp.py) and run on its thread.
+# --------------------------------------------------------------------------
+
+PO_COUNTRY = (("TCSG", "SG"), ("TCMY", "MY"), ("TCHK", "HK"), ("TCTH", "TH"))
+
+
+def country_from_po(po: str) -> str:
+    """TCSG-12345 is a Singapore order, and so on; '' when the PO doesn't say."""
+    up = po.upper()
+    return next((c for prefix, c in PO_COUNTRY if prefix in up), "")
+
+
+def category_from_text(text: str) -> str:
+    t = text.lower()
+    for key, name in SHEET_CATEGORY.items():
+        if t == name.lower():
+            return key
+    if "address" in t:
+        return "ADDRESS"
+    if "date" in t or "time" in t:
+        return "DATE"
+    if "product" in t or "colour" in t or "color" in t:
+        return "PRODUCT"
+    if "stop" in t:
+        return "STOP"
+    return "OTHER"
+
+
+def timeframe_from_text(text: str) -> tuple:
+    t = text.lower().replace(" ", "").replace("–", "-")
+    for key, name in SHEET_TIME.items():
+        if t == name.lower():
+            return key, None
+    return "OTHER", (text.strip() or "Other")
+
+
+def paperform_request(payload: dict) -> tuple:
+    """(request dict, the name typed on the form) from a Paperform webhook, or
+    (None, why). Questions are matched by their titles, like the sheet's columns."""
+    answers = []
+    for item in payload.get("data") or []:
+        value = item.get("value")
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value)
+        answers.append((str(item.get("title") or item.get("key") or "").lower(),
+                        "" if value is None else str(value).strip()))
+
+    def answer(*words: str) -> str:
+        for title, value in answers:
+            if all(re.search(rf"\b{w}", title) for w in words) and value:
+                return value
+        return ""
+
+    po = answer("po") or answer("order")
+    if not po:
+        return None, "no PO number"
+    day = read_day(answer("delivery", "date") or answer("date")) or now().date()
+    timeframe, other = timeframe_from_text(answer("delivery", "time") or answer("time"))
+    details = answer("description") or answer("detail") or "(no description)"
+    return {
+        "order_no": po[:80], "country": country_from_po(po),
+        "category": category_from_text(answer("category") or answer("request")),
+        "details": details[:2000], "delivery_date": day.isoformat(),
+        "timeframe": timeframe, "timeframe_other": other,
+    }, (answer("name") or answer("person") or answer("submitted"))[:80]
+
+
+def web_paperform(payload: dict) -> dict:
+    d, name = paperform_request(payload)
+    if not d:
+        return {"ok": False, "error": name}
+    out = on_bot_loop(create_request(bot_ref(), d, 0, "paperform", name), timeout=20)
+    return {"ok": bool(out), "id": out[0] if out else None}
+
+
+def find_sheet_request(po: str, timestamp: str, category: str):
+    """The open request a ticked sheet row belongs to: the bot's own rows match
+    on PO # and timestamp, Paperform's on PO # and request type."""
+    live = q("SELECT * FROM special_requests WHERE order_no=? AND status IN ('OPEN','TAKEN')"
+             " ORDER BY id DESC", (po,))
+    for r in live:
+        if r["source"] != "paperform" and sheet_values(r)[1] == timestamp:
+            return r
+    for r in live:
+        if r["source"] == "paperform" and SHEET_CATEGORY[r["category"]].lower() == category.lower():
+            return r
+    return None
+
+
+async def after_sheet_tick(bot, rid: int) -> None:
+    r = get_request(rid)
+    await refresh_ops_message(bot, rid)
+    await tell_sender(bot, r, f"✅ <b>Ops have done {about(r)}.\n<i>— ticked in the Ops sheet</i>")
+
+
+def web_sheet_tick(body: dict) -> dict:
+    """Column H ticked in the sheet: that request is done in Telegram too."""
+    r = find_sheet_request(str(body.get("po") or ""), str(body.get("timestamp") or ""),
+                           str(body.get("category") or ""))
+    if not r:
+        return {"ok": True, "matched": False}
+    run("UPDATE special_requests SET status='DONE', handled_by=0, handled_at=?, sheet_dirty=0"
+        " WHERE id=? AND status IN ('OPEN','TAKEN')", (now().isoformat(), r["id"]))
+    on_bot_loop(after_sheet_tick(bot_ref(), r["id"]))
+    return {"ok": True, "matched": True, "id": r["id"]}

@@ -7,6 +7,9 @@
  *   · F Delivery Date · G Delivery Time
  * Ops answer in Telegram -> that row's H checkbox (Ops tick) is ticked, and the
  *   reason or note is added to J (Remarks). Anything already in J is kept.
+ *   Paperform rows are found by PO # and Category (the bot never adds those).
+ * Ops tick H in the sheet -> the bot marks that request done in Telegram too
+ *   (needs the trigger in step 5).
  * Columns I (SO #), K (Pending?) and L (Appears in Cancellation?) are never
  * touched, and nothing outside this tab is read or changed.
  *
@@ -19,6 +22,10 @@
  *        Execute as: Me.  Who has access: Anyone.
  *      (Anyone can reach the address, but nothing is written without SECRET.)
  *   4. Copy the Web app URL into the bot's REQUEST_SHEET_URL setting on Railway.
+ *   5. Ticks back to the bot: Script Properties > add BOT_URL = the bot's App
+ *      address (its PUBLIC_URL, e.g. https://xxx.up.railway.app). Then
+ *      Triggers (clock icon) > Add Trigger > function onTickEdit, event
+ *      source From spreadsheet, event type On edit > Save, and allow access.
  */
 
 const SHEET_NAME = 'Special Req';
@@ -59,7 +66,9 @@ function addRow(sheet, values) {
 }
 
 function updateRow(sheet, body) {
-  const row = findRow(sheet, body.row, body.po, body.timestamp);
+  const row = body.timestamp
+    ? findRow(sheet, body.row, body.po, body.timestamp)
+    : findByCategory(sheet, body.po, body.category);
   if (!row) return { ok: false, error: 'row not found' };
   if (body.ticked) {
     const tick = sheet.getRange(row, COL_TICK);
@@ -87,6 +96,37 @@ function findRow(sheet, hint, po, timestamp) {
     if (String(data[i][0]) === String(timestamp) && String(data[i][1]) === String(po)) return i + 2;
   }
   return 0;
+}
+
+// A Paperform row: the newest with this PO # and Category.
+function findByCategory(sheet, po, category) {
+  const last = lastFilledRow(sheet);
+  if (last < 2) return 0;
+  const data = sheet.getRange(2, COL_PO, last - 1, 2).getDisplayValues();   // C and D
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (String(data[i][0]) === String(po)
+        && String(data[i][1]).toLowerCase() === String(category).toLowerCase()) return i + 2;
+  }
+  return 0;
+}
+
+// Installable "On edit" trigger (setup step 5): when someone ticks H, tell the bot.
+function onTickEdit(e) {
+  const range = e && e.range;
+  if (!range || range.getSheet().getName() !== SHEET_NAME) return;
+  if (range.getColumn() > COL_TICK || range.getColumn() + range.getNumColumns() - 1 < COL_TICK) return;
+  const props = PropertiesService.getScriptProperties();
+  const url = props.getProperty('BOT_URL'), secret = props.getProperty('SECRET');
+  if (!url || !secret) return;
+  const sheet = range.getSheet();
+  for (let r = range.getRow(); r < range.getRow() + range.getNumRows(); r++) {
+    if (r < 2 || sheet.getRange(r, COL_TICK).getValue() !== true) continue;
+    const row = sheet.getRange(r, 1, 1, 4).getDisplayValues()[0];   // A-D
+    UrlFetchApp.fetch(url.replace(/\/$/, '') + '/api/ops/sheet-tick', {
+      method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+      payload: JSON.stringify({ secret: secret, timestamp: row[1], po: row[2], category: row[3] }),
+    });
+  }
 }
 
 // The last row with something in column A or B: checkboxes further down

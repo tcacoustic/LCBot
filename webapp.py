@@ -1158,6 +1158,24 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             return
         self._send(404, b'{"error":"not found"}')
 
+    def _ops_hook(self, path: str):
+        """Special requests from the Paperform, and ticks from the Ops sheet. Not
+        from Telegram, so they prove themselves with the shared secret instead
+        (?key= on the Paperform's webhook address; "secret" from the sheet)."""
+        from ops import web_paperform, web_sheet_tick
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            body = {}
+        key = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("key") or [""])[0]
+        given = key if path == "/api/ops/paperform" else str(body.get("secret") or "")
+        if not REQUEST_SHEET_SECRET or not hmac.compare_digest(given, REQUEST_SHEET_SECRET):
+            self._send(403, b'{"error":"not allowed"}')
+            return
+        out = web_paperform(body) if path == "/api/ops/paperform" else web_sheet_tick(body)
+        self._send(200, json.dumps(out).encode())
+
     def do_POST(self):
         try:
             self._post()
@@ -1170,6 +1188,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
 
     def _post(self):
         path = urllib.parse.urlparse(self.path).path
+        if path in ("/api/ops/paperform", "/api/ops/sheet-tick"):
+            return self._ops_hook(path)
         user = verify_init_data(self.headers.get("X-Init-Data", ""))
         if not user or "id" not in user:
             self._send(401, b'{"error":"unverified"}')
