@@ -84,7 +84,7 @@ async def sync_store_chats(bot, agent_id: int, closed_ids=(),
 
 async def cmd_pmalerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/pmalerts on|off — the short DM platform managers get about new cases."""
-    if not is_admin(update.effective_user.id):
+    if not admin_for(update.effective_user.id, "ON"):
         return
     want = (context.args[0].lower() if context.args else "")
     if want in ("on", "off"):
@@ -102,7 +102,7 @@ async def cmd_linkchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """/linkchat Shopee SG      — in a store's group: post its new cases here
        /linkchat                — which chat each channel posts to
        /linkchat off Shopee SG  — stop posting that channel's cases"""
-    if not is_admin(update.effective_user.id):
+    if not admin_for(update.effective_user.id, "ON"):
         return
     chat = update.effective_chat
     args = " ".join(context.args).strip()
@@ -794,7 +794,7 @@ def may_see_cases(user_id: int) -> bool:
 
 
 def may_edit_cases(user_id: int) -> bool:
-    return is_online(user_id) or is_admin(user_id)
+    return is_online(user_id) or admin_for(user_id, "ON")
 
 
 def case_button_label(r) -> str:
@@ -900,7 +900,7 @@ def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if online:
             buttons.append([InlineKeyboardButton("↩️ Hand back to SH",
                                                  callback_data=f"cs:h:{case_id}")])
-        if is_admin(user_id):
+        if admin_for(user_id, "ON", "SH", "LIVECHAT"):
             buttons.append([InlineKeyboardButton("🔒 Force close (both sides)",
                                                  callback_data=f"cs:f:{case_id}")])
     buttons.append([InlineKeyboardButton("◀️ All cases", callback_data="cs:l")])
@@ -942,7 +942,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await refresh_case_post(context.bot, case_id)
         await notify_reply(context.bot, case_id, uid, closed=True)
         await query.answer("Closed on the SH side ✓")
-    elif action == "f" and is_admin(uid):
+    elif action == "f" and admin_for(uid, "ON", "SH", "LIVECHAT"):
         async with write_lock:
             force_close_case(case_id, uid)
         await refresh_case_post(context.bot, case_id)
@@ -1227,7 +1227,7 @@ def case_report(channels: list, first: date, last: date) -> str:
 
 def report_channels(user_id: int) -> list:
     """Admins see every channel; the Online team sees their own."""
-    if is_admin(user_id) and not is_online(user_id):
+    if admin_for(user_id, "ON") and not is_online(user_id):
         return [k for k, _, _ in CHANNELS]
     return online_channels(user_id)
 
@@ -1237,7 +1237,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
     uid = update.effective_user.id
-    if not (is_online(uid) or is_admin(uid)):
+    if not (is_online(uid) or admin_for(uid, "ON")):
         return
     channels = report_channels(uid)
     if not channels:

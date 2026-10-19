@@ -1190,13 +1190,25 @@ def is_online(user_id: int) -> bool:
     return "ON" in depts_of(user_id)
 
 
+def admin_for(user_id: int, *depts: str) -> bool:
+    """Admin powers for these teams. The owner has them for every team; other
+    admins only for the teams they're in (an SH + Livechat admin gets no ON or
+    Ops tools)."""
+    if not is_admin(user_id):
+        return False
+    if is_owner(user_id) or not ADMIN_IDS:
+        return True
+    return bool(depts_of(user_id) & set(depts))
+
+
 def is_livechat(user_id: int) -> bool:
-    """May use the Livechat side: avails, shifts, clock-in, handovers. Admins
-    always may, unless the owner is viewing as another team."""
+    """May use the Livechat side: avails, shifts, clock-in, handovers. The owner
+    always may (unless viewing as another team); other admins when they're in
+    Livechat, like everyone else."""
     view = viewing_as(user_id)
     if view:
         return view == "LIVECHAT"
-    return "LIVECHAT" in depts_of(user_id) or is_admin(user_id)
+    return "LIVECHAT" in depts_of(user_id) or admin_for(user_id, "LIVECHAT")
 
 
 def online_view(user_id: int) -> bool:
@@ -3028,29 +3040,54 @@ ONLINE_COMMANDS = [
 ]
 
 
+# Which teams each admin tool belongs to. An admin gets a tool when they're in
+# one of its teams (the owner gets them all); () means every admin. Anything
+# not listed is a Livechat tool (the week, slots, hours and pay).
+ADMIN_TEAMS = {
+    "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
+    "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
+    "departments": (), "access": (), "roster": (), "pending": (),
+    "request": ("SH", "LIVECHAT", "FS"), "requests": ("OPS",), "opschat": ("OPS",),
+}
+
+
+def admin_tool_ok(user_id: int, command: str) -> bool:
+    teams = ADMIN_TEAMS.get(command, ("LIVECHAT",))
+    return admin_for(user_id, *teams) if teams else is_admin(user_id)
+
+
+def admin_groups_for(user_id: int) -> list:
+    """ADMIN_GROUPS cut down to this admin's teams, for the menu and /help."""
+    out = []
+    for title, group in ADMIN_GROUPS:
+        mine = [(c, d) for c, d in group if admin_tool_ok(user_id, c)]
+        if mine:
+            out.append((title, mine))
+    return out
+
+
 def menu_for(user_id: int) -> list:
-    """The / menu someone sees: their departments' commands, admin tools for
-    admins, and /viewas for the owner (who keeps it while viewing as a team)."""
+    """The / menu someone sees: every team's commands (someone can be in more
+    than one, e.g. SH who also do Livechat), the admin tools for their teams if
+    they're an admin, and /viewas for the owner (kept while viewing as a team)."""
     depts = depts_of(user_id)
+    pairs = list(AGENT_COMMANDS) if is_livechat(user_id) else []
+    if "ON" in depts:
+        pairs += ONLINE_COMMANDS
+    if "SH" in depts or "FS" in depts:
+        pairs += SH_COMMANDS
+    if "FS" in depts:
+        pairs += FS_COMMANDS
+    if "ONSITE" in depts:
+        pairs += ONSITE_COMMANDS
+    if depts & {"SH", "LIVECHAT", "FS"}:
+        pairs += REQUEST_COMMANDS
+    if "OPS" in depts:
+        pairs += OPS_COMMANDS
     if is_admin(user_id):
-        pairs = ADMIN_COMMANDS + (OWNER_EXTRA if is_owner(user_id) else [])
-    else:
-        # Someone can be in more than one team (e.g. SH who also do Livechat):
-        # they get every team's commands, once each.
-        pairs = list(AGENT_COMMANDS) if is_livechat(user_id) else []
-        if "ON" in depts:
-            pairs += ONLINE_COMMANDS
-        if "SH" in depts or "FS" in depts:
-            pairs += SH_COMMANDS
-        if "FS" in depts:
-            pairs += FS_COMMANDS
-        if "ONSITE" in depts:
-            pairs += ONSITE_COMMANDS
-        if depts & {"SH", "LIVECHAT", "FS"}:
-            pairs += REQUEST_COMMANDS
-        if "OPS" in depts:
-            pairs += OPS_COMMANDS
-        pairs += [("help", "List commands")]
+        pairs += [c for _, group in admin_groups_for(user_id) for c in group]
+        pairs += OWNER_EXTRA if is_owner(user_id) else []
+    pairs += [("help", "List commands")]
     if viewing_as(user_id):
         pairs = pairs + [("viewas", "Back to your own view")]
     seen, out = set(), []

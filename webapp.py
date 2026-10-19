@@ -207,8 +207,10 @@ def app_tabs(user_id: int) -> list:
         tabs |= {"ho", "vis"}
     if depts & {"FS", "ONSITE"}:
         tabs.add("vis")
-    if is_admin(user_id):
-        tabs |= {"vis", "team"}
+    if admin_for(user_id, "SH", "FS", "ONSITE"):
+        tabs.add("vis")
+    if admin_for(user_id, "LIVECHAT"):
+        tabs.add("team")
     return [t for t in TAB_ORDER if t in tabs]
 
 
@@ -602,7 +604,7 @@ ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback",
 
 def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
     """Online team and admins: change a case's urgency or its parts."""
-    if not (is_online(user_id) or is_admin(user_id)):
+    if not (is_online(user_id) or admin_for(user_id, "ON")):
         return {"ok": False, "error": "Only the Online team and admins edit cases."}
     r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if not r:

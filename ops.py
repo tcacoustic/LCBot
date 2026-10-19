@@ -49,11 +49,11 @@ DATE_CHOICES = 8   # today and the next 7 days as buttons; anything else is type
 
 
 def may_request(user_id: int) -> bool:
-    return is_admin(user_id) or bool(depts_of(user_id) & {"SH", "LIVECHAT", "FS"})
+    return bool(depts_of(user_id) & {"SH", "LIVECHAT", "FS"}) or admin_for(user_id, "SH", "LIVECHAT", "FS")
 
 
 def is_ops(user_id: int) -> bool:
-    return is_admin(user_id) or "OPS" in depts_of(user_id)
+    return "OPS" in depts_of(user_id) or admin_for(user_id, "OPS")
 
 
 def ops_target(country: str = "") -> dict | None:
@@ -772,7 +772,7 @@ def ops_chat_lines() -> list:
 async def cmd_opschat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/opschat [SG|MY|HK|TH] (admins, inside an Ops chat or topic) — requests post here.
     No country: the shared chat for any country without its own. /opschat off [CC] stops."""
-    if not is_admin(update.effective_user.id):
+    if not admin_for(update.effective_user.id, "OPS"):
         return
     chat = update.effective_chat
     args = [a.upper() for a in context.args]

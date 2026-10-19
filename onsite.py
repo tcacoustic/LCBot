@@ -65,7 +65,7 @@ def money_text(cents: int, currency: str) -> str:
 
 def may_book(user_id: int) -> bool:
     """SH, FS and admins book visits; specialists work them."""
-    return is_admin(user_id) or bool(depts_of(user_id) & {"SH", "FS"})
+    return admin_for(user_id, "SH", "FS", "ONSITE") or bool(depts_of(user_id) & {"SH", "FS"})
 
 
 def is_specialist(user_id: int) -> bool:
@@ -96,7 +96,7 @@ async def ask_country(bot, admin_id: int, user_id: int, shown: str) -> None:
 async def on_country_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """vz:cy:<id>:<CC> — set the country a specialist works in."""
     query = update.callback_query
-    if not is_admin(query.from_user.id):
+    if not admin_for(query.from_user.id, "ONSITE"):
         await query.answer("Only admins can change this.", show_alert=True)
         return
     _, _, raw, country = query.data.split(":")
@@ -167,7 +167,7 @@ async def on_store_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     _, step, raw, value = query.data.split(":")
     uid = int(raw)
-    if query.from_user.id != uid and not is_admin(query.from_user.id):
+    if query.from_user.id != uid and not admin_for(query.from_user.id, "FS"):
         await query.answer("Only admins can change someone else's store.", show_alert=True)
         return
     question = f"<b>{esc(store_question(uid, query.from_user.id))}</b>"
@@ -200,7 +200,7 @@ async def cmd_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
     uid = update.effective_user.id
-    if "FS" not in depts_of(uid) and not is_admin(uid):
+    if "FS" not in depts_of(uid) and not admin_for(uid, "FS"):
         return
     if "FS" not in depts_of(uid):
         await update.message.reply_text("To set an FS member's store: /specialists @username")
@@ -215,7 +215,7 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """/specialists — On-Site Specialists and FS by country · /specialists @name — set theirs."""
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
-    if not is_admin(update.effective_user.id):
+    if not admin_for(update.effective_user.id, "ONSITE", "FS"):
         return
     target = " ".join(context.args).strip()
     if target:
@@ -1003,7 +1003,7 @@ async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
 async def cmd_visitchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/visitchat (admins, inside a group) — post visit reports here as well.
     /visitchat off — stop."""
-    if not is_admin(update.effective_user.id):
+    if not admin_for(update.effective_user.id, "SH"):
         return
     chat = update.effective_chat
     if context.args and context.args[0].lower() == "off":

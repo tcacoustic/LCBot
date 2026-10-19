@@ -470,7 +470,7 @@ def channels_text(user_id: int) -> str:
 async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Admins tick the channels an Online team member looks after."""
     query = update.callback_query
-    if not is_admin(query.from_user.id):
+    if not admin_for(query.from_user.id, "ON"):
         await query.answer("Only admins can change this.", show_alert=True)
         return
     _, raw, choice = query.data.split(":", 2)
@@ -532,7 +532,7 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
        /channels @mei    — change Mei's channels, or add her to the team"""
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
-    if not is_admin(update.effective_user.id):
+    if not admin_for(update.effective_user.id, "ON"):
         return
     target = " ".join(context.args).strip()
     if not target:
