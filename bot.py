@@ -506,62 +506,14 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Point at the buttons and the app first, commands second."""
+    """The same commands as the / menu, with the App pointed to first."""
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         await update.message.reply_text("Use /schedule here, or message me directly.")
         return
-
     user = update.effective_user
-    if not is_livechat(user.id):
-        await update.message.reply_text(team_help(user.id), parse_mode=constants.ParseMode.HTML)
-        return
-    role = role_of(user.id)
-    lines = ["<b>How to use me</b>", ""]
-
-    lines += [
-        "<b>The buttons below the message box</b>",
-        "  ⏱ Clock in / ✅ Clock out — whichever you need",
-        "  🕐 My hours · 📋 My shifts",
-        "",
-    ]
-    if PUBLIC_URL:
-        lines += [
-        "<b>The app</b> — tap <b>App</b> by the 📎",
-        "  🏠 Home — your shift and any open cases",
-        "  📅 Week — take a slot, or let one go",
-        "  🕐 Hours — what you've worked and earned",
-        "  📝 Handover — close cases, post it, and 🔎 search any case",
-        "",
-        ]
-
-    lines += [
-        "<b>When something changes</b>",
-        "  /dropshift — ask to come off a shift",
-        "  /pickup — ask for one that's open",
-        "  /swap — hand one to a colleague",
-        "",
-        "<b>Anything else</b>",
-        "  /support — who you list as Support",
-        "  /request — special request to Ops (delivery changes)",
-        "  /payslip — open the app",
-    ]
-
-    if role in ("admin", "owner"):
-        lines += ["", "━━━━━━━━━━━━━━", "<b>ADMIN</b>"]
-        for title, group in admin_groups_for(user.id):
-            lines += ["", f"<b>{title}</b>"]
-            lines += [f"  /{c} — {d}" for c, d in group]
-    if role == "owner":
-        lines += ["", "<b>Owner</b>"]
-        lines += [f"  /{c} — {d}" for c, d in OWNER_EXTRA]
-    more = team_help(user.id, extra=True)
-    if more:
-        lines += ["", "━━━━━━━━━━━━━━", more]
-
     await reply_long(
-        update.message, "\n".join(lines),
-        parse_mode=constants.ParseMode.HTML,
-        reply_markup=agent_keyboard(user.id),
+        update.message, help_text(user.id), parse_mode=constants.ParseMode.HTML,
+        reply_markup=agent_keyboard(user.id) if is_livechat(user.id) else ReplyKeyboardRemove(),
     )
 
 
