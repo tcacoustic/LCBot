@@ -2994,7 +2994,7 @@ ADMIN_GROUPS = [
         ("pending", "Approve or decline access requests"),
         ("dropreqs", "Shift requests waiting"),
         ("handovers", "Recent closing handovers"),
-        ("linkchat", "Link a store's chat to its cases"),
+        ("onchat", "Link a store's chat to its cases (ON)"),
         ("pmalerts", "New-case messages to the Online team on/off"),
         ("report", "Case report by channel, last 7 days"),
         ("channels", "Online team and the channels they cover"),
@@ -3100,7 +3100,7 @@ ONLINE_COMMANDS = [
 # one of its teams (the owner gets them all); () means every admin. Anything
 # not listed is a Livechat tool (the week, slots, hours and pay).
 ADMIN_TEAMS = {
-    "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
+    "onchat": ("ON",), "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
     "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
     "departments": (), "access": (), "roster": (), "pending": (),
     "request": ("SH", "LIVECHAT", "FS"), "requests": ("OPS",), "opschat": ("OPS",),
