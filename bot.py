@@ -918,7 +918,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
-    app.add_handler(CommandHandler("linkchat", cmd_linkchat))
+    app.add_handler(CommandHandler(["onchat", "linkchat"], cmd_linkchat))   # /linkchat: the old name
     app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
     app.add_handler(CommandHandler("cases", cmd_cases))
     app.add_handler(CommandHandler("find", cmd_find))

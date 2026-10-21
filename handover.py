@@ -99,9 +99,10 @@ async def cmd_pmalerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_linkchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/linkchat Shopee SG      — in a store's group: post its new cases here
-       /linkchat                — which chat each channel posts to
-       /linkchat off Shopee SG  — stop posting that channel's cases"""
+    """(/linkchat still works, the old name.)
+       /onchat Shopee SG      — in a store's group: post its new cases here
+       /onchat                — which chat each channel posts to
+       /onchat off Shopee SG  — stop posting that channel's cases"""
     if not admin_for(update.effective_user.id, "ON"):
         return
     chat = update.effective_chat
@@ -116,8 +117,8 @@ async def cmd_linkchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 f"<b>{esc(where.get('title') or str(where['chat']))}</b>"
                 if where else "<i>not linked</i>"))
         lines += ["", "To link one, send this inside that store's group:",
-                  "<code>/linkchat Shopee SG</code>",
-                  "To unlink: <code>/linkchat off Shopee SG</code>"]
+                  "<code>/onchat Shopee SG</code>",
+                  "To unlink: <code>/onchat off Shopee SG</code>"]
         await update.message.reply_text(
             "\n".join(lines), parse_mode=constants.ParseMode.HTML)
         return
