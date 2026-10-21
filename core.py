@@ -2916,7 +2916,6 @@ AGENT_COMMANDS = [
     ("clockout", "End my shift"),
     ("handover", "Add or update handover cases"),
     ("cases", "Open cases — notes and closing your side"),
-    ("find", "Search cases: name, order no., product or date"),
     ("payslip", "Open the app"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
@@ -3010,7 +3009,7 @@ ONLINE_HELP = (
     "  ✏️ edit it if a detail is wrong\n"
     "  ➕ New Online request: ask SH to do something with a customer\n"
     "/report — how your channels' cases went this past week\n"
-    "/find — search any case, open or closed: name, order no., product or date\n"
+    "🔎 Search any case, open or closed, in the <b>App</b>: name, order no., product or date\n"
     "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
     "Shopee, Lazada and Webstore.\n"
     "/help — this list again\n\n"
@@ -3021,14 +3020,13 @@ SH_HELP = (
     "👋 <b>SH</b>\n\n"
     "/cases — open cases: add a note, or close your side. Online requests "
     "from the ON team are marked 📣.\n"
-    "/find — search any case, open or closed: name, order no., product or date\n"
+    "🔎 Search any case, open or closed, in the <b>App</b>: name, order no., product or date\n"
     "/visits — On-Site visits and follow-ups. Book visits in the <b>App</b>.\n"
     "/help — this list again"
 )
 
 SH_COMMANDS = [
     ("cases", "Open cases — notes and closing your side"),
-    ("find", "Search cases: name, order no., product or date"),
     ("visits", "On-Site visits and follow-ups"),
 ]
 ONSITE_COMMANDS = [
@@ -3040,7 +3038,6 @@ FS_COMMANDS = [
 
 ONLINE_COMMANDS = [
     ("cases", "Open cases for your channels"),
-    ("find", "Search cases: name, order no., product or date"),
     ("report", "Your channels' cases, last 7 days"),
     ("help", "List commands"),
 ]

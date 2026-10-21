@@ -208,6 +208,8 @@ def app_tabs(user_id: int) -> list:
         tabs |= {"ho", "vis"}
     if depts & {"FS", "ONSITE"}:
         tabs.add("vis")
+    if "FS" in depts:
+        tabs.add("ho")      # cases, and the case search that replaced /find
     if admin_for(user_id, "SH", "FS", "ONSITE"):
         tabs.add("vis")
     if admin_for(user_id, "LIVECHAT"):
