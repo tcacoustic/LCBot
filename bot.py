@@ -737,6 +737,16 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("feedback", cmd_feedback)],
+            states={FEEDBACK_TEXT: [MessageHandler(
+                (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.IMAGE,
+                on_feedback_message)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
+            conversation_timeout=1800,
+        )
+    )
+    app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND
             & filters.Regex(f"^({BTN_IN}|{BTN_OUT}|{BTN_HOURS}|{BTN_SHIFTS})$"),
