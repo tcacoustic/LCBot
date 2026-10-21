@@ -3,6 +3,8 @@
 Part of the LC avails bot. Shared helpers live in core.py.
 """
 
+from __future__ import annotations
+
 from core import *  # noqa: F401,F403
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1000,3 +1002,69 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if w:
         await refresh_group(context, w["id"])
+
+
+# --------------------------------------------------------------------------
+# Feedback: from the App's Feedback button or /feedback, to the owner by DM
+# --------------------------------------------------------------------------
+
+FEEDBACK_TEXT = 430   # conversation state: waiting for the message
+FEEDBACK_KINDS = {"PROBLEM": "🐞 Problem", "IDEA": "💡 Idea", "QUESTION": "❓ Question"}
+
+
+def feedback_head(user_id: int, kind: str = "", where: str = "") -> str:
+    row = q1("SELECT username FROM agents WHERE user_id=?", (user_id,))
+    handle = f" @{row['username']}" if row and row["username"] else ""
+    teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id)]
+    bits = [b for b in (FEEDBACK_KINDS.get(kind, ""), f"from the App: {where}" if where else "") if b]
+    return (f"💬 <b>Feedback from {esc(display_name_of(user_id, 'someone'))}</b>{esc(handle)}"
+            f"{' · ' + esc(' + '.join(teams)) if teams else ''}"
+            + (f"\n{esc(' · '.join(bits))}" if bits else ""))
+
+
+async def send_feedback(bot, user_id: int, text: str = "", kind: str = "", where: str = "",
+                        photo_from: tuple | None = None) -> int:
+    """Send it to the owner(s); returns how many got it. photo_from = (chat, message)
+    for a screenshot sent to the bot, copied across as it is."""
+    head = feedback_head(user_id, kind, where)
+    sent = 0
+    for owner in ADMIN_IDS:
+        try:
+            await bot.send_message(owner, head + (f"\n\n{esc(text)}" if text else ""),
+                                   parse_mode=constants.ParseMode.HTML)
+            if photo_from:
+                await bot.copy_message(owner, photo_from[0], photo_from[1])
+            sent += 1
+        except Exception as e:
+            log.info("Couldn't pass feedback to %s: %s", owner, e)
+    return sent
+
+
+async def cmd_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/feedback — a problem, idea or question, straight to the owner."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        await update.message.reply_text("Message me directly with /feedback.")
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if agent_status(uid) != "active" and not is_owner(uid):
+        await update.message.reply_text("Send /start first, then try /feedback again.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "💬 <b>Feedback</b>\n\nWhat's up? A problem, an idea or a question: type it, or send "
+        "a screenshot with a caption. It goes straight to the bot's owner.\n"
+        "<i>Please blur any customer details. /cancel to stop.</i>",
+        parse_mode=constants.ParseMode.HTML)
+    return FEEDBACK_TEXT
+
+
+async def on_feedback_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.message
+    photo = (msg.chat_id, msg.message_id) if msg.photo or msg.document else None
+    text = (msg.text or "").strip() if not photo else ""
+    if not text and not photo:
+        await msg.reply_text("Type your feedback, or send a screenshot. /cancel to stop.")
+        return FEEDBACK_TEXT
+    sent = await send_feedback(context.bot, update.effective_user.id, text[:3000], photo_from=photo)
+    await msg.reply_text("✅ Thanks! It's been passed on." if sent else
+                         "Sorry, I couldn't pass that on just now. Please try again later.")
+    return ConversationHandler.END

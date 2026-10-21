@@ -3088,7 +3088,7 @@ def menu_for(user_id: int) -> list:
     if is_admin(user_id):
         pairs += [c for _, group in admin_groups_for(user_id) for c in group]
         pairs += OWNER_EXTRA if is_owner(user_id) else []
-    pairs += [("help", "List commands")]
+    pairs += [("feedback", "A problem, idea or question for the bot's owner"), ("help", "List commands")]
     if viewing_as(user_id):
         pairs = pairs + [("viewas", "Back to your own view")]
     seen, out = set(), []
@@ -3402,6 +3402,11 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .search button { min-width:84px; border:0; border-radius:6px; background:var(--ink); color:#fff;
     font-size:14px; font-weight:800; text-transform:uppercase; cursor:pointer; }
   .search-clear { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin:-4px 0 12px; }
+  /* Feedback button, top right over the black header on every screen */
+  #fbBtn { position:fixed; top:12px; right:12px; z-index:15; padding:6px 10px; border-radius:6px;
+    border:2px solid #4A525C; background:var(--ink); color:#fff; font-size:11px; font-weight:800;
+    letter-spacing:.06em; text-transform:uppercase; cursor:pointer; }
+  #app > h1 { padding-right:110px; }
   .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
   .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
     color:#fff; padding:12px 16px; border-radius:8px; font-size:14px; font-weight:700; text-align:center; }
@@ -4597,7 +4602,55 @@ async function loadTeam() {
   wire();
 }
 
+// Feedback: a button on every screen, straight to the owner by DM.
+const SCREEN_NAMES = { home: 'Home', week: 'Week', me: 'Hours', ho: 'Handover', vis: 'Visits',
+                       team: 'Team', req: 'Special request' };
+let FB = { back: 'home', kind: 'PROBLEM', text: '' };
+function feedbackButton() {
+  if (document.getElementById('fbBtn')) return;
+  const b = document.createElement('button');
+  b.id = 'fbBtn'; b.type = 'button'; b.textContent = 'Feedback';
+  b.onclick = () => { if (VIEW !== 'fb') { FB.back = VIEW; VIEW = 'fb'; render(); } };
+  document.body.appendChild(b);
+}
+function loadFeedback() {
+  const app = document.getElementById('app');
+  const kinds = [['PROBLEM', 'Problem'], ['IDEA', 'Idea'], ['QUESTION', 'Question']];
+  let h = '<div class="back" id="fbBack">‹ Back</div><h1>Feedback</h1>'
+    + '<div class="sub">Goes straight to the bot’s owner</div>';
+  h += '<div class="fld"><label>What is it?</label><div class="pick">' + kinds.map(([k, n]) =>
+    '<button data-fbk="' + k + '" class="' + (FB.kind === k ? 'on' : '') + '">' + n + '</button>').join('') + '</div></div>';
+  h += '<div class="fld"><label>Tell us</label><textarea id="fbText" rows="5" '
+     + 'placeholder="What happened, or what would help?">' + esc(FB.text) + '</textarea>'
+     + '<div class="note" style="margin-top:6px">Please don’t include customer details. '
+     + 'For a screenshot, send /feedback to the bot instead.</div></div>';
+  h += '<button class="big" id="fbSend">Send</button>';
+  app.innerHTML = h + navBar();
+  wire();
+  document.querySelectorAll('[data-fbk]').forEach(el => {
+    el.onclick = () => { FB.text = document.getElementById('fbText').value; FB.kind = el.dataset.fbk; loadFeedback(); };
+  });
+  document.getElementById('fbBack').onclick = () => {
+    FB.text = document.getElementById('fbText').value; VIEW = FB.back || 'home'; render();
+  };
+  const send = document.getElementById('fbSend');
+  send.onclick = async () => {
+    const text = document.getElementById('fbText').value.trim();
+    if (!text) { toast('Type your feedback first.'); return; }
+    send.disabled = true; send.textContent = 'Sending…';
+    const out = await post('/api/feedback', { kind: FB.kind, text, where: SCREEN_NAMES[FB.back] || FB.back });
+    send.disabled = false; send.textContent = 'Send';
+    if (!out.ok) { toast(out.error || 'Could not send that.'); return; }
+    FB.text = ''; toast('Thanks! It’s been passed on.');
+    VIEW = FB.back || 'home'; render();
+  };
+}
+
 async function render() {
+  feedbackButton();
+  const fb = document.getElementById('fbBtn');
+  if (fb) fb.style.display = VIEW === 'fb' ? 'none' : '';
+  if (VIEW === 'fb') { loadFeedback(); return; }
   if (VIEW === 'home') {
     try { await loadHome(); }
     catch (e) { showFatal('Home would not load', e.message || e); }
