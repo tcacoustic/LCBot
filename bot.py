@@ -530,7 +530,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  🏠 Home — your shift and any open cases",
         "  📅 Week — take a slot, or let one go",
         "  🕐 Hours — what you've worked and earned",
-        "  📝 Handover — close cases and post it",
+        "  📝 Handover — close cases, post it, and 🔎 search any case",
         "",
         ]
 
@@ -542,7 +542,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         "<b>Anything else</b>",
         "  /support — who you list as Support",
-        "  /find — search any case: name, order no., product or date",
         "  /request — special request to Ops (delivery changes)",
         "  /payslip — open the app",
     ]
@@ -972,7 +971,6 @@ def main() -> None:
     app.add_handler(CommandHandler(["onchat", "linkchat"], cmd_linkchat))   # /linkchat: the old name
     app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
     app.add_handler(CommandHandler("cases", cmd_cases))
-    app.add_handler(CommandHandler("find", cmd_find))
     app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(
@@ -996,7 +994,7 @@ def main() -> None:
         )
     )
     app.add_handler(CallbackQueryHandler(on_cases_button,
-                                         pattern=r"^cs:(l|v|fv|fr|ro|x|s|f|e|ep)(:|$)"))
+                                         pattern=r"^cs:(l|v|ro|x|s|f|e|ep)(:|$)"))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("addreview", cmd_addreview)],
