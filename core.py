@@ -3052,6 +3052,7 @@ ONLINE_HELP = (
     "  ✏️ edit it if a detail is wrong\n"
     "  ➕ New Online request: ask SH to do something with a customer\n"
     "/report — how your channels' cases went this past week\n"
+    "/request — special request to Ops (delivery changes)\n"
     "🔎 Search any case, open or closed, in the <b>App</b>: name, order no., product or date\n"
     "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
     "Shopee, Lazada and Webstore.\n"
@@ -3100,7 +3101,7 @@ ADMIN_TEAMS = {
     "onchat": ("ON",), "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
     "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
     "departments": (), "access": (), "roster": (), "pending": (),
-    "request": ("SH", "LIVECHAT", "FS"), "requests": ("OPS",), "opschat": ("OPS",),
+    "request": ("SH", "LIVECHAT", "ON", "FS"), "requests": ("OPS",), "opschat": ("OPS",),
 }
 
 
@@ -3133,7 +3134,7 @@ def menu_for(user_id: int) -> list:
         pairs += FS_COMMANDS
     if "ONSITE" in depts:
         pairs += ONSITE_COMMANDS
-    if depts & {"SH", "LIVECHAT", "FS"}:
+    if depts & {"SH", "LIVECHAT", "ON", "FS"}:
         pairs += REQUEST_COMMANDS
     if "OPS" in depts:
         pairs += OPS_COMMANDS
@@ -3168,7 +3169,7 @@ def team_help(user_id: int, extra: bool = False) -> str:
                      "and follow-ups\n/store — change the store you're at\n"
                      "/request — special request to Ops (delivery changes)")
     if "OPS" in depts:
-        parts.append("👋 <b>Ops</b>\n\nSpecial requests from SH, Livechat and FS post in the "
+        parts.append("👋 <b>Ops</b>\n\nSpecial requests from SH, Livechat, ON and FS post in the "
                      "Ops chat: tap 🙋 I'm on it, then ✅ Done or 🚫 Can't do, and the sender is told. "
                      "📝 Note to sender sends them a short message. Next-working-day "
                      "deliveries asked for after the 2pm cut-off are marked ⏰ and come back "
@@ -3582,7 +3583,7 @@ async function loadHome() {
   const app = document.getElementById('app');
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
-  if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
+  if (d.online) { ONLINE = true; CAN_REQUEST = !!d.canRequest; VIEW = 'ho'; return loadHandover(); }
   if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; CAN_REQUEST = !!d.canRequest; VIEW = 'vis'; return loadVisits(); }
   if (d.comingSoon) {
     app.innerHTML = `<h1>Hello</h1><div class="sub">${esc((d.teams || []).join(', ') || 'Your team')}</div>`
@@ -4105,6 +4106,7 @@ function renderOnline(d) {
      + `${mine.size ? ' · ' + nMine + ' on your channels' : ''}</div>`;
   h += searchBar();
   h += '<button class="big" id="newCase" style="margin:10px 0 0">+ New Online request</button>';
+  h += requestButton();
 
   h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
     const n = open.filter(c => c.group === g).length;
@@ -4135,6 +4137,7 @@ function renderOnline(d) {
   }
   app.innerHTML = h;
   wireHandover();
+  wireRequestButton();
   document.querySelectorAll('[data-og]').forEach(el => {
     el.onclick = () => { ON_GROUP = el.dataset.og; ON_REGION = ''; renderOnline(d); };
   });

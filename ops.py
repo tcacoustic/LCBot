@@ -1,4 +1,4 @@
-"""Ops: special requests from SH, Livechat and FS (change a delivery's date,
+"""Ops: special requests from SH, Livechat, ON and FS (change a delivery's date,
 address or product, stop it, or anything else).
 
 Each request posts in its country's Ops chat (or topic). One Ops person takes
@@ -49,8 +49,11 @@ LIVE = ("OPEN", "TAKEN")   # still waiting on Ops
 DATE_CHOICES = 8   # today and the next 7 days as buttons; anything else is typed
 
 
+SENDER_TEAMS = {"SH", "LIVECHAT", "ON", "FS"}   # who can send Ops special requests
+
+
 def may_request(user_id: int) -> bool:
-    return bool(depts_of(user_id) & {"SH", "LIVECHAT", "FS"}) or admin_for(user_id, "SH", "LIVECHAT", "FS")
+    return bool(depts_of(user_id) & SENDER_TEAMS) or admin_for(user_id, *SENDER_TEAMS)
 
 
 def is_ops(user_id: int) -> bool:
@@ -121,7 +124,7 @@ def cutoff_text() -> str:
 
 
 def team_of(user_id: int) -> str:
-    names = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id) and k in ("SH", "LIVECHAT", "FS")]
+    names = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id) and k in SENDER_TEAMS]
     return " + ".join(names) or ("Admin" if is_admin(user_id) else "")
 
 
@@ -459,7 +462,7 @@ async def cmd_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text("Message me directly to send a special request.")
         return ConversationHandler.END
     if not may_request(update.effective_user.id):
-        await update.message.reply_text("Special requests are for SH, Livechat and FS.")
+        await update.message.reply_text("Special requests are for SH, Livechat, ON and FS.")
         return ConversationHandler.END
     context.user_data["sr"] = {}
     return await show_step(update, context, R_ORDER)
@@ -1046,7 +1049,7 @@ def request_form_payload(user_id: int, country: str = "") -> dict:
 def web_request_add(user_id: int, body: dict) -> dict:
     """The App form: checked the same way as the bot's steps, then sent the same way."""
     if not may_request(user_id):
-        return {"ok": False, "error": "Special requests are for SH, Livechat and FS."}
+        return {"ok": False, "error": "Special requests are for SH, Livechat, ON and FS."}
     get = lambda k: str(body.get(k) or "").strip()
     d = {"order_no": get("order_no")[:80], "country": get("country"), "category": get("category"),
          "details": get("details")[:2000], "delivery_date": get("delivery_date"),

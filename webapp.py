@@ -1079,7 +1079,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     return
                 if online_view(uid):
                     # Their app is the handover view only.
-                    self._send(200, json.dumps({"online": True}).encode())
+                    self._send(200, json.dumps({"online": True, "canRequest": may_request(uid)}).encode())
                     return
                 if visit_role(uid) and not is_livechat(uid):
                     # SH, FS and On-Site open on the visits calendar.
