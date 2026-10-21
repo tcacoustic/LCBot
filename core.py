@@ -2964,14 +2964,17 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         await asyncio.sleep(0.05)
 
 
-# The / menus (and /help, which shows the same list) only carry what the App
-# can't do yet. Commands the App covers (clock in/out, handover, cases, visits
-# booking, special requests) still work when typed; they just aren't listed.
 AGENT_COMMANDS = [
+    ("clockin", "Start my shift — or /clockin 2pm-4pm"),
+    ("clockout", "End my shift"),
+    ("handover", "Add or update handover cases"),
+    ("cases", "Open cases — notes and closing your side"),
+    ("payslip", "Open the app"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
     ("swap", "Hand a shift to someone"),
     ("support", "Who I list as support"),
+    ("help", "List commands"),
 ]
 GROUP_COMMANDS = [
     ("schedule", "Show this week's schedule"),
@@ -3080,20 +3083,27 @@ SH_HELP = (
     "/help — this list again"
 )
 
-SH_COMMANDS = []          # cases, booking visits and requests are all in the App
+SH_COMMANDS = [
+    ("cases", "Open cases — notes and closing your side"),
+    ("visits", "On-Site visits and follow-ups"),
+]
 ONSITE_COMMANDS = [
     ("visits", "My visits: arrive, leave, report"),
 ]
 FS_COMMANDS = [
     ("store", "Change the store you're at"),
 ]
-REQUEST_COMMANDS = []     # the App's "Special request to Ops" button
+REQUEST_COMMANDS = [
+    ("request", "Special request to Ops: delivery changes"),
+]
 OPS_COMMANDS = [
     ("requests", "Special requests still open"),
 ]
 
 ONLINE_COMMANDS = [
+    ("cases", "Open cases for your channels"),
     ("report", "Your channels' cases, last 7 days"),
+    ("help", "List commands"),
 ]
 
 
@@ -3123,48 +3133,36 @@ def admin_groups_for(user_id: int) -> list:
     return out
 
 
-def menu_sections(user_id: int) -> list:
-    """[(heading, [(command, description)])]: everything this person's / menu and
-    /help show, from every team they're in (e.g. SH who also do Livechat), the
-    admin tools for their teams, and the owner's extras."""
-    depts = depts_of(user_id)
-    team = list(AGENT_COMMANDS) if is_livechat(user_id) else []
-    for dept, cmds in (("ON", ONLINE_COMMANDS), ("SH", SH_COMMANDS), ("FS", SH_COMMANDS + FS_COMMANDS),
-                       ("ONSITE", ONSITE_COMMANDS), ("OPS", OPS_COMMANDS)):
-        if dept in depts:
-            team += cmds
-    if depts & {"SH", "LIVECHAT", "ON", "FS"}:
-        team += REQUEST_COMMANDS
-    sections = [("", team)]
-    if is_admin(user_id):
-        sections += [(f"Admin · {title}", group) for title, group in admin_groups_for(user_id)]
-        if is_owner(user_id):
-            sections.append(("Owner", list(OWNER_EXTRA)))
-    last = [("feedback", "A problem, idea or question for the bot's owner"), ("help", "This list")]
-    if viewing_as(user_id):
-        last.append(("viewas", "Back to your own view"))
-    sections.append(("", last))
-    seen, out = set(), []
-    for title, pairs in sections:
-        keep = [(c, d) for c, d in pairs if c not in seen and not seen.add(c)]
-        if keep:
-            out.append((title, keep))
-    return out
-
-
 def menu_for(user_id: int) -> list:
-    """The / menu: the same commands /help lists, in the same order."""
-    return [pair for _, pairs in menu_sections(user_id) for pair in pairs]
-
-
-def help_text(user_id: int) -> str:
-    """/help: the App first, then exactly what the / menu shows."""
-    lines = ["📱 Most things are in the <b>App</b>: tap <b>App</b> next to the message box.", ""]
-    for title, pairs in menu_sections(user_id):
-        if title:
-            lines += ["", f"<b>{esc(title)}</b>"]
-        lines += [f"/{c} — {esc(d)}" for c, d in pairs]
-    return "\n".join(lines)
+    """The / menu someone sees: every team's commands (someone can be in more
+    than one, e.g. SH who also do Livechat), the admin tools for their teams if
+    they're an admin, and /viewas for the owner (kept while viewing as a team)."""
+    depts = depts_of(user_id)
+    pairs = list(AGENT_COMMANDS) if is_livechat(user_id) else []
+    if "ON" in depts:
+        pairs += ONLINE_COMMANDS
+    if "SH" in depts or "FS" in depts:
+        pairs += SH_COMMANDS
+    if "FS" in depts:
+        pairs += FS_COMMANDS
+    if "ONSITE" in depts:
+        pairs += ONSITE_COMMANDS
+    if depts & {"SH", "LIVECHAT", "ON", "FS"}:
+        pairs += REQUEST_COMMANDS
+    if "OPS" in depts:
+        pairs += OPS_COMMANDS
+    if is_admin(user_id):
+        pairs += [c for _, group in admin_groups_for(user_id) for c in group]
+        pairs += OWNER_EXTRA if is_owner(user_id) else []
+    pairs += [("feedback", "A problem, idea or question for the bot's owner"), ("help", "List commands")]
+    if viewing_as(user_id):
+        pairs = pairs + [("viewas", "Back to your own view")]
+    seen, out = set(), []
+    for c, d in pairs:
+        if c not in seen:
+            seen.add(c)
+            out.append((c, d))
+    return out
 
 
 def team_help(user_id: int, extra: bool = False) -> str:
