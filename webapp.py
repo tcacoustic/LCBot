@@ -5,6 +5,7 @@ Part of the LC avails bot. Shared helpers live in core.py.
 
 from core import *  # noqa: F401,F403
 from onsite import *  # noqa: F401,F403
+from people import send_feedback
 
 async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open the hours summary."""
@@ -1179,7 +1180,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if not web_has_access(uid):
             self._send(403, b'{"error":"no access"}')
             return
-        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS:
+        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | {"/api/feedback"}:
             self._send(403, b'{"error":"online team: handover only"}')
             return
 
@@ -1189,6 +1190,16 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
 
+        if path == "/api/feedback":
+            text = str(body.get("text") or "").strip()[:3000]
+            if not text:
+                self._send(200, json.dumps({"ok": False, "error": "Type your feedback first."}).encode())
+                return
+            sent = on_bot_loop(send_feedback(bot_ref(), uid, text, str(body.get("kind") or ""),
+                                             str(body.get("where") or "")[:40]))
+            self._send(200, json.dumps({"ok": bool(sent)} if sent else
+                                       {"ok": False, "error": "Couldn't send that just now."}).encode())
+            return
         if path == "/api/agent/set":
             if not is_admin(uid):
                 self._send(403, b'{"error":"admins only"}')
