@@ -14,22 +14,42 @@
  * touched, and nothing outside this tab is read or changed.
  *
  * Setup (once), by someone with edit access to the Ops sheet:
- *   1. Extensions > Apps Script, paste this file, Save.
+ *   1. Make a SEPARATE script project, so any code the sheet already has is
+ *      untouched: go to script.google.com > New project, paste this file, Save.
+ *      (Or, if the sheet has no script yet: Extensions > Apps Script.)
  *   2. Project Settings > Script Properties > Add property:
  *        SECRET = a long random password. The same value goes in the bot's
  *        REQUEST_SHEET_SECRET setting on Railway. Never paste it in a chat.
+ *        SHEET_ID = the sheet's ID, the long part of its address between
+ *        /d/ and /edit (only needed for a separate project).
  *   3. Deploy > New deployment > Web app.
  *        Execute as: Me.  Who has access: Anyone.
  *      (Anyone can reach the address, but nothing is written without SECRET.)
  *   4. Copy the Web app URL into the bot's REQUEST_SHEET_URL setting on Railway.
  *   5. Ticks back to the bot: Script Properties > add BOT_URL = the bot's App
- *      address (its PUBLIC_URL, e.g. https://xxx.up.railway.app). Then
- *      Triggers (clock icon) > Add Trigger > function onTickEdit, event
- *      source From spreadsheet, event type On edit > Save, and allow access.
+ *      address (its PUBLIC_URL, e.g. https://xxx.up.railway.app). Then run
+ *      installTrigger once (pick it next to Run, press Run, allow access).
  */
 
 const SHEET_NAME = 'Special Req';
 const COL_PERSON = 1, COL_TIMESTAMP = 2, COL_PO = 3, COL_TICK = 8, COL_REMARKS = 10;
+
+// The Ops sheet: by SHEET_ID when this is a separate project, else the sheet
+// this script belongs to.
+function book() {
+  const id = PropertiesService.getScriptProperties().getProperty('SHEET_ID');
+  return id ? SpreadsheetApp.openById(id.trim()) : SpreadsheetApp.getActiveSpreadsheet();
+}
+
+// Run once (setup step 5): makes the "On edit" trigger that sends ticks to the
+// bot, replacing any old one from this project.
+function installTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'onTickEdit')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('onTickEdit').forSpreadsheet(book()).onEdit().create();
+  Logger.log('onTickEdit trigger installed for "' + book().getName() + '"');
+}
 
 function doPost(e) {
   const secret = PropertiesService.getScriptProperties().getProperty('SECRET');
@@ -42,7 +62,7 @@ function doPost(e) {
   if (!secret || body.secret !== secret) {
     return reply({ ok: false, error: 'not allowed' });
   }
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const sheet = book().getSheetByName(SHEET_NAME);
   if (!sheet) return reply({ ok: false, error: 'no tab called ' + SHEET_NAME });
 
   const lock = LockService.getScriptLock();
@@ -178,15 +198,16 @@ function reply(obj) {
 // Execution log) to see what the script sees. It changes nothing and logs no
 // row contents: only row numbers and whether H has checkboxes.
 function checkSetup() {
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const sheet = book().getSheetByName(SHEET_NAME);
   if (!sheet) { Logger.log('No tab called "' + SHEET_NAME + '". Tabs: ' +
-    SpreadsheetApp.getActiveSpreadsheet().getSheets().map(s => s.getName()).join(', ')); return; }
+    book().getSheets().map(s => s.getName()).join(', ')); return; }
   const last = lastFilledRow(sheet);
   Logger.log('Last filled row (A or B): ' + last + ' · next new row: ' + (last + 1));
   for (let r = Math.max(2, last - 4); r <= last + 1; r++) {
     const rule = sheet.getRange(r, COL_TICK).getDataValidation();
     Logger.log('Row ' + r + ' H: ' + (rule ? String(rule.getCriteriaType()) : 'no rule (plain cell)'));
   }
-  Logger.log('Script version: always-checkbox (no "Done" text)');
+  Logger.log('Script version: always-checkbox, separate-project ready');
+  Logger.log('Sheet: "' + book().getName() + '"');
   Logger.log('SECRET set: ' + !!PropertiesService.getScriptProperties().getProperty('SECRET'));
 }
