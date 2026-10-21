@@ -158,6 +158,13 @@ GROUP_THREAD_ID = env_int("GROUP_THREAD_ID") or None
 # the text to copy instead.
 OPS_CHAT_ID = env_int("OPS_CHAT_ID")
 OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
+# Ops special requests (ops.py). Requests at or after the cut-off are tagged and
+# re-posted at the top of the next working morning. The sheet URL is the Apps
+# Script web app on the Ops sheet; the secret must match its Script Property.
+REQUEST_CUTOFF = os.environ.get("REQUEST_CUTOFF", "").strip() or "14:00"
+REQUEST_CARRY_TIME = os.environ.get("REQUEST_CARRY_TIME", "").strip() or "10:00"
+REQUEST_SHEET_URL = os.environ.get("REQUEST_SHEET_URL", "").strip()
+REQUEST_SHEET_SECRET = os.environ.get("REQUEST_SHEET_SECRET", "").strip()
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
 # Set TEST_MODE=on only on the test bot: lets the owner try the Online team's
@@ -559,6 +566,38 @@ if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
 if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
 # Who did what to a case, and any note they left.
+# Special requests to Ops (ops.py): one row each, mirrored to the Ops sheet.
+db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_no        TEXT NOT NULL,
+    country         TEXT,
+    category        TEXT NOT NULL,
+    details         TEXT NOT NULL,
+    delivery_date   TEXT NOT NULL,
+    timeframe       TEXT NOT NULL,
+    timeframe_other TEXT,
+    created_by      INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    after_cutoff    INTEGER NOT NULL DEFAULT 0,   -- next working day's delivery, asked after 2pm
+    urgent          INTEGER NOT NULL DEFAULT 0,   -- same-day delivery
+    status          TEXT NOT NULL DEFAULT 'OPEN',
+    reason          TEXT,
+    taken_by        INTEGER,
+    taken_at        TEXT,
+    ops_note        TEXT,
+    handled_by      INTEGER,
+    handled_at      TEXT,
+    ops_chat_id     INTEGER,
+    ops_msg_id      INTEGER,
+    sheet_dirty     INTEGER NOT NULL DEFAULT 1,
+    sheet_row       INTEGER
+)""")
+_cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
+for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER",
+             "urgent INTEGER NOT NULL DEFAULT 0", "source TEXT NOT NULL DEFAULT 'bot'",
+             "submitted_name TEXT"):
+    if _col.split()[0] not in _cols:
+        db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     case_id    INTEGER NOT NULL,
@@ -1113,6 +1152,7 @@ DEPARTMENTS = [
     ("ONSITE", "On-Site"),
     ("SH", "SH"),
     ("FS", "FS"),
+    ("OPS", "Ops"),
 ]
 DEPT_NAMES = dict(DEPARTMENTS)
 # Livechat people, for the lists that are about shifts, avails and pay.
@@ -2968,6 +3008,9 @@ ADMIN_GROUPS = [
         ("specialists", "On-Site Specialists by country"),
         ("visits", "On-Site visits and follow-ups"),
         ("visitchat", "Post On-Site visit reports in this group"),
+        ("request", "Send a special request to Ops"),
+        ("requests", "Special requests still open"),
+        ("opschat", "Post special requests in this group (Ops)"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -3016,6 +3059,7 @@ ONLINE_HELP = (
     "  ✏️ edit it if a detail is wrong\n"
     "  ➕ New Online request: ask SH to do something with a customer\n"
     "/report — how your channels' cases went this past week\n"
+    "/request — special request to Ops (delivery changes)\n"
     "🔎 Search any case, open or closed, in the <b>App</b>: name, order no., product or date\n"
     "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
     "Shopee, Lazada and Webstore.\n"
@@ -3029,6 +3073,7 @@ SH_HELP = (
     "from the ON team are marked 📣.\n"
     "🔎 Search any case, open or closed, in the <b>App</b>: name, order no., product or date\n"
     "/visits — On-Site visits and follow-ups. Book visits in the <b>App</b>.\n"
+    "/request — special request to Ops (delivery changes)\n"
     "/help — this list again"
 )
 
@@ -3041,6 +3086,12 @@ ONSITE_COMMANDS = [
 ]
 FS_COMMANDS = [
     ("store", "Change the store you're at"),
+]
+REQUEST_COMMANDS = [
+    ("request", "Special request to Ops: delivery changes"),
+]
+OPS_COMMANDS = [
+    ("requests", "Special requests still open"),
 ]
 
 ONLINE_COMMANDS = [
@@ -3057,6 +3108,7 @@ ADMIN_TEAMS = {
     "onchat": ("ON",), "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
     "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
     "departments": (), "access": (), "roster": (), "pending": (),
+    "request": ("SH", "LIVECHAT", "ON", "FS"), "requests": ("OPS",), "opschat": ("OPS",),
 }
 
 
@@ -3089,6 +3141,10 @@ def menu_for(user_id: int) -> list:
         pairs += FS_COMMANDS
     if "ONSITE" in depts:
         pairs += ONSITE_COMMANDS
+    if depts & {"SH", "LIVECHAT", "ON", "FS"}:
+        pairs += REQUEST_COMMANDS
+    if "OPS" in depts:
+        pairs += OPS_COMMANDS
     if is_admin(user_id):
         pairs += [c for _, group in admin_groups_for(user_id) for c in group]
         pairs += OWNER_EXTRA if is_owner(user_id) else []
@@ -3117,7 +3173,14 @@ def team_help(user_id: int, extra: bool = False) -> str:
         parts.append("👋 <b>FS</b>\n\nBook on-site visits in the <b>App</b> by the 📎: "
                      "pick the country, the date and time, and the customer's details. "
                      "The specialist is told straight away.\n/visits — upcoming visits "
-                     "and follow-ups\n/store — change the store you're at")
+                     "and follow-ups\n/store — change the store you're at\n"
+                     "/request — special request to Ops (delivery changes)")
+    if "OPS" in depts:
+        parts.append("👋 <b>Ops</b>\n\nSpecial requests from SH, Livechat, ON and FS post in the "
+                     "Ops chat: tap 🙋 I'm on it, then ✅ Done or 🚫 Can't do, and the sender is told. "
+                     "📝 Note to sender sends them a short message. Next-working-day "
+                     "deliveries asked for after the 2pm cut-off are marked ⏰ and come back "
+                     "at 10am the next working day; same-day ones are 🔴 URGENT.\n/requests — the ones still open")
     if "ONSITE" in depts:
         parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
                      "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "
@@ -3264,6 +3327,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:16px; font-weight:800; letter-spacing:.04em; text-transform:uppercase;
     cursor:pointer; margin-top:12px; background:var(--accent); color:#fff; }
   .big.stop { background:var(--ink); }
+  .big.ghost { background:var(--card); color:var(--ink); border:2px solid var(--ink); min-height:50px; }
   /* Add a case sits above Post handover: only one orange button per screen. */
   #newCase:has(~ #postHo), #newCase:has(~ #postOps) { background:var(--card); color:var(--ink); border:2px solid var(--ink); }
   .big[disabled] { opacity:.5; }
@@ -3526,8 +3590,8 @@ async function loadHome() {
   const app = document.getElementById('app');
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
-  if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
-  if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; VIEW = 'vis'; return loadVisits(); }
+  if (d.online) { ONLINE = true; CAN_REQUEST = !!d.canRequest; VIEW = 'ho'; return loadHandover(); }
+  if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; CAN_REQUEST = !!d.canRequest; VIEW = 'vis'; return loadVisits(); }
   if (d.comingSoon) {
     app.innerHTML = `<h1>Hello</h1><div class="sub">${esc((d.teams || []).join(', ') || 'Your team')}</div>`
       + '<div class="note">Your team\u2019s screens are on the way. Until then, send /help to the bot to see what you can use.</div>';
@@ -3535,6 +3599,7 @@ async function loadHome() {
   }
   IS_ADMIN = !!d.isAdmin;
   TABS = d.tabs || null;
+  CAN_REQUEST = !!d.canRequest;
 
   let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}`
     + `${d.teams && d.teams.length ? ' · ' + esc(d.teams.join(' + ')) : ''}</div>`;
@@ -3555,6 +3620,8 @@ async function loadHome() {
   h += `<div class="card"><div class="n">${esc(d.weekHours)}</div><div class="l">This week</div></div>`;
   h += `<div class="card"><div class="n">${d.weekShifts}</div><div class="l">Shifts</div></div>`;
   h += '</div>';
+
+  h += requestButton();
 
   if (d.booked && d.booked.length) {
     h += '<h2>Appointments you booked</h2>';
@@ -3588,6 +3655,7 @@ async function loadHome() {
   wire();
   const btn = document.getElementById('act');
   if (btn) btn.onclick = () => d.onShift ? doClockOut(btn) : doClockIn(btn, d.slotsToday);
+  wireRequestButton();
   document.querySelectorAll('[data-gotovis]').forEach(el => {
     el.onclick = () => { VIEW = 'vis'; render(); };
   });
@@ -4045,6 +4113,7 @@ function renderOnline(d) {
      + `${mine.size ? ' · ' + nMine + ' on your channels' : ''}</div>`;
   h += searchBar();
   h += '<button class="big" id="newCase" style="margin:10px 0 0">+ New Online request</button>';
+  h += requestButton();
 
   h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
     const n = open.filter(c => c.group === g).length;
@@ -4075,6 +4144,7 @@ function renderOnline(d) {
   }
   app.innerHTML = h;
   wireHandover();
+  wireRequestButton();
   document.querySelectorAll('[data-og]').forEach(el => {
     el.onclick = () => { ON_GROUP = el.dataset.og; ON_REGION = ''; renderOnline(d); };
   });
@@ -4242,6 +4312,7 @@ async function loadVisits() {
       h += '<div class="note">No On-Site Specialist in this country yet.</div>';
     }
     h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+ Book an appointment</button>';
+    h += requestButton();
   } else {
     h += '<h2>My availability</h2>'
        + '<div class="note" style="margin-top:0">Tap a day. AM = not free 10am–2pm, '
@@ -4274,6 +4345,7 @@ async function loadVisits() {
 
 function wireVisits(d) {
   wire();
+  wireRequestButton();
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
   on('[data-vc]', el => { VS.country = el.dataset.vc; VS.spec = ''; loadVisits(); });
   on('[data-vsp]', el => { VS.spec = el.dataset.vsp; loadVisits(); });
@@ -4612,6 +4684,85 @@ async function loadTeam() {
   wire();
 }
 
+// Special request to Ops: the same steps as /request in the bot, on one screen.
+let RQ = { form: {}, back: 'home' };
+let CAN_REQUEST = false;
+function requestButton() {
+  return CAN_REQUEST ? '<button class="big ghost" id="openRequest">Special request to Ops</button>' : '';
+}
+function wireRequestButton() {
+  const b = document.getElementById('openRequest');
+  if (b) b.onclick = () => { RQ.back = VIEW; RQ.form = RQ.form || {}; VIEW = 'req'; render(); };
+}
+function keepRequest() {
+  for (const k of ['order_no', 'details', 'timeframe_other']) {
+    const el = document.getElementById('rq_' + k);
+    if (el) RQ.form[k] = el.value;
+  }
+}
+async function loadRequest() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/requests?country=' + encodeURIComponent(RQ.form.country || ''));
+  const f = RQ.form;
+  f.country = d.country;
+  if (f.delivery_date && !d.days.some(x => x.iso === f.delivery_date)) f.delivery_date = '';
+  const pick = (attr, items, cur) => '<div class="pick">' + items.map(it =>
+    '<button data-' + attr + '="' + it.key + '" class="' + (cur === it.key ? 'on' : '') + '">' + esc(it.name) + '</button>').join('') + '</div>';
+  let h = '<div class="back" id="rqBack">‹ Back</div><h1>Special request</h1><div class="sub">To Ops</div>';
+  h += '<div class="fld"><label>Order number</label><input id="rq_order_no" value="' + esc(f.order_no || '') + '"></div>';
+  h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: c.key })), f.country) + '</div>';
+  h += '<div class="fld"><label>What is the request?</label>' + pick('rqcat', d.categories, f.category) + '</div>';
+  const cat = d.categories.find(c => c.key === f.category);
+  h += '<div class="fld"><label>Details</label>'
+     + '<div class="note" style="margin:0 0 6px">' + esc(cat ? cat.hint : 'As fully as you can.') + ' No phone or ID numbers.</div>'
+     + '<textarea id="rq_details" rows="3">' + esc(f.details || '') + '</textarea></div>';
+  h += '<div class="fld"><label>' + (f.category === 'DATE' ? 'New delivery date' : 'Delivery date') + '</label><div class="pick">'
+     + d.days.map(x => '<button data-rqd="' + x.iso + '" class="' + (f.delivery_date === x.iso ? 'on' : '') + '">'
+       + esc(x.label) + (x.kind === 'URGENT' ? ' · URGENT' : x.kind === 'LATE' ? ' · late' : '') + '</button>').join('')
+     + '</div><div class="note" style="margin-top:6px">Public holidays are left out (no deliveries). '
+     + 'Next-working-day deliveries asked for after ' + esc(d.cutoff) + ' are after cut-off.</div></div>';
+  h += '<div class="fld"><label>Time frame</label>' + pick('rqt', d.timeframes, f.timeframe);
+  if (f.timeframe === 'OTHER') h += '<input id="rq_timeframe_other" placeholder="e.g. after 7pm" style="margin-top:6px" value="' + esc(f.timeframe_other || '') + '">';
+  h += '</div>';
+  const day = d.days.find(x => x.iso === f.delivery_date);
+  if (day && day.kind === 'URGENT') h += '<div class="warn">Same-day delivery: Ops will see it marked URGENT.</div>';
+  if (day && day.kind === 'LATE') h += '<div class="warn">After the ' + esc(d.cutoff) + ' cut-off for ' + esc(day.label)
+    + '. Ops will try, but it may move to the next working day: check the customer is OK with that.</div>';
+  h += '<button class="big" id="rqSend">Send to Ops</button>';
+  if (d.mine.length) {
+    h += '<h2>Your recent requests</h2>';
+    for (const r of d.mine) {
+      const tags = [];
+      if (r.urgent) tags.push(['URGENT', 'red']); else if (r.late) tags.push(['AFTER CUT-OFF', 'amber']);
+      tags.push([r.status.toUpperCase(), r.statusKey === 'DONE' ? 'green' : r.statusKey === 'CANT' ? 'red' : 'blue']);
+      h += '<div class="p"><div class="tags">' + tags.map(([t, k]) => '<span class="tag ' + k + '">' + t + '</span>').join('') + '</div>'
+         + '<div class="pn">#' + r.id + ' · ' + esc(r.category) + '</div>'
+         + '<div class="t">' + esc(r.order) + ' · ' + esc(r.delivery) + '</div>'
+         + (r.reason ? '<div class="t">Reason: ' + esc(r.reason) + '</div>' : '')
+         + (r.note ? '<div class="t">Ops note: ' + esc(r.note) + '</div>' : '') + '</div>';
+    }
+  }
+  app.innerHTML = h + navBar();
+  wire();
+  const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => { keepRequest(); fn(el); }; });
+  on('[data-rqc]', el => { f.country = el.dataset.rqc; f.delivery_date = ''; loadRequest(); });
+  on('[data-rqcat]', el => { f.category = el.dataset.rqcat; loadRequest(); });
+  on('[data-rqd]', el => { f.delivery_date = el.dataset.rqd; loadRequest(); });
+  on('[data-rqt]', el => { f.timeframe = el.dataset.rqt; loadRequest(); });
+  document.getElementById('rqBack').onclick = () => { keepRequest(); VIEW = RQ.back || 'home'; render(); };
+  const send = document.getElementById('rqSend');
+  send.onclick = async () => {
+    keepRequest();
+    send.disabled = true; send.textContent = 'Sending…';
+    const out = await post('/api/request', f);
+    send.disabled = false; send.textContent = 'Send to Ops';
+    if (!out.ok) { toast(out.error || 'Could not send that.'); return; }
+    toast(out.message);
+    RQ.form = { country: f.country };
+    loadRequest();
+  };
+}
+
 // Feedback: a button on every screen, straight to the owner by DM.
 const SCREEN_NAMES = { home: 'Home', week: 'Week', me: 'Hours', ho: 'Handover', vis: 'Visits',
                        team: 'Team', req: 'Special request' };
@@ -4675,6 +4826,11 @@ async function render() {
   if (VIEW === 'ho') {
     try { await loadHandover(); }
     catch (e) { showFatal('The handover would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'req') {
+    try { await loadRequest(); }
+    catch (e) { showFatal('The request form would not load', e.message || e); }
     return;
   }
   if (VIEW === 'vis') {

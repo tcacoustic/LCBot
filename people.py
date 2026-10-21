@@ -49,6 +49,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     status = agent_status(user.id)
 
+    # From 📝 Note to sender under a special request in an Ops chat.
+    if context.args and context.args[0].startswith("srn_"):
+        from ops import start_ops_note
+        return await start_ops_note(update, context, context.args[0][4:])
+    # From ✏️ Other reason under Can't do: the reason is typed here.
+    if context.args and context.args[0].startswith("srx_"):
+        from ops import start_cant_reason
+        return await start_cant_reason(update, context, context.args[0][4:])
+
     # From 📝 Note under a case in a store chat: take the note here, privately.
     if context.args and context.args[0].startswith("note_") and (
             status == "active" or is_owner(user.id)):
@@ -417,7 +426,7 @@ async def cmd_viewas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     arg = re.sub(r"[^a-z]", "", " ".join(context.args).lower())
     pick = {"off": "", "me": "", "livechat": "LIVECHAT", "lc": "LIVECHAT", "on": "ON",
-            "online": "ON", "onsite": "ONSITE", "sh": "SH", "fs": "FS"}
+            "online": "ON", "onsite": "ONSITE", "sh": "SH", "fs": "FS", "ops": "OPS"}
     if arg not in pick:
         now_view = viewing_as(uid)
         await update.message.reply_text(
