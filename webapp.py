@@ -540,7 +540,8 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
         "request": (display_name_of(r["agent_id"], "Online")
                     if r["origin"] == "on" else ""),
         "group": order_kind(r["platform"], r["store"]),
-        "region": {"TH": "TH", "WEBSTORE": "SG", "WEBSTORE_MY": "MY", "WEBSTORE_HK": "HK"}.get(
+        "region": {"TH": "TH", "WEBSTORE": "SG", "WEBSTORE_MY": "MY", "WEBSTORE_HK": "HK",
+                   "WEBSTORE_TH": "TH"}.get(
             r["channel"] or "", (r["channel"] or "").split("_")[-1]),
         "note": note_line(r["id"]),
         "history": case_history_lines(r["id"]),
