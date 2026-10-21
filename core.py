@@ -3409,7 +3409,9 @@ MINIAPP_HTML = """<!DOCTYPE html>
   /* The label opens out on hover (a computer); on phones it's just the bubble. */
   #fbBtn .fb-label { max-width:0; opacity:0; overflow:hidden; white-space:nowrap; font-size:11px;
     font-weight:800; letter-spacing:.06em; transition:max-width .2s, opacity .2s, margin .2s; }
-  #fbBtn:hover .fb-label, #fbBtn:focus-visible .fb-label { max-width:120px; opacity:1; margin-left:6px; }
+  #fbBtn:hover .fb-label, #fbBtn:focus-visible .fb-label { max-width:180px; opacity:1; margin-left:6px;
+    padding-right:4px; overflow:visible; }
+  #fbBtn:hover, #fbBtn:focus-visible { padding-right:10px; }
   #app > h1 { padding-right:64px; }
   .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
   .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
@@ -4613,7 +4615,7 @@ let FB = { back: 'home', kind: 'PROBLEM', text: '' };
 function feedbackButton() {
   if (document.getElementById('fbBtn')) return;
   const b = document.createElement('button');
-  b.id = 'fbBtn'; b.type = 'button'; b.title = 'Feedback'; b.setAttribute('aria-label', 'Feedback');
+  b.id = 'fbBtn'; b.type = 'button'; b.setAttribute('aria-label', 'Feedback');
   b.innerHTML = '<span aria-hidden="true">🎧</span><span class="fb-label">FEEDBACK 🔧</span>';
   b.onclick = () => { if (VIEW !== 'fb') { FB.back = VIEW; VIEW = 'fb'; render(); } };
   document.body.appendChild(b);
