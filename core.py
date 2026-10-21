@@ -3466,10 +3466,11 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:14px; font-weight:800; text-transform:uppercase; cursor:pointer; }
   .search-clear { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin:-4px 0 12px; }
   /* Feedback button, top right over the black header on every screen */
-  #fbBtn { position:fixed; top:12px; right:12px; z-index:15; padding:6px 10px; border-radius:6px;
-    border:2px solid #4A525C; background:var(--ink); color:#fff; font-size:11px; font-weight:800;
-    letter-spacing:.06em; text-transform:uppercase; cursor:pointer; }
-  #app > h1 { padding-right:110px; }
+  #fbBtn { position:fixed; top:12px; right:12px; z-index:15; width:36px; height:36px; padding:0;
+    border-radius:50%; border:2px solid #4A525C; background:var(--ink); color:#fff; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; }
+  #fbBtn svg { width:18px; height:18px; }
+  #app > h1 { padding-right:64px; }
   .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
   .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
     color:#fff; padding:12px 16px; border-radius:8px; font-size:14px; font-weight:700; text-align:center; }
@@ -4757,7 +4758,10 @@ let FB = { back: 'home', kind: 'PROBLEM', text: '' };
 function feedbackButton() {
   if (document.getElementById('fbBtn')) return;
   const b = document.createElement('button');
-  b.id = 'fbBtn'; b.type = 'button'; b.textContent = 'Feedback';
+  b.id = 'fbBtn'; b.type = 'button'; b.title = 'Feedback'; b.setAttribute('aria-label', 'Feedback');
+  b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+    + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + '<path d="M4 5h16v11H9l-5 4z"/></svg>';
   b.onclick = () => { if (VIEW !== 'fb') { FB.back = VIEW; VIEW = 'fb'; render(); } };
   document.body.appendChild(b);
 }
