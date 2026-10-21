@@ -731,6 +731,9 @@ def main() -> None:
                 SR_NOTE: [     # /start srn_<id> from 📝 Note to sender in an Ops chat
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_ops_note_text)
                 ],
+                SR_REASON: [   # /start srx_<id> from ✏️ Other reason under Can't do
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_cant_reason_text)
+                ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )

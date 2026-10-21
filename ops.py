@@ -32,19 +32,20 @@ REQUEST_CATEGORIES = [
 CATEGORY_NAMES = dict(REQUEST_CATEGORIES)
 TIMEFRAMES = [("ANY", "Anytime"), ("AM", "10am–2pm"), ("PM", "2pm–6pm"), ("OTHER", "Other")]
 TIMEFRAME_NAMES = dict(TIMEFRAMES)
-# Shown as buttons when Ops can't do a request. Keep it to 5 or fewer.
+# Shown as buttons when Ops can't do a request, with "Other" for a typed
+# reason underneath. Keep the buttons to 4 or fewer. A typed reason is saved as
+# it is, so CANT_NAMES.get(reason, reason) shows either kind.
 CANT_REASONS = [
     ("SHIPPED", "Already out for delivery"),
     ("INFO", "Need more information"),
-    ("NOTPOSSIBLE", "Not possible"),
 ]
-CANT_NAMES = dict(CANT_REASONS)
+CANT_NAMES = {**dict(CANT_REASONS), "NOTPOSSIBLE": "Not possible"}   # NOTPOSSIBLE: earlier requests
 STATUS_NAMES = {"OPEN": "Open", "TAKEN": "In progress", "DONE": "Done", "CANT": "Can't do"}
 LIVE = ("OPEN", "TAKEN")   # still waiting on Ops
 
 # Conversation states: /request, and the note Ops write to the sender
 (R_ORDER, R_CAT, R_DETAILS, R_DATE, R_DATE_TYPED, R_TIME, R_TIME_TYPED, R_CONFIRM,
- R_COUNTRY, SR_NOTE) = range(410, 420)
+ R_COUNTRY, SR_NOTE, SR_REASON) = range(410, 421)
 DATE_CHOICES = 8   # today and the next 7 days as buttons; anything else is typed
 
 
@@ -180,8 +181,12 @@ def ops_buttons(r, bot_username: str = "") -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-def cant_buttons(rid: int) -> InlineKeyboardMarkup:
+def cant_buttons(rid: int, bot_username: str = "") -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(name, callback_data=f"sr:nr:{rid}:{key}")] for key, name in CANT_REASONS]
+    if bot_username:
+        # Typed in a private chat with the bot (a group button can't take text).
+        rows.append([InlineKeyboardButton("✏️ Other reason (type it)",
+                                          url=f"https://t.me/{bot_username}?start=srx_{rid}")])
     rows.append([InlineKeyboardButton("‹ Back", callback_data=f"sr:bk:{rid}")])
     return InlineKeyboardMarkup(rows)
 
@@ -683,7 +688,7 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     if action == "no":
         await query.answer()
-        await query.edit_message_reply_markup(reply_markup=cant_buttons(rid))
+        await query.edit_message_reply_markup(reply_markup=cant_buttons(rid, context.bot.username))
         return
     if action == "bk":
         await query.answer()
@@ -706,10 +711,55 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if status == "DONE":
         msg = f"✅ <b>Ops have done {about(r)}.\n<i>— {who}</i>"
     else:
-        msg = (f"🚫 <b>Ops can't do {about(r)}\nReason: <b>{esc(CANT_NAMES[reason])}</b>\n<i>— {who}</i>"
+        msg = (f"🚫 <b>Ops can't do {about(r)}\nReason: <b>{esc(CANT_NAMES.get(reason, reason))}</b>\n<i>— {who}</i>"
                "\n\nThey may add a note with more detail.")
     await tell_sender(context.bot, r, msg)
     await sync_to_sheet(rid)
+
+
+async def start_cant_reason(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
+    """/start srx_<id>, from ✏️ Other reason: Ops type why it can't be done."""
+    uid = update.effective_user.id
+    r = get_request(int(raw)) if raw.isdigit() else None
+    if not r or not is_ops(uid):
+        await update.message.reply_text("That request is gone, or this is for the Ops team only.")
+        return ConversationHandler.END
+    if r["status"] not in LIVE:
+        await update.message.reply_text(f"Request #{r['id']} is already answered: {STATUS_NAMES[r['status']]}.")
+        return ConversationHandler.END
+    if r["status"] == "TAKEN" and r["taken_by"] != uid and not is_admin(uid):
+        await update.message.reply_text(f"{display_name_of(r['taken_by'], 'Someone')} is on that one.")
+        return ConversationHandler.END
+    context.user_data["sr_reason"] = r["id"]
+    await update.message.reply_text(
+        f"🚫 <b>Can't do {about(r).replace('</b>', '', 1)}\n\nWhy can't it be done? Type the reason; "
+        f"{esc(sender_name(r))} will see it.\n\n<i>/cancel to stop</i>", parse_mode=constants.ParseMode.HTML)
+    return SR_REASON
+
+
+async def on_cant_reason_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    rid = context.user_data.pop("sr_reason", None)
+    text = (update.message.text or "").strip()[:300]
+    uid = update.effective_user.id
+    r = get_request(rid) if rid else None
+    if not r or not text:
+        await update.message.reply_text("Nothing was changed.")
+        return ConversationHandler.END
+    async with write_lock:
+        run("UPDATE special_requests SET status='CANT', reason=?, handled_by=?, handled_at=?, sheet_dirty=1,"
+            " taken_by=COALESCE(taken_by, ?), taken_at=COALESCE(taken_at, ?)"
+            " WHERE id=? AND status IN ('OPEN','TAKEN')",
+            (text, uid, now().isoformat(), uid, now().isoformat(), rid))
+    r = get_request(rid)
+    if r["status"] != "CANT" or r["reason"] != text:
+        await update.message.reply_text(f"Request #{rid} was answered meanwhile: {STATUS_NAMES[r['status']]}.")
+        return ConversationHandler.END
+    await refresh_ops_message(context.bot, rid)
+    await tell_sender(context.bot, r, f"🚫 <b>Ops can't do {about(r)}\nReason: <b>{esc(text)}</b>\n"
+                                      f"<i>— {esc(display_name_of(uid, 'Ops'))}</i>")
+    await sync_to_sheet(rid)
+    await update.message.reply_text(f"✅ Marked can't do, and {sender_name(r)} has been told why.")
+    return ConversationHandler.END
 
 
 async def start_ops_note(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
