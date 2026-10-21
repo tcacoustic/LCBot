@@ -2003,6 +2003,7 @@ CHANNELS = [
     ("WEBSTORE", "🇸🇬", "TC Webstore SG"),
     ("WEBSTORE_MY", "🇲🇾", "TC Webstore MY"),
     ("WEBSTORE_HK", "🇭🇰", "TC Webstore HK"),
+    ("WEBSTORE_TH", "🇹🇭", "TC Webstore TH"),
 ]
 CHANNEL_NAMES = {key: f"{flag} {name}" for key, flag, name in CHANNELS}
 STORE_CHANNEL = {
@@ -2020,12 +2021,14 @@ STORE_CHANNEL = {
     "[SG]WEBSTORE": "WEBSTORE",
     "[MY]WEBSTORE": "WEBSTORE_MY",
     "[HK]WEBSTORE": "WEBSTORE_HK",
+    "[TH]WEBSTORE": "WEBSTORE_TH",
 }
 # Livechat cases come from one of the webstores.
 WEBSTORES = [
     ("🇸🇬", "[SG]WEBSTORE"),
     ("🇲🇾", "[MY]WEBSTORE"),
     ("🇭🇰", "[HK]WEBSTORE"),
+    ("🇹🇭", "[TH]WEBSTORE"),
 ]
 
 
@@ -2075,6 +2078,7 @@ ORDER_EXAMPLES = {
     "WEBSTORE": "#40665-TCSG",
     "WEBSTORE_MY": "#40665-TCMY",
     "WEBSTORE_HK": "#40665-TCHK",
+    "WEBSTORE_TH": "#40665-TCTH",
 }
 
 
@@ -2091,7 +2095,7 @@ def order_kind(platform: str | None, store: str | None) -> str:
 def case_example(key: str, platform: str | None, store: str | None) -> str:
     if key == "order_no":
         channel = channel_for(platform, store)
-        if channel in ("WEBSTORE_MY", "WEBSTORE_HK"):
+        if channel in ("WEBSTORE_MY", "WEBSTORE_HK", "WEBSTORE_TH"):
             return ORDER_EXAMPLES[channel]
         return ORDER_EXAMPLES[order_kind(platform, store)]
     return CASE_EXAMPLES.get(key, "")
@@ -2382,6 +2386,8 @@ def parse_channel(text: str) -> str | None:
             names |= {"mywebstore"}
         if key == "WEBSTORE_HK":
             names |= {"hkwebstore"}
+        if key == "WEBSTORE_TH":
+            names |= {"thwebstore"}
         if want in names:
             return key
     return None
@@ -4016,7 +4022,7 @@ function keepForm() {
 const ON_GROUPS = [['SHOPEE', 'Shopee'], ['LAZADA', 'Lazada'], ['WEBSTORE', 'Webstore']];
 const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
                    LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE',
-                   WEBSTORE_MY: 'WEBSTORE', WEBSTORE_HK: 'WEBSTORE' };
+                   WEBSTORE_MY: 'WEBSTORE', WEBSTORE_HK: 'WEBSTORE', WEBSTORE_TH: 'WEBSTORE' };
 
 function onlineCard(c, mine) {
   let h = '<div class="case"><div class="top"><div style="flex:1">';
@@ -4104,7 +4110,7 @@ function renderOnline(d) {
     ON_GROUP = first ? first.group
       : (d.myChannels && d.myChannels.length ? CH_GROUP[d.myChannels[0]] : 'SHOPEE');
   }
-  const regions = ON_GROUP === 'WEBSTORE' ? ['SG', 'MY', 'HK'] : ['SG', 'MY', 'TH'];
+  const regions = ON_GROUP === 'WEBSTORE' ? ['SG', 'MY', 'HK', 'TH'] : ['SG', 'MY', 'TH'];
   if (ON_REGION && !regions.includes(ON_REGION)) ON_REGION = '';
 
   const nMine = open.filter(c => mine.has(c.channel)).length;
