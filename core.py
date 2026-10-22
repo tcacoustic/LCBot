@@ -3043,10 +3043,7 @@ OWNER_EXTRA = [
     ("export", "This week's board as CSV"),
     ("backup", "Download a copy of the data"),
     ("restore", "Put a backup back"),
-    ("dbinfo", "What's in the database"),
     ("chatid", "Show this chat's ID"),
-    ("tidy", "Clear old closed weeks only"),
-    ("reset", "Clear EVERYTHING except people"),
 ]
 ADMIN_COMMANDS = AGENT_COMMANDS + [
     c for _, group in ADMIN_GROUPS for c in group
