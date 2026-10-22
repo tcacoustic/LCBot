@@ -3501,7 +3501,7 @@ function showFatal(what, detail) {
   app.innerHTML = '<div class="err"><b>' + what + '</b><br><br>'
     + '<code style="font-size:11px;word-break:break-word">'
     + String(detail).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))
-    + '</code><br><br>Screenshot this and send it on.</div>';
+    + '</code><br><br>Screenshot this and send it to @caydenseee on Telegram.</div>';
 }
 window.onerror = (m, src, line, col) =>
   showFatal('Something broke', m + '  (line ' + line + ':' + col + ')');
