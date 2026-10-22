@@ -291,34 +291,6 @@ async def on_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """What's in the database right now."""
-    if not is_admin(update.effective_user.id):
-        return
-    info = inspect_db(DB_PATH)
-    if not info["ok"]:
-        await update.message.reply_text(info.get("error", "Couldn't read it."))
-        return
-    try:
-        size = os.path.getsize(DB_PATH) / 1024
-    except OSError:
-        size = 0
-    c = info["counts"]
-    await update.message.reply_text(
-        "🗄 <b>Database</b>\n\n"
-        f"  {c['agents']} agents\n"
-        f"  {c['weeks']} weeks\n"
-        f"  {c['signups']} signups\n"
-        f"  {c['time_entries']} time entries\n"
-        f"  {c['handovers']} handovers\n"
-        f"  {c['reviews']} reviews\n\n"
-        f"  Newest shift: <b>{info['newest'] or '—'}</b>\n"
-        f"  File size: {size:.0f} KB\n"
-        f"  Path: <code>{esc(DB_PATH)}</code>",
-        parse_mode=constants.ParseMode.HTML,
-    )
-
-
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
@@ -358,129 +330,6 @@ async def job_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Backup sent to %d owner(s).", len(targets))
 
 
-async def cmd_tidy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete old closed weeks. The live week and all hours are untouched."""
-    if not is_owner(update.effective_user.id):
-        return
-
-    live = open_week()
-    old = q(
-        "SELECT * FROM weeks WHERE status='closed'"
-        + (" AND id <> ?" if live else "")
-        + " ORDER BY id",
-        (live["id"],) if live else (),
-    )
-    if not old:
-        await update.message.reply_text("No old weeks to clear.")
-        return
-
-    n_sign = q1(
-        """SELECT COUNT(*) c FROM signups su JOIN slots s ON s.id=su.slot_id
-           JOIN days d ON d.id=s.day_id WHERE d.week_id IN ({})""".format(
-            ",".join(str(w["id"]) for w in old)),
-    )["c"]
-
-    if not context.args or context.args[0] != "CONFIRM":
-        lines = [
-            f"This clears <b>{len(old)} closed week(s)</b> and their "
-            f"{n_sign} claim(s):",
-            "",
-        ]
-        lines += [f"  · {esc(w['label'])} ({w['start_date']})" for w in old[:10]]
-        if len(old) > 10:
-            lines.append(f"  · and {len(old) - 10} more")
-        lines += [
-            "",
-            "<b>Kept:</b> the live week, every clock-in record, agents, "
-            "rates and fixed rosters.",
-            "",
-            "To go ahead: <code>/tidy CONFIRM</code>",
-        ]
-        if live:
-            lines.append(f"\n<i>Live week {esc(live['label'])} is safe.</i>")
-        await update.message.reply_text(
-            "\n".join(lines), parse_mode=constants.ParseMode.HTML
-        )
-        return
-
-    ids = ",".join(str(w["id"]) for w in old)
-    async with write_lock:
-        run(f"""DELETE FROM signups WHERE slot_id IN
-                (SELECT s.id FROM slots s JOIN days d ON d.id=s.day_id
-                 WHERE d.week_id IN ({ids}))""")
-        run(f"DELETE FROM confirmations WHERE week_id IN ({ids})")
-        run(f"""DELETE FROM slots WHERE day_id IN
-                (SELECT id FROM days WHERE week_id IN ({ids}))""")
-        run(f"DELETE FROM days WHERE week_id IN ({ids})")
-        run(f"DELETE FROM weeks WHERE id IN ({ids})")
-
-    await update.message.reply_text(
-        f"✅ Cleared {len(old)} old week(s).\n"
-        "Clock-in records, agents, rates and fixed rosters all kept.",
-        parse_mode=constants.ParseMode.HTML,
-    )
-    log.info("Tidied %d old weeks", len(old))
-
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear test schedules and time entries. Keeps people and rates."""
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("Only an owner can reset the data.")
-        return
-
-    counts = {
-        "weeks": q1("SELECT COUNT(*) c FROM weeks")["c"],
-        "signups": q1("SELECT COUNT(*) c FROM signups")["c"],
-        "shifts": q1("SELECT COUNT(*) c FROM time_entries")["c"],
-        "agents": q1("SELECT COUNT(*) c FROM agents WHERE status='active'")["c"],
-    }
-
-    if not context.args or context.args[0] != "CONFIRM":
-        await update.message.reply_text(
-            "⚠️ <b>This will permanently delete:</b>\n"
-            f"  · {counts['weeks']} week(s) and every slot in them\n"
-            f"  · {counts['signups']} slot claim(s)\n"
-            f"  · {counts['shifts']} clock-in record(s)\n\n"
-            "<b>It will keep:</b>\n"
-            f"  · your {counts['agents']} approved agent(s)\n"
-            "  · pay rates and timing presets\n\n"
-            "I'll send you a backup first.\n\n"
-            "To go ahead, send <code>/reset CONFIRM</code>",
-            parse_mode=constants.ParseMode.HTML,
-        )
-        return
-
-    try:
-        data, c = snapshot_db()
-        await update.message.reply_document(
-            data, filename=data.name,
-            caption="🗄 Backup taken before reset. Keep this.",
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"Couldn't take a backup ({e}) — stopping rather than deleting blind."
-        )
-        return
-
-    async with write_lock:
-        with db_lock:
-            for t in ("time_edits", "time_entries", "confirmations",
-                      "signups", "slots", "days", "weeks"):
-                run(f"DELETE FROM {t}")
-            db.execute("DELETE FROM sqlite_sequence WHERE name IN "
-                       "('weeks','days','slots','time_entries','time_edits')")
-            db.commit()
-
-    await update.message.reply_text(
-        "✅ <b>Cleared.</b>\n\n"
-        f"{counts['agents']} agent(s) kept — they don't need to re-register.\n"
-        "Pay rates kept.\n\n"
-        "Post your first real week with /newweek.",
-        parse_mode=constants.ParseMode.HTML,
-    )
-    log.info("Data reset by owner %s", update.effective_user.id)
-
-
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
@@ -506,62 +355,14 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Point at the buttons and the app first, commands second."""
+    """The same commands as the / menu, with the App pointed to first."""
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         await update.message.reply_text("Use /schedule here, or message me directly.")
         return
-
     user = update.effective_user
-    if not is_livechat(user.id):
-        await update.message.reply_text(team_help(user.id), parse_mode=constants.ParseMode.HTML)
-        return
-    role = role_of(user.id)
-    lines = ["<b>How to use me</b>", ""]
-
-    lines += [
-        "<b>The buttons below the message box</b>",
-        "  ⏱ Clock in / ✅ Clock out — whichever you need",
-        "  🕐 My hours · 📋 My shifts",
-        "",
-    ]
-    if PUBLIC_URL:
-        lines += [
-        "<b>The app</b> — tap <b>App</b> by the 📎",
-        "  🏠 Home — your shift and any open cases",
-        "  📅 Week — take a slot, or let one go",
-        "  🕐 Hours — what you've worked and earned",
-        "  📝 Handover — close cases, post it, and 🔎 search any case",
-        "",
-        ]
-
-    lines += [
-        "<b>When something changes</b>",
-        "  /dropshift — ask to come off a shift",
-        "  /pickup — ask for one that's open",
-        "  /swap — hand one to a colleague",
-        "",
-        "<b>Anything else</b>",
-        "  /support — who you list as Support",
-        "  /request — special request to Ops (delivery changes)",
-        "  /payslip — open the app",
-    ]
-
-    if role in ("admin", "owner"):
-        lines += ["", "━━━━━━━━━━━━━━", "<b>ADMIN</b>"]
-        for title, group in admin_groups_for(user.id):
-            lines += ["", f"<b>{title}</b>"]
-            lines += [f"  /{c} — {d}" for c, d in group]
-    if role == "owner":
-        lines += ["", "<b>Owner</b>"]
-        lines += [f"  /{c} — {d}" for c, d in OWNER_EXTRA]
-    more = team_help(user.id, extra=True)
-    if more:
-        lines += ["", "━━━━━━━━━━━━━━", more]
-
     await reply_long(
-        update.message, "\n".join(lines),
-        parse_mode=constants.ParseMode.HTML,
-        reply_markup=agent_keyboard(user.id),
+        update.message, help_text(user.id), parse_mode=constants.ParseMode.HTML,
+        reply_markup=agent_keyboard(user.id) if is_livechat(user.id) else ReplyKeyboardRemove(),
     )
 
 
@@ -844,7 +645,6 @@ def main() -> None:
     app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
     app.add_handler(CommandHandler("fixtime", cmd_fixtime))
     app.add_handler(CommandHandler("backup", cmd_backup))
-    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("restore", cmd_restore)],
@@ -861,8 +661,6 @@ def main() -> None:
             conversation_timeout=1800,
         )
     )
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("tidy", cmd_tidy))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("avails", cmd_avails))
     app.add_handler(CommandHandler("salaried", cmd_salaried))
