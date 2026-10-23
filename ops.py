@@ -1027,7 +1027,6 @@ def request_form_payload(user_id: int, country: str = "") -> dict:
         if not holiday_name(country, day):
             days.append({"iso": day.isoformat(), "label": date_label(day), "kind": cutoff_kind(when, day, country)})
         day += timedelta(days=1)
-    mine = q("SELECT * FROM special_requests WHERE created_by=? ORDER BY id DESC LIMIT 8", (user_id,))
     return {
         "country": country,
         "countries": [{"key": k, "name": n} for k, n in REQUEST_COUNTRIES],
@@ -1035,14 +1034,50 @@ def request_form_payload(user_id: int, country: str = "") -> dict:
         "timeframes": [{"key": k, "name": n} for k, n in TIMEFRAMES],
         "days": days,
         "cutoff": cutoff_text(),
-        "mine": [{
-            "id": r["id"], "order": r["order_no"], "category": CATEGORY_NAMES[r["category"]],
-            "delivery": f"{date_label(date.fromisoformat(r['delivery_date']))} · {timeframe_text(r)}",
-            "status": STATUS_NAMES.get(r["status"], r["status"]), "statusKey": r["status"],
-            "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]),
-            "reason": CANT_NAMES.get(r["reason"], r["reason"] or "") if r["status"] == "CANT" else "",
-            "note": r["ops_note"] or "",
-        } for r in mine],
+        "mine": my_requests(user_id, 8),
+    }
+
+
+def my_requests(user_id: int, limit: int) -> list:
+    """This person's latest special requests, as the App lists them."""
+    return [{
+        "id": r["id"], "order": r["order_no"], "category": CATEGORY_NAMES[r["category"]],
+        "delivery": f"{date_label(date.fromisoformat(r['delivery_date']))} · {timeframe_text(r)}",
+        "status": STATUS_NAMES.get(r["status"], r["status"]), "statusKey": r["status"],
+        "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]),
+        "takenBy": display_name_of(r["taken_by"], "") if r["status"] == "TAKEN" and r["taken_by"] else "",
+        "reason": CANT_NAMES.get(r["reason"], r["reason"] or "") if r["status"] == "CANT" else "",
+        "note": r["ops_note"] or "",
+    } for r in q("SELECT * FROM special_requests WHERE created_by=? ORDER BY id DESC LIMIT ?",
+                 (user_id, limit))]
+
+
+def ops_home(user_id: int) -> dict:
+    """Ops's Home: what's open, the urgent ones first, each linking to its
+    message in the Ops chat (that's where it's answered)."""
+    rows = q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN')"
+             " ORDER BY urgent DESC, after_cutoff DESC, delivery_date, id")
+    def item(r):
+        chat = str(r["ops_chat_id"] or "")
+        link = (f"https://t.me/c/{chat[4:]}/{r['ops_msg_id']}"
+                if chat.startswith("-100") and r["ops_msg_id"] else "")
+        taker = display_name_of(r["taken_by"], "") if r["status"] == "TAKEN" and r["taken_by"] else ""
+        return {"id": r["id"], "order": r["order_no"], "category": CATEGORY_NAMES[r["category"]],
+                "flag": REQUEST_COUNTRY_NAMES.get(r["country"] or "", "")[:2],
+                "delivery": date_label(date.fromisoformat(r["delivery_date"])),
+                "from": sender_name(r),
+                "at": datetime.fromisoformat(r["created_at"]).strftime("%-I:%M%p").lower(),
+                "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]),
+                "takenBy": "You" if r["taken_by"] == user_id and taker else taker, "link": link}
+    today = now().date().isoformat()
+    return {
+        "open": len(rows),
+        "urgent": sum(1 for r in rows if r["urgent"]),
+        "late": sum(1 for r in rows if r["after_cutoff"] and not r["urgent"]),
+        "mine": sum(1 for r in rows if r["status"] == "TAKEN" and r["taken_by"] == user_id),
+        "doneToday": q1("SELECT COUNT(*) AS n FROM special_requests WHERE status IN ('DONE','CANT')"
+                        " AND handled_at >= ?", (today,))["n"],
+        "requests": [item(r) for r in rows[:30]],
     }
 
 

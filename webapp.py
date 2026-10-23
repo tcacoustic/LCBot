@@ -5,7 +5,7 @@ Part of the LC avails bot. Shared helpers live in core.py.
 
 from core import *  # noqa: F401,F403
 from onsite import *  # noqa: F401,F403
-from ops import may_request, request_form_payload, web_request_add
+from ops import may_request, my_requests, ops_home, request_form_payload, web_request_add
 from people import send_feedback
 
 async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,19 +203,110 @@ TAB_ORDER = ["home", "week", "me", "ho", "vis", "team"]
 
 def app_tabs(user_id: int) -> list:
     depts, tabs = depts_of(user_id), set()
+    if is_livechat(user_id) or team_home_kind(user_id):
+        tabs.add("home")
     if is_livechat(user_id):
-        tabs |= {"home", "week", "me", "ho"}
+        tabs |= {"week", "me", "ho"}
+    if online_view(user_id):
+        tabs.add("ho")      # the Online team's cases
     if "SH" in depts:
         tabs |= {"ho", "vis"}
     if depts & {"FS", "ONSITE"}:
         tabs.add("vis")
-    if "FS" in depts:
-        tabs.add("ho")      # cases, and the case search that replaced /find
     if admin_for(user_id, "SH", "FS", "ONSITE"):
         tabs.add("vis")
     if admin_for(user_id, "LIVECHAT"):
         tabs.add("team")
     return [t for t in TAB_ORDER if t in tabs]
+
+
+def tab_names(user_id: int) -> dict:
+    """Tab labels that differ by team."""
+    names = {}
+    if online_view(user_id):
+        names["ho"] = "Cases"
+    if visit_role(user_id) == "specialist":
+        names["vis"] = "My visits"
+    return names
+
+
+def team_home_kind(user_id: int) -> str:
+    """Which team's Home someone outside Livechat gets ('' for none)."""
+    if is_livechat(user_id):
+        return ""
+    if online_view(user_id):
+        return "ON"
+    depts = depts_of(user_id)
+    for team in ("SH", "FS", "ONSITE", "OPS"):
+        if team in depts:
+            return team
+    return ""
+
+
+def team_home_payload(user_id: int) -> dict:
+    """Home for SH, FS, On-Site, ON and Ops: what that team needs first."""
+    kind = team_home_kind(user_id)
+    today = now().date()
+    first = today - timedelta(days=today.weekday())
+    week = [(first + timedelta(days=i)).isoformat() for i in range(7)]
+    live = ",".join("?" * len(LIVE_STATUSES))
+    out = {"teamHome": kind, "name": display_name_of(user_id, "You"),
+           "today": today.strftime("%a %-d %b"), "team": DEPT_NAMES.get(kind, kind),
+           "tabs": app_tabs(user_id), "tabNames": tab_names(user_id),
+           "canRequest": may_request(user_id),
+           "requests": my_requests(user_id, 5) if may_request(user_id) else []}
+
+    if kind == "SH":
+        running = open_cases()
+        needs = [r for r in running if r["origin"] == "on" or r["handed_back"]]
+        out.update(
+            openCases=len(running),
+            onlineRequests=sum(1 for r in needs if r["origin"] == "on" and not r["handed_back"]),
+            handedBack=sum(1 for r in needs if r["handed_back"]),
+            needs=[case_shape(r, today) for r in needs[:5]],
+            visitsToday=q1(f"SELECT COUNT(*) AS n FROM appointments WHERE status IN ({live})"
+                           " AND substr(starts_at,1,10)=?", (*LIVE_STATUSES, today.isoformat()))["n"],
+            booked=my_bookings(user_id))
+    elif kind == "FS":
+        booked = my_bookings(user_id)
+        out.update(
+            booked=booked,
+            bookedWeek=q1(f"SELECT COUNT(*) AS n FROM appointments WHERE created_by=? AND status IN ({live})"
+                          " AND substr(starts_at,1,10) BETWEEN ? AND ?",
+                          (user_id, *LIVE_STATUSES, week[0], week[-1]))["n"],
+            requestsOpen=q1("SELECT COUNT(*) AS n FROM special_requests WHERE created_by=?"
+                            " AND status IN ('OPEN','TAKEN')", (user_id,))["n"])
+    elif kind == "ONSITE":
+        rows = q(f"SELECT * FROM appointments WHERE specialist_id=? AND status IN ({live})"
+                 " AND substr(starts_at,1,10) BETWEEN ? AND ? ORDER BY starts_at",
+                 (user_id, *LIVE_STATUSES, week[0], week[-1]))
+        todays = [r for r in rows if r["starts_at"][:10] == today.isoformat()]
+        nxt = next((r for r in todays if span_of(r)[1] > now()), None) or next(
+            (r for r in rows if r["starts_at"][:10] > today.isoformat()), None)
+        parts = {"AM": "AM", "PM": "PM", "FD": "full day"}
+        blocks = q("SELECT * FROM specialist_blocks WHERE user_id=? AND part IS NOT NULL"
+                   " AND substr(starts_at,1,10) BETWEEN ? AND ? ORDER BY starts_at",
+                   (user_id, today.isoformat(), week[-1]))
+        out.update(
+            next={**visit_item(nxt, "specialist"),
+                  "day": span_of(nxt)[0].strftime("%a %-d %b")} if nxt else None,
+            todayVisits=[visit_item(r, "specialist") for r in todays],
+            weekVisits=len(rows),
+            notFree=[date.fromisoformat(b["starts_at"][:10]).strftime("%a %-d %b") + " "
+                     + parts.get(b["part"], b["part"]) for b in blocks])
+    elif kind == "ON":
+        mine = online_channels(user_id)
+        running = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 AND on_closed=0 ORDER BY id")
+                   if r["channel"] in mine]
+        out.update(
+            channels=[{"key": key, "name": f"{name}", "n": sum(1 for r in running if r["channel"] == key)}
+                      for key, _, name in CHANNELS if key in mine],
+            open=len(running),
+            waiting=sum(1 for r in running if (today - date.fromisoformat(r["the_date"])).days >= 3),
+            oldest=[case_shape(r, today) for r in running[:3]])
+    elif kind == "OPS":
+        out.update(ops=ops_home(user_id))
+    return out
 
 
 def my_bookings(user_id: int, limit: int = 3) -> list:
@@ -1077,6 +1168,10 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 uid = int(user["id"])
                 if not web_has_access(uid):
                     self._send(403, b'{"error":"no access"}')
+                    return
+                if team_home_kind(uid):
+                    # SH, FS, On-Site, ON and Ops: their own team's Home.
+                    self._send(200, json.dumps(team_home_payload(uid)).encode())
                     return
                 if online_view(uid):
                     # Their app is the handover view only.

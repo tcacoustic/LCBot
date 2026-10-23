@@ -517,7 +517,7 @@ async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await context.bot.send_message(
                 uid, f"You're set up for: {channels_text(uid)}.\n\n"
-                     "/cases shows those first.")
+                     "The App shows those first.")
         except Exception:
             pass
         return
