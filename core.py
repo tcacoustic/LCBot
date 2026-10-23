@@ -2673,7 +2673,8 @@ def shift_start(user_id: int) -> datetime:
 def render_shift_summary(user_id: int, who: str) -> tuple:
     """The end-of-shift post for TC Online: the cases this person raised this
     shift, in full with how they stand now, what they closed, and a count of
-    what's still open from before. Returns (text, closed count)."""
+    what's still open from before. Returns (text, closed count); the text is
+    empty when they raised and closed nothing, so nothing is posted."""
     since = shift_start(user_id).isoformat()
     raised = q("SELECT * FROM ho_cases WHERE agent_id=? AND origin='sh' AND created_at >= ?"
                " ORDER BY id", (user_id, since))
@@ -2682,6 +2683,8 @@ def render_shift_summary(user_id: int, who: str) -> tuple:
                            " AND sh_closed_at >= ? ORDER BY sh_closed_at", (user_id, since))
               if r["id"] not in ids]
     earlier = [r for r in open_cases() if r["id"] not in ids]
+    if not raised and not closed:
+        return "", 0
 
     out = ["⭐️ Live Chat Agent Closing Handover ⭐️",
            f"{now().strftime('%a %-d %b')} · {who}"]
@@ -2691,8 +2694,6 @@ def render_shift_summary(user_id: int, who: str) -> tuple:
             out += ["", case_status_line(r), render_case(case_row_to_dict(r))]
             if note_line(r["id"]):
                 out.append(note_line(r["id"]))
-    else:
-        out += ["", "🆕 No new cases this shift"]
     if closed:
         out += ["", f"✔️ Closed this shift ({len(closed)})"]
         out += [f"  {r['prio']} {r['username']} — {r['store'] or r['platform']}" for r in closed]
@@ -4105,7 +4106,9 @@ async function postHandover(btn) {
   const app = document.getElementById('app');
   let h = '<h1>Posted</h1>';
   h += `<div class="sub">${out.open} open · ${out.closed} closed by you today</div>`;
-  if (!out.posted) {
+  if (out.nothing) {
+    h += '<div class="note">Nothing new this shift, so nothing went to TC Online.</div>';
+  } else if (!out.posted) {
     h += '<div class="note">I could not reach TC Online, so here it is to copy:</div>';
     h += `<div class="case"><div class="body">${esc(out.text)}</div></div>`;
   } else {

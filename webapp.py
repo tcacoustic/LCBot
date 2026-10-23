@@ -886,12 +886,12 @@ def web_handover_post(user_id: int) -> dict:
         (user_id, today.isoformat(),
          "\n\n".join(render_case(c) for c in cases), now().isoformat()),
     )
-    posted = bool(on_bot_loop(post_ops(bot_ref(), text)))
+    posted = bool(text and on_bot_loop(post_ops(bot_ref(), text)))
     on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
     on_bot_loop(notify_pms(bot_ref(), user_id), timeout=30)
     return {
         "ok": True, "posted": posted, "open": len(cases), "closed": closed,
-        "text": text if not posted else "",
+        "nothing": not text, "text": text if not posted else "",
     }
 
 
