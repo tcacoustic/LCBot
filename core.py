@@ -2582,32 +2582,35 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
 
 
 async def notify_pms(bot, agent_id: int) -> None:
-    """After a handover, a short DM to each platform manager whose channels
-    have new cases. One message per person per handover, not per case."""
+    """A DM to each platform manager whose channels have new cases: what each
+    case is and what help it needs. One message per person, not per case."""
     rows = q("SELECT * FROM ho_cases WHERE pm_notified=0 ORDER BY id")
     if not rows:
         return
     run("UPDATE ho_cases SET pm_notified=1 WHERE pm_notified=0")
     if setting("pm_alerts", "on") == "off":
         return
-    by_channel: dict = {}
-    for r in rows:
-        if not r["closed"]:
-            by_channel.setdefault(r["channel"], []).append(r)
+    rows = [r for r in rows if not r["closed"]]
     who = display_name_of(agent_id, "SH")
+    names = {key: name for key, _, name in CHANNELS}
     for pm in online_team():
-        mine = [ch for ch in json.loads(pm["channels"] or "[]") if ch in by_channel]
-        if not mine:
+        mine = set(json.loads(pm["channels"] or "[]"))
+        blocks = []
+        for r in (r for r in rows if r["channel"] in mine):
+            lines = [f"🆕 New case from {who} · {CHANNEL_NAMES.get(r['channel'], r['channel'])}",
+                     f"{r['prio']} {r['username']}" + (f" · {r['product']}" if r["product"] else "")]
+            if r["need"]:
+                lines.append(f"‼️ Need help: {r['need']}")
+            blocks.append("\n".join(lines))
+        if not blocks:
             continue
-        lines = [f"🆕 New cases from {who}", ""]
-        for ch in mine:
-            cases = by_channel[ch]
-            names = ", ".join(c["username"] for c in cases[:5])
-            more = f" +{len(cases) - 5}" if len(cases) > 5 else ""
-            lines.append(f"{CHANNEL_NAMES.get(ch, ch)}: {len(cases)} ({names}{more})")
-        lines += ["", "Open /cases to see them."]
+        chats = sorted({names.get(r["channel"], "") for r in rows
+                        if r["channel"] in mine and channel_chat(r["channel"])})
+        where = (f"It's in the {' and '.join(chats)} chat. " if len(blocks) == 1 and chats
+                 else "They're in your store chats. " if chats else "")
+        text = "\n\n".join(blocks) + f"\n\n{where}Open the App to see all cases."
         try:
-            await bot.send_message(pm["user_id"], "\n".join(lines))
+            await bot.send_message(pm["user_id"], text)
         except Exception as e:
             log.info("Couldn't message %s about new cases: %s", pm["user_id"], e)
 
