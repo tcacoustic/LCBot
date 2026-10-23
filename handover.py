@@ -166,12 +166,12 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             (user.id, today.isoformat(),
              "\n\n".join(render_case(c) for c in cases), now().isoformat()),
         )
-    posted = await post_ops(context.bot, text)
+    posted = await post_ops(context.bot, text) if text else False
     await sync_store_chats(context.bot, user.id)
     await query.answer("Carried forward ✓")
     await query.edit_message_text(
-        f"✅ Handover posted — {len(cases)} case(s) still open."
-        if posted else text,
+        "✅ Nothing new this shift, so nothing went to TC Online." if not text
+        else f"✅ Handover posted — {len(cases)} case(s) still open." if posted else text,
         parse_mode=None,
     )
 
@@ -200,15 +200,19 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             (user.id, today.isoformat(), "", now().isoformat()),
         )
     text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
-    posted = await post_ops(context.bot, text)
+    posted = await post_ops(context.bot, text) if text else False
     await sync_store_chats(context.bot, user.id, closed_ids)
     await query.answer("Nothing to hand over ✓")
     others = len(open_cases())
+    if not text:
+        reply = "✅ Nothing new this shift, so nothing went to TC Online."
+    elif posted:
+        reply = "✅ Handover posted — your cases are closed." + (
+            f" {others} from others are still open." if others else "")
+    else:
+        reply = text
     await query.edit_message_text(
-        ("✅ Handover posted — your cases are closed."
-         + (f" {others} from others are still open." if others else "")
-         + "\n\nThanks, enjoy your evening.")
-        if posted else text,
+        reply + ("\n\nThanks, enjoy your evening." if posted or not text else ""),
         parse_mode=None,
     )
 
@@ -308,12 +312,14 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
-    posted = await post_ops(context.bot, text)
+    posted = await post_ops(context.bot, text) if text else False
     await sync_store_chats(context.bot, user.id, closed_ids)
     for k in ("ho_cases", "ho_draft", "ho_keep"):
         context.user_data.pop(k, None)
 
-    if posted:
+    if not text:
+        await query.edit_message_text("✅ Nothing new this shift, so nothing went to TC Online.", parse_mode=None)
+    elif posted:
         msg = f"✅ Handover posted — {len(cases)} open case(s)"
         msg += f", {len(closed)} closed." if closed else "."
         await query.edit_message_text(msg, parse_mode=None)
