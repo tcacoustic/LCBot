@@ -587,7 +587,6 @@ def handover_payload(user_id: int) -> dict:
                        "channel": CHANNEL_NAMES[STORE_CHANNEL[st]],
                        "orderExample": case_example("order_no", "LIVECHAT", st)}
                       for f, st in WEBSTORES],
-        "storeChatsPending": store_chats_pending(),
         "platforms": PLATFORMS,
         "priorities": [{"emoji": e, "name": n} for e, n in PRIORITIES],
         "nextWorking": next_working_day(today).strftime("%A %-d %b"),
@@ -768,24 +767,18 @@ def web_case_add(user_id: int, c: dict) -> dict:
         log_case(cid, user_id, "on", "raised")
         sent = bool(on_bot_loop(post_request(bot_ref(), cid, user_id), timeout=30))
         return {"ok": True, "username": d["username"], "request": True, "sent": sent}
-    insert_case(user_id, d, now().date())
-    return {"ok": True, "username": d["username"]}
+    cid = insert_case(user_id, d, now().date())
+    sent = bool(on_bot_loop(post_case_now(bot_ref(), cid, user_id), timeout=30))
+    return {"ok": True, "username": d["username"], "sent": sent,
+            "chat": CHANNEL_NAMES.get(d["channel"] or "", "")}
 
 
-def web_handover_post(user_id: int, store_chats: bool = True) -> dict:
-    """Post whatever is open, noting what this person closed today."""
+def web_handover_post(user_id: int) -> dict:
+    """Post this person's shift summary to TC Online. Their new cases already
+    went to the store chats as they were added; any that didn't go now."""
     today = now().date()
-    cases = [case_row_to_dict(r) for r in
-             open_cases()]
-    closed = [
-        case_row_to_dict(r) for r in q(
-            "SELECT * FROM ho_cases WHERE sh_closed=1 AND sh_closed_by=? "
-            "AND sh_closed_at >= ? ORDER BY sh_closed_at",
-            (user_id, today.isoformat()),
-        )
-    ]
-    who = display_name_of(user_id, "")
-    text = render_handover(cases, who, today, closed)
+    cases = [case_row_to_dict(r) for r in open_cases()]
+    text, closed = render_shift_summary(user_id, display_name_of(user_id, ""))
 
     run(
         "INSERT INTO handovers (agent_id, the_date, body, created_at) "
@@ -794,13 +787,10 @@ def web_handover_post(user_id: int, store_chats: bool = True) -> dict:
          "\n\n".join(render_case(c) for c in cases), now().isoformat()),
     )
     posted = bool(on_bot_loop(post_ops(bot_ref(), text)))
-    if store_chats:
-        on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
-    else:
-        skip_store_chats()
+    on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
     on_bot_loop(notify_pms(bot_ref(), user_id), timeout=30)
     return {
-        "ok": True, "posted": posted, "open": len(cases), "closed": len(closed),
+        "ok": True, "posted": posted, "open": len(cases), "closed": closed,
         "text": text if not posted else "",
     }
 
@@ -1293,7 +1283,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = (web_case_note(uid, cid, str(body.get("note", "")))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/handover/post":
-            out = web_handover_post(uid, body.get("storeChats", True) is not False)
+            out = web_handover_post(uid)
         elif path == "/api/claim":
             try:
                 sid = int(body.get("slot", 0))
