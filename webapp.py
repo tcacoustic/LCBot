@@ -570,6 +570,7 @@ def handover_payload(user_id: int) -> dict:
 
     return {
         "isOnline": online_view(user_id),
+        "canPost": is_livechat(user_id),     # the closing handover is Livechat's
         "myChannels": online_channels(user_id),
         "openCases": [case_shape(r, today) for r in open_rows],
         "closedCases": [case_shape(r, today, True) for r in closed_rows],

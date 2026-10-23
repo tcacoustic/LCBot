@@ -3888,7 +3888,9 @@ async function loadHandover() {
   }
 
   h += '<button class="big" id="newCase" style="margin-top:14px">Add a case</button>';
-  if (HO_CHOOSE) {
+  if (!d.canPost) {
+    // SH and FS add and update cases; posting the handover is Livechat's.
+  } else if (HO_CHOOSE) {
     h += '<div class="note">TC Online always gets the full handover. Store chats get only their own new cases.</div>';
     h += '<button class="big" id="postOps" style="margin-top:8px">TC Online only</button>';
     h += '<button class="big" id="postAll" style="margin-top:8px">TC Online + store chats</button>';
