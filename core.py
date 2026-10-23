@@ -3577,13 +3577,13 @@ function caseTags(c, extra) {
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
               ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'] };
+let TAB_NAMES = {};
 function navBar() {
-  if (ONLINE) return '';
   const tabs = TABS || ['home', 'week', 'me', 'ho'].concat(IS_ADMIN ? ['vis', 'team'] : []);
   if (tabs.length < 2) return '';
   return '<div class="nav-bar">'
     + tabs.filter(v => NAV[v]).map(v =>
-        `<div class="${VIEW === v ? 'on' : ''}" data-v="${v}">${icon(NAV[v][0])}${NAV[v][1]}</div>`
+        `<div class="${VIEW === v ? 'on' : ''}" data-v="${v}">${icon(NAV[v][0])}${TAB_NAMES[v] || NAV[v][1]}</div>`
       ).join('')
     + '</div>';
 }
@@ -3623,6 +3623,7 @@ async function loadHome() {
   const app = document.getElementById('app');
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
+  if (d.teamHome) return renderTeamHome(d);
   if (d.online) { ONLINE = true; CAN_REQUEST = !!d.canRequest; VIEW = 'ho'; return loadHandover(); }
   if (d.visits) { VISITS_ONLY = true; TABS = d.tabs || null; CAN_REQUEST = !!d.canRequest; VIEW = 'vis'; return loadVisits(); }
   if (d.comingSoon) {
@@ -3706,6 +3707,100 @@ async function loadHome() {
       render();
     };
   });
+}
+
+// Home for SH, FS, On-Site, ON and Ops.
+function renderTeamHome(d) {
+  const app = document.getElementById('app');
+  TABS = d.tabs || null; TAB_NAMES = d.tabNames || {}; CAN_REQUEST = !!d.canRequest;
+  if (d.teamHome === 'ON') ONLINE = true;
+  const card = (n, l, wide) => `<div class="card${wide ? ' wide' : ''}"><div class="n">${esc(String(n))}</div><div class="l">${esc(l)}</div></div>`;
+  const cards = list => '<div class="cards" style="margin-top:20px">'
+    + list.map((c, i) => card(c[0], c[1], list.length % 2 && i === list.length - 1)).join('') + '</div>';
+  const hero = (k, v, t, live) => `<div class="hero${live ? ' live' : ''}"><div class="k">${esc(k)}</div>`
+    + `<div class="v">${esc(v)}</div>${t ? '<div class="t"' + (live ? ' style="color:#fff"' : '') + '>' + esc(t) + '</div>' : ''}</div>`;
+  const plural = (n, one) => n + ' ' + one + (n === 1 ? '' : 's');
+  const caseRow = (c, extra) => `<div class="p tappable" data-hcase="${c.id}" data-hch="${esc(c.channel)}">`
+    + caseTags(c, extra) + `<div class="ptop"><div class="pn">${esc(c.username)}</div><div class="t">›</div></div>`
+    + `<div class="t">${esc([c.channelName || c.platform, c.store, c.age ? c.age + 'd' + (c.stale ? ' ⏳' : '') : ''].filter(Boolean).join(' · '))}</div></div>`;
+  const visitRow = (v, day) => `<div class="p tappable" data-gotovis="1"><div class="ptop">`
+    + `<div class="pn">${esc((day ? day + ' ' : '') + v.start)} · ${esc(v.type)}</div><div class="t">›</div></div>`
+    + `<div class="t">${esc([v.customer, v.specialist].filter(Boolean).join(' · '))}</div></div>`;
+  const mine = () => d.requests && d.requests.length ? '<h2>Your special requests</h2>' + requestCards(d.requests) : '';
+
+  let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)} · ${esc(d.team)}</div>`;
+  if (d.teamHome === 'SH') {
+    const n = d.needs.length;
+    h += hero('Needs you', plural(d.onlineRequests + d.handedBack, 'case'),
+              plural(d.onlineRequests, 'Online request') + ' · ' + d.handedBack + ' handed back');
+    h += cards([[d.openCases, 'Open cases'], [d.visitsToday, 'Visits today']]);
+    h += requestButton();
+    if (n) h += '<h2>Needs you</h2>' + d.needs.map(c => caseRow(c, c.handedBack ? [['HANDED BACK', 'amber']]
+                                                       : c.request ? [['ONLINE REQUEST', 'blue']] : [])).join('');
+    if (d.booked.length) h += '<h2>Appointments you booked</h2>' + d.booked.map(b => visitRow(b, b.day)).join('');
+    h += mine();
+  } else if (d.teamHome === 'FS') {
+    const b = d.booked[0];
+    h += b ? hero('Next appointment you booked', b.day + ' ' + b.start, [b.type, b.customer, b.specialist].filter(Boolean).join(' · '))
+           : hero('Next appointment you booked', 'None yet', '');
+    h += cards([[d.bookedWeek, 'Booked this week'], [d.requestsOpen, 'Requests open']]);
+    h += '<button class="big" id="hBook">Book an appointment</button>';
+    h += requestButton();
+    if (d.booked.length) h += '<h2>Appointments you booked</h2>' + d.booked.map(v => visitRow(v, v.day)).join('');
+    h += mine();
+  } else if (d.teamHome === 'ONSITE') {
+    h += d.next ? hero('Next visit · ' + d.next.day + ' ' + d.next.start, d.next.customer,
+                       [d.next.type, d.next.address].filter(Boolean).join(' · '), true)
+                : hero('Next visit', 'Nothing booked', '');
+    h += cards([[d.todayVisits.length, 'Visits today'], [d.weekVisits, 'This week']]);
+    if (d.todayVisits.length) h += '<h2>Today</h2>' + d.todayVisits.map(v => visitRow({ ...v, specialist: '' })).join('');
+    h += '<div class="note">At the visit, send /visits to the bot to tap 📍 Arrived and 🏁 Leave.</div>';
+    h += '<h2>Not free this week</h2><div class="p tappable" data-gotovis="1"><div class="pn">'
+       + esc(d.notFree.length ? d.notFree.join(' · ') : 'Free all week') + '</div><div class="t">Change it in My visits</div></div>';
+  } else if (d.teamHome === 'ON') {
+    h += hero('Open on your channels', plural(d.open, 'case'),
+              d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
+                                : 'No channels yet: ask an admin to set yours');
+    if (d.channels.length) h += cards(d.channels.map(c => [c.n, c.name]));
+    h += '<button class="big" id="hNewOnline">New Online request</button>';
+    h += requestButton();
+    if (d.oldest.length) h += '<h2>Oldest first</h2>' + d.oldest.map(c => caseRow(c)).join('');
+    h += mine();
+  } else if (d.teamHome === 'OPS') {
+    const o = d.ops;
+    h += hero('Open requests', String(o.open), '🔴 ' + o.urgent + ' same-day · ⏰ ' + o.late + ' after cut-off');
+    h += cards([[o.mine, 'Yours (on it)'], [o.doneToday, 'Done today']]);
+    const row = r => `<div class="p${r.link ? ' tappable' : ''}" data-link="${esc(r.link)}"><div class="tags">`
+      + (r.urgent ? '<span class="tag red">URGENT</span>' : r.late ? '<span class="tag amber">AFTER CUT-OFF</span>' : '')
+      + (r.takenBy ? '<span class="tag blue">ON IT · ' + esc(r.takenBy.toUpperCase()) + '</span>'
+                   : (r.urgent || r.late) ? '' : '<span class="tag">OPEN</span>')
+      + `</div><div class="ptop"><div class="pn">${esc(r.order)} · ${esc(r.category)}</div><div class="t">${r.link ? '›' : ''}</div></div>`
+      + `<div class="t">${esc([r.flag, r.delivery, 'from ' + r.from, r.at].filter(Boolean).join(' · '))}</div></div>`;
+    const urgent = o.requests.filter(r => r.urgent), rest = o.requests.filter(r => !r.urgent);
+    if (urgent.length) h += '<h2>Urgent · same day</h2>' + urgent.map(row).join('');
+    if (rest.length) h += '<h2>' + (urgent.length ? 'Other open' : 'Open') + '</h2>' + rest.map(row).join('');
+    if (!o.open) h += '<div class="empty">Nothing open. 🎉</div>';
+    else h += '<div class="note">Tap a request to jump to it in the Ops chat, and answer it there.</div>';
+  }
+  app.innerHTML = h + navBar();
+  wire();
+  wireRequestButton();
+  document.querySelectorAll('[data-gotovis]').forEach(el => { el.onclick = () => { VIEW = 'vis'; render(); }; });
+  document.querySelectorAll('[data-hcase]').forEach(el => {
+    el.onclick = () => {
+      if (d.teamHome === 'ON') { ON_GROUP = CH_GROUP[el.dataset.hch] || ON_GROUP; ON_REGION = ''; }
+      else HO_SHOWN[el.dataset.hcase] = true;
+      VIEW = 'ho'; render();
+    };
+  });
+  document.querySelectorAll('[data-link]').forEach(el => {
+    if (!el.dataset.link) return;
+    el.onclick = () => { if (tg && tg.openTelegramLink) tg.openTelegramLink(el.dataset.link); else window.open(el.dataset.link, '_blank'); };
+  });
+  const bk = document.getElementById('hBook');
+  if (bk) bk.onclick = () => { VS.form = { country: '', spec: '', visit_type: 'SETUP', date: '', time: '' }; VIEW = 'vis'; render(); };
+  const no = document.getElementById('hNewOnline');
+  if (no) no.onclick = () => { HO_FORM = { section: 'open', prio: '', platform: '', store: '' }; VIEW = 'ho'; render(); };
 }
 
 async function doClockIn(btn, slots) {
@@ -4162,7 +4257,7 @@ function renderOnline(d) {
     h += '<div class="note" style="margin-top:0">Tick one to reopen it.</div>';
     for (const c of closed) h += caseCard(c, true);
   }
-  app.innerHTML = h;
+  app.innerHTML = h + navBar();
   wireHandover();
   wireRequestButton();
   document.querySelectorAll('[data-og]').forEach(el => {
@@ -4315,6 +4410,7 @@ async function loadVisits() {
   const qs = new URLSearchParams({ week: VS.week, country: VS.country, spec: VS.spec, avail: VS.avail });
   const d = await getJSON('/api/visits?' + qs.toString());
   VS.country = d.country; VS.spec = String(d.specId || ''); VS.week = d.weekStart;
+  if (VS.form && !VS.form.country) { VS.form.country = d.country; VS.form.spec = VS.spec; }
   if (VS.form) {
     app.innerHTML = bookForm(d) + navBar();
     wireVisits(d);
@@ -4714,6 +4810,21 @@ function wireRequestButton() {
   const b = document.getElementById('openRequest');
   if (b) b.onclick = () => { RQ.back = VIEW; RQ.form = RQ.form || {}; VIEW = 'req'; render(); };
 }
+// URGENT / AFTER CUT-OFF, then where it stands (ON IT shows who).
+function requestTags(r) {
+  const tags = [];
+  if (r.urgent) tags.push(['URGENT', 'red']); else if (r.late) tags.push(['AFTER CUT-OFF', 'amber']);
+  if (r.statusKey === 'TAKEN' && r.takenBy) tags.push(['ON IT · ' + r.takenBy.toUpperCase(), 'blue']);
+  else if (r.status) tags.push([r.status.toUpperCase(), r.statusKey === 'DONE' ? 'green' : r.statusKey === 'CANT' ? 'red' : '']);
+  return '<div class="tags">' + tags.map(([t, k]) => '<span class="tag ' + k + '">' + esc(t) + '</span>').join('') + '</div>';
+}
+function requestCards(list) {
+  return list.map(r => '<div class="p' + (r.statusKey === 'DONE' ? ' quiet' : '') + '">' + requestTags(r)
+    + '<div class="pn">#' + r.id + ' · ' + esc(r.category) + '</div>'
+    + '<div class="t">' + esc(r.order) + ' · ' + esc(r.delivery) + '</div>'
+    + (r.reason ? '<div class="t">Reason: ' + esc(r.reason) + '</div>' : '')
+    + (r.note ? '<div class="t">Ops note: ' + esc(r.note) + '</div>' : '') + '</div>').join('');
+}
 function keepRequest() {
   for (const k of ['order_no', 'details', 'timeframe_other']) {
     const el = document.getElementById('rq_' + k);
@@ -4750,17 +4861,7 @@ async function loadRequest() {
     + '. Ops will try, but it may move to the next working day: check the customer is OK with that.</div>';
   h += '<button class="big" id="rqSend">Send to Ops</button>';
   if (d.mine.length) {
-    h += '<h2>Your recent requests</h2>';
-    for (const r of d.mine) {
-      const tags = [];
-      if (r.urgent) tags.push(['URGENT', 'red']); else if (r.late) tags.push(['AFTER CUT-OFF', 'amber']);
-      tags.push([r.status.toUpperCase(), r.statusKey === 'DONE' ? 'green' : r.statusKey === 'CANT' ? 'red' : 'blue']);
-      h += '<div class="p"><div class="tags">' + tags.map(([t, k]) => '<span class="tag ' + k + '">' + t + '</span>').join('') + '</div>'
-         + '<div class="pn">#' + r.id + ' · ' + esc(r.category) + '</div>'
-         + '<div class="t">' + esc(r.order) + ' · ' + esc(r.delivery) + '</div>'
-         + (r.reason ? '<div class="t">Reason: ' + esc(r.reason) + '</div>' : '')
-         + (r.note ? '<div class="t">Ops note: ' + esc(r.note) + '</div>' : '') + '</div>';
-    }
+    h += '<h2>Your recent requests</h2>' + requestCards(d.mine);
   }
   app.innerHTML = h + navBar();
   wire();
