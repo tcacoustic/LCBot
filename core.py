@@ -2724,6 +2724,16 @@ def handover_keyboard(running=None) -> InlineKeyboardMarkup:
     ])
 
 
+def handover_question() -> tuple:
+    """The closing-handover ask sent after clocking out: (text, keyboard)."""
+    running = open_cases()
+    note = ""
+    if running:
+        note = f"\n\n<i>{len(running)} case(s) still open from earlier shifts.</i>"
+    return ("<b>Closing handover</b>\n\nAnything for the next agent?" + note,
+            handover_keyboard(running))
+
+
 def open_cases() -> list:
     """Cases still live on SH's side, oldest first."""
     return q("SELECT * FROM ho_cases WHERE closed=0 AND sh_closed=0 ORDER BY id")
@@ -3710,7 +3720,7 @@ async function doClockOut(btn) {
   if (out.ot) h += `<div class="card"><div class="n">+${esc(out.ot)}</div><div class="l">Overtime</div></div>`;
   if (out.pay) h += `<div class="card pay wide"><div class="n">${esc(out.pay)}</div><div class="l">This shift</div></div>`;
   h += '</div>';
-  h += '<div class="note">Do your handover in Telegram — the bot will ask.</div>';
+  h += '<div class="note">Now do your handover: the bot has sent you the question in the chat.</div>';
   app.innerHTML = h + navBar();
   wire();
 }
