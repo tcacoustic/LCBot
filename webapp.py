@@ -365,6 +365,10 @@ def web_clock_out(user_id: int) -> dict:
     fresh = q1("SELECT * FROM time_entries WHERE id=?", (row["id"],))
     base, ot = entry_split(fresh)
     cents = round((base + ot) / 60 * rate_for(user_id, date.fromisoformat(row["the_date"])))
+    # Same as clocking out in the chat: the bot asks for the closing handover.
+    text, kb = handover_question()
+    on_bot_loop(bot_ref().send_message(user_id, text, parse_mode=constants.ParseMode.HTML,
+                                       reply_markup=kb))
 
     return {
         "ok": True, "at": when.strftime("%H:%M"),
