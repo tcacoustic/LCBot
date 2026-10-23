@@ -3421,6 +3421,11 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:14px; font-weight:800; background:var(--card); color:var(--ink); cursor:pointer; }
   .otabs button.on { background:var(--ink); border-color:var(--ink); color:#fff; }
   .otabs.small button { min-height:40px; font-size:13px; }
+  /* The Online team's platform tabs in each platform's colour */
+  .otabs button.og-SHOPEE { color:#EE4D2D; }
+  .otabs button.og-SHOPEE.on { background:#EE4D2D; border-color:#EE4D2D; color:#fff; }
+  .otabs button.og-LAZADA { color:#0F146D; }
+  .otabs button.og-LAZADA.on { background:#0F146D; border-color:#0F146D; color:#fff; }
 
   /* Bottom bar */
   .nav-bar { position:fixed; left:0; right:0; bottom:0; display:flex; z-index:10;
@@ -3504,17 +3509,12 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .search button { min-width:84px; border:0; border-radius:6px; background:var(--ink); color:#fff;
     font-size:14px; font-weight:800; text-transform:uppercase; cursor:pointer; }
   .search-clear { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin:-4px 0 12px; }
-  /* Feedback button, top right over the black header on every screen */
-  #fbBtn { position:fixed; top:12px; right:12px; z-index:15; height:36px; min-width:36px; padding:0 7px;
-    border-radius:18px; border:2px solid #4A525C; background:var(--ink); color:#fff; cursor:pointer;
-    display:flex; align-items:center; justify-content:center; font-size:17px; line-height:1; }
-  /* The label opens out on hover (a computer); on phones it's just the bubble. */
-  #fbBtn .fb-label { max-width:0; opacity:0; overflow:hidden; white-space:nowrap; font-size:11px;
-    font-weight:800; letter-spacing:.06em; transition:max-width .2s, opacity .2s, margin .2s; }
-  #fbBtn:hover .fb-label, #fbBtn:focus-visible .fb-label { max-width:180px; opacity:1; margin-left:6px;
-    padding-right:4px; overflow:visible; }
-  #fbBtn:hover, #fbBtn:focus-visible { padding-right:10px; }
-  #app > h1 { padding-right:64px; }
+  /* Feedback button: top right, in the black header on every screen */
+  #fbBtn { position:absolute; top:14px; right:16px; z-index:15; height:34px; padding:0 12px;
+    border-radius:17px; border:2px solid #4A525C; background:var(--ink); color:#fff; cursor:pointer;
+    display:flex; align-items:center; gap:6px; font-size:12px; font-weight:800; letter-spacing:.06em;
+    text-transform:uppercase; line-height:1; }
+  #app > h1 { padding-right:132px; }
   .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
   .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
     color:#fff; padding:12px 16px; border-radius:8px; font-size:14px; font-weight:700; text-align:center; }
@@ -4132,6 +4132,7 @@ function keepForm() {
 }
 
 const ON_GROUPS = [['SHOPEE', 'Shopee'], ['LAZADA', 'Lazada'], ['WEBSTORE', 'Webstore']];
+const REGION_FLAGS = { SG: '🇸🇬', MY: '🇲🇾', TH: '🇹🇭', HK: '🇭🇰' };
 const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
                    LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE',
                    WEBSTORE_MY: 'WEBSTORE', WEBSTORE_HK: 'WEBSTORE', WEBSTORE_TH: 'WEBSTORE' };
@@ -4235,7 +4236,7 @@ function renderOnline(d) {
 
   h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
     const n = open.filter(c => c.group === g).length;
-    return `<button data-og="${g}" class="${ON_GROUP === g ? 'on' : ''}">${label}${n ? ' (' + n + ')' : ''}</button>`;
+    return `<button data-og="${g}" class="og-${g}${ON_GROUP === g ? ' on' : ''}">${label}${n ? ' (' + n + ')' : ''}</button>`;
   }).join('') + '</div>';
   if (regions.length) {
     const inGroup = open.filter(c => c.group === ON_GROUP);
@@ -4243,7 +4244,7 @@ function renderOnline(d) {
        + `<button data-or="" class="${ON_REGION ? '' : 'on'}">All</button>`
        + regions.map(rg => {
            const n = inGroup.filter(c => c.region === rg).length;
-           return `<button data-or="${rg}" class="${ON_REGION === rg ? 'on' : ''}">${rg}${n ? ' (' + n + ')' : ''}</button>`;
+           return `<button data-or="${rg}" class="${ON_REGION === rg ? 'on' : ''}">${REGION_FLAGS[rg] || ''} ${rg}${n ? ' (' + n + ')' : ''}</button>`;
          }).join('') + '</div>';
   }
 
@@ -4890,18 +4891,18 @@ async function loadRequest() {
 // Feedback: a button on every screen, straight to the owner by DM.
 const SCREEN_NAMES = { home: 'Home', week: 'Week', me: 'Hours', ho: 'Handover', vis: 'Visits',
                        team: 'Team', req: 'Special request' };
-let FB = { back: 'home', kind: 'PROBLEM', text: '' };
+let FB = { back: 'home', kind: 'IDEA', text: '' };
 function feedbackButton() {
   if (document.getElementById('fbBtn')) return;
   const b = document.createElement('button');
   b.id = 'fbBtn'; b.type = 'button'; b.setAttribute('aria-label', 'Feedback');
-  b.innerHTML = '<span aria-hidden="true">🎧</span><span class="fb-label">FEEDBACK 🔧</span>';
+  b.innerHTML = '<span aria-hidden="true">🔧</span><span>Feedback</span>';
   b.onclick = () => { if (VIEW !== 'fb') { FB.back = VIEW; VIEW = 'fb'; render(); } };
   document.body.appendChild(b);
 }
 function loadFeedback() {
   const app = document.getElementById('app');
-  const kinds = [['PROBLEM', 'Problem'], ['IDEA', 'Idea'], ['QUESTION', 'Question']];
+  const kinds = [['IDEA', 'Idea'], ['PROBLEM', 'Problem'], ['QUESTION', 'Question']];
   let h = '<div class="back" id="fbBack">‹ Back</div><h1>Feedback</h1>'
     + '<div class="sub">Goes straight to the bot’s owner</div>';
   h += '<div class="fld"><label>What is it?</label><div class="pick">' + kinds.map(([k, n]) =>
