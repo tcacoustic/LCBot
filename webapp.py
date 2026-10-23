@@ -200,6 +200,10 @@ def team_payload(first: date, mode: str = "month") -> dict:
 # in this order. Someone in two teams (SH who also do Livechat) gets both sets.
 TAB_ORDER = ["home", "week", "me", "ho", "vis", "team"]
 
+# The platform logos on the Online team's tabs (assets/logos).
+LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logos")
+LOGO_FILES = {"shopee.png", "lazada.png", "tc.png", "tc-white.png"}
+
 
 def app_tabs(user_id: int) -> list:
     depts, tabs = depts_of(user_id), set()
@@ -1048,6 +1052,10 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/index.html"):
             self._send(200, MINIAPP_HTML.encode(), "text/html; charset=utf-8")
+            return
+        if path.startswith("/logos/") and path[7:] in LOGO_FILES:
+            with open(os.path.join(LOGO_DIR, path[7:]), "rb") as f:
+                self._send(200, f.read(), "image/png")
             return
         if path == "/health":
             self._send(200, b'{"ok":true}')

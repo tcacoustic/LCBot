@@ -3426,6 +3426,10 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .otabs button.og-SHOPEE.on { background:#EE4D2D; border-color:#EE4D2D; color:#fff; }
   .otabs button.og-LAZADA { color:#0F146D; }
   .otabs button.og-LAZADA.on { background:#0F146D; border-color:#0F146D; color:#fff; }
+  .otabs button[data-og] { display:flex; align-items:center; justify-content:center; gap:5px;
+    white-space:nowrap; font-size:13px; padding:8px 4px; }
+  .plogo { height:18px; width:auto; flex:none; }
+  .plchip { background:#fff; border-radius:5px; padding:2px; display:inline-flex; }
 
   /* Bottom bar */
   .nav-bar { position:fixed; left:0; right:0; bottom:0; display:flex; z-index:10;
@@ -4133,6 +4137,13 @@ function keepForm() {
 
 const ON_GROUPS = [['SHOPEE', 'Shopee'], ['LAZADA', 'Lazada'], ['WEBSTORE', 'Webstore']];
 const REGION_FLAGS = { SG: '🇸🇬', MY: '🇲🇾', TH: '🇹🇭', HK: '🇭🇰' };
+// Each platform's logo on its tab. Picked, Shopee's sits on a white chip (or it
+// vanishes into the orange) and TC turns white on black.
+function platformLogo(g, on) {
+  const file = { SHOPEE: 'shopee', LAZADA: 'lazada', WEBSTORE: on ? 'tc-white' : 'tc' }[g];
+  const img = '<img class="plogo" src="/logos/' + file + '.png" alt="">';
+  return g === 'SHOPEE' && on ? '<span class="plchip">' + img + '</span>' : img;
+}
 const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
                    LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE',
                    WEBSTORE_MY: 'WEBSTORE', WEBSTORE_HK: 'WEBSTORE', WEBSTORE_TH: 'WEBSTORE' };
@@ -4236,7 +4247,7 @@ function renderOnline(d) {
 
   h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
     const n = open.filter(c => c.group === g).length;
-    return `<button data-og="${g}" class="og-${g}${ON_GROUP === g ? ' on' : ''}">${label}${n ? ' (' + n + ')' : ''}</button>`;
+    return `<button data-og="${g}" class="og-${g}${ON_GROUP === g ? ' on' : ''}">${platformLogo(g, ON_GROUP === g)}${label}${n ? ' (' + n + ')' : ''}</button>`;
   }).join('') + '</div>';
   if (regions.length) {
     const inGroup = open.filter(c => c.group === ON_GROUP);
