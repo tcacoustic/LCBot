@@ -189,7 +189,8 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await gate_cb(query):
         return
     today = now().date()
-    closed_ids = [c["id"] for c in open_cases()]
+    # Only this person's own cases: others' stay open for whoever raised them.
+    closed_ids = [c["id"] for c in open_cases() if c["agent_id"] == user.id]
     async with write_lock:
         for cid in closed_ids:
             close_case(cid, user.id)
@@ -202,8 +203,11 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     posted = await post_ops(context.bot, text)
     await sync_store_chats(context.bot, user.id, closed_ids)
     await query.answer("Nothing to hand over ✓")
+    others = len(open_cases())
     await query.edit_message_text(
-        "✅ Handover posted — nothing outstanding.\n\nThanks, enjoy your evening."
+        ("✅ Handover posted — your cases are closed."
+         + (f" {others} from others are still open." if others else "")
+         + "\n\nThanks, enjoy your evening.")
         if posted else text,
         parse_mode=None,
     )
