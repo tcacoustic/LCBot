@@ -2734,7 +2734,7 @@ def handover_keyboard(running=None) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(
                 "↩️ All still open, nothing new", callback_data="ho:carry")],
             [InlineKeyboardButton(
-                "✅ All cases closed", callback_data="ho:none")],
+                "✅ All my cases closed", callback_data="ho:none")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📝 Add handover", callback_data="ho:add")],
