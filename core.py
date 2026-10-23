@@ -3904,7 +3904,7 @@ async function loadHandover() {
 
   h += '<button class="big" id="newCase" style="margin-top:14px">Add a case</button>';
   if (!d.canPost) {
-    // SH and FS add and update cases; posting the handover is Livechat's.
+    // FS add and update cases; posting the handover is Livechat's and SH's.
   } else if (n) {
     h += '<button class="big" id="postHo" style="margin-top:8px">Post handover</button>';
   } else {

@@ -559,6 +559,11 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
     return out
 
 
+def may_post_handover(user_id: int) -> bool:
+    """Livechat and SH both talk to customers, so both post a closing handover."""
+    return is_livechat(user_id) or "SH" in depts_of(user_id)
+
+
 def handover_payload(user_id: int) -> dict:
     """Open cases, recently closed ones, and the pickers for a new case."""
     today = now().date()
@@ -570,7 +575,7 @@ def handover_payload(user_id: int) -> dict:
 
     return {
         "isOnline": online_view(user_id),
-        "canPost": is_livechat(user_id),     # the closing handover is Livechat's
+        "canPost": may_post_handover(user_id),
         "myChannels": online_channels(user_id),
         "openCases": [case_shape(r, today) for r in open_rows],
         "closedCases": [case_shape(r, today, True) for r in closed_rows],
@@ -1216,7 +1221,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if not web_has_access(uid):
             self._send(403, b'{"error":"no access"}')
             return
-        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | {"/api/feedback"}:
+        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | {"/api/feedback"} \
+                and not (path == "/api/handover/post" and may_post_handover(uid)):
             self._send(403, b'{"error":"online team: handover only"}')
             return
 
