@@ -68,14 +68,10 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-async def sync_store_chats(bot, agent_id: int, closed_ids=(),
-                           post_new: bool = True) -> None:
-    """After a handover: new cases to their store chats (unless the agent
-    chose TC Online only), and closed ones updated either way."""
-    if post_new:
-        await post_new_cases_to_chats(bot, agent_id)
-    else:
-        skip_store_chats()
+async def sync_store_chats(bot, agent_id: int, closed_ids=()) -> None:
+    """After a handover: any new cases not in their store chats yet go there,
+    and closed ones are updated."""
+    await post_new_cases_to_chats(bot, agent_id)
     for cid in closed_ids:
         await refresh_case_post(bot, cid)
         await notify_reply(bot, cid, agent_id, closed=True)
@@ -162,11 +158,7 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     today = now().date()
     cases = [case_row_to_dict(c) for c in running]
-    who = display_name_of(user.id, user.full_name)
-    text = render_handover(cases, who, today)
-    text = text.replace(
-        "Open Cases", "Open Cases\n↩️ Still open — nothing new from my shift", 1
-    )
+    text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
     async with write_lock:
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
@@ -197,7 +189,6 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await gate_cb(query):
         return
     today = now().date()
-    cleared = [case_row_to_dict(c) for c in open_cases()]
     closed_ids = [c["id"] for c in open_cases()]
     async with write_lock:
         for cid in closed_ids:
@@ -207,9 +198,7 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "VALUES (?,?,?,?)",
             (user.id, today.isoformat(), "", now().isoformat()),
         )
-    text = render_handover(
-        [], display_name_of(user.id, user.full_name), today, cleared
-    )
+    text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
     posted = await post_ops(context.bot, text)
     await sync_store_chats(context.bot, user.id, closed_ids)
     await query.answer("Nothing to hand over ✓")
@@ -247,29 +236,6 @@ def case_picker(keep: set) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def needs_post_choice(context) -> bool:
-    """Only ask where to post when a new case is headed for a store chat."""
-    new = context.user_data.get("ho_cases", [])
-    return store_chats_pending(
-        channel_for(d["platform"], d.get("store")) for d in new)
-
-
-async def ask_where_to_post(query, prefix: str) -> None:
-    await query.edit_message_text(
-        "<b>Where should this handover go?</b>\n\n"
-        "TC Online always gets the full handover. Store chats get only "
-        "their own new cases.",
-        parse_mode=constants.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 TC Online only",
-                                  callback_data=f"{prefix}:send:ops")],
-            [InlineKeyboardButton("📤 TC Online + store chats",
-                                  callback_data=f"{prefix}:send:all")],
-            [InlineKeyboardButton("◀️ Back", callback_data=f"{prefix}:back")],
-        ]),
-    )
-
-
 async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Tick which of the running cases are still live."""
     query = update.callback_query
@@ -293,15 +259,7 @@ async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if choice == "post":
         await query.answer()
-        if needs_post_choice(context):
-            await ask_where_to_post(query, "hk")
-            return HO_PICK
         return await finish_handover(update, context)
-
-    if choice.startswith("send:"):
-        await query.answer()
-        return await finish_handover(update, context,
-                                     store_chats=choice == "send:all")
 
     if choice != "back":
         keep.symmetric_difference_update({int(choice)})
@@ -316,8 +274,7 @@ async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return HO_PICK
 
 
-async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                          store_chats: bool = True) -> int:
+async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Close what wasn't kept, save what's new, and post."""
     query = update.callback_query
     user = query.from_user
@@ -346,10 +303,9 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE,
              "\n\n".join(render_case(c) for c in cases), now().isoformat()),
         )
 
-    who = display_name_of(user.id, user.full_name)
-    text = render_handover(cases, who, today, closed)
+    text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
     posted = await post_ops(context.bot, text)
-    await sync_store_chats(context.bot, user.id, closed_ids, post_new=store_chats)
+    await sync_store_chats(context.bot, user.id, closed_ids)
     for k in ("ho_cases", "ho_draft", "ho_keep"):
         context.user_data.pop(k, None)
 
@@ -697,19 +653,6 @@ async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         n = len(context.user_data.get("ho_cases", [])) + 1
         return await show_section(query, context, n)
     await query.answer()
-    if choice.startswith("send:"):
-        return await finish_handover(update, context,
-                                     store_chats=choice == "send:all")
-    if choice == "back":
-        n = len(context.user_data.get("ho_cases", []))
-        await query.edit_message_text(
-            f"{n} new case(s) ready. Add another, or post?",
-            reply_markup=more_keyboard(),
-        )
-        return HO_MORE
-    if needs_post_choice(context):
-        await ask_where_to_post(query, "hm")
-        return HO_MORE
     return await finish_handover(update, context)
 
 
@@ -752,15 +695,9 @@ async def cmd_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not await gate(update):
         return
-    running = open_cases()
-    note = ""
-    if running:
-        note = f"\n\n<i>{len(running)} case(s) still open from earlier shifts.</i>"
+    text, kb = handover_question()
     await update.message.reply_text(
-        "<b>Closing handover</b>\n\nAnything for the next agent?" + note,
-        parse_mode=constants.ParseMode.HTML,
-        reply_markup=handover_keyboard(running),
-    )
+        text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

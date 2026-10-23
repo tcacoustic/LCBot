@@ -325,15 +325,9 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_markup=agent_keyboard(user.id),
     )
 
-    running = open_cases()
-    note = ""
-    if running:
-        note = f"\n\n<i>{len(running)} case(s) still open from earlier shifts.</i>"
+    text, kb = handover_question()
     await update.message.reply_text(
-        "<b>Closing handover</b>\n\nAnything for the next agent?" + note,
-        parse_mode=constants.ParseMode.HTML,
-        reply_markup=handover_keyboard(running),
-    )
+        text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
 
 
 async def cmd_addreview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

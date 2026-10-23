@@ -2429,7 +2429,7 @@ def render_channel_post(post_id: int) -> str:
     cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))
     who = display_name_of(p["agent_id"], "") if p["agent_id"] else ""
     day = date.fromisoformat(p["the_date"]).strftime("%-d %b %Y")
-    heading = "📣 Online request" if p["kind"] == "request" else "📋 Handover"
+    heading = {"request": "📣 Online request", "case": "🆕 New case"}.get(p["kind"], "📋 Handover")
     out = [f"{heading} · {CHANNEL_NAMES.get(p['channel'], p['channel'])}",
            f"{day}" + (f" · from {who}" if who else "")]
     for r in cases:
@@ -2520,6 +2520,18 @@ async def send_channel_post(bot, channel: str, cases: list, agent_id: int,
     return sent
 
 
+async def post_case_now(bot, case_id: int, agent_id: int) -> bool:
+    """A case just added by SH or Livechat goes to its store's chat straight
+    away, so the PM sees it without waiting for the end-of-shift handover.
+    No linked chat: it waits for the handover summary in TC Online."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r or not channel_chat(r["channel"]):
+        return False
+    sent = bool(await send_channel_post(bot, r["channel"], [r], agent_id, kind="case"))
+    await notify_pms(bot, agent_id)
+    return sent
+
+
 async def post_request(bot, case_id: int, pm_id: int) -> bool:
     """A new Online request goes straight to its store's chat, where SH sees
     it. No linked chat: TC Online instead, so SH always hears about it."""
@@ -2569,48 +2581,36 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
         log.info("Couldn't tell %s about a reply: %s", pm, e)
 
 
-def store_chats_pending(extra_channels=()) -> bool:
-    """Whether posting now would put a new case in a linked store chat."""
-    channels = set(extra_channels) | {
-        r["channel"] for r in q(
-            "SELECT channel FROM ho_cases WHERE chat_posted=0 AND closed=0 "
-            "AND sh_closed=0")
-    }
-    return any(channel_chat(c) for c in channels if c)
-
-
-def skip_store_chats() -> None:
-    """'TC Online only' — these new cases never go to the store chats."""
-    run("UPDATE ho_cases SET chat_posted=1 WHERE chat_posted=0")
-
-
 async def notify_pms(bot, agent_id: int) -> None:
-    """After a handover, a short DM to each platform manager whose channels
-    have new cases. One message per person per handover, not per case."""
+    """A DM to each platform manager whose channels have new cases: what each
+    case is and what help it needs. One message per person, not per case."""
     rows = q("SELECT * FROM ho_cases WHERE pm_notified=0 ORDER BY id")
     if not rows:
         return
     run("UPDATE ho_cases SET pm_notified=1 WHERE pm_notified=0")
     if setting("pm_alerts", "on") == "off":
         return
-    by_channel: dict = {}
-    for r in rows:
-        if not r["closed"]:
-            by_channel.setdefault(r["channel"], []).append(r)
+    rows = [r for r in rows if not r["closed"]]
     who = display_name_of(agent_id, "SH")
+    names = {key: name for key, _, name in CHANNELS}
     for pm in online_team():
-        mine = [ch for ch in json.loads(pm["channels"] or "[]") if ch in by_channel]
-        if not mine:
+        mine = set(json.loads(pm["channels"] or "[]"))
+        blocks = []
+        for r in (r for r in rows if r["channel"] in mine):
+            lines = [f"🆕 New case from {who} · {CHANNEL_NAMES.get(r['channel'], r['channel'])}",
+                     f"{r['prio']} {r['username']}" + (f" · {r['product']}" if r["product"] else "")]
+            if r["need"]:
+                lines.append(f"‼️ Need help: {r['need']}")
+            blocks.append("\n".join(lines))
+        if not blocks:
             continue
-        lines = [f"🆕 New cases from {who}'s handover", ""]
-        for ch in mine:
-            cases = by_channel[ch]
-            names = ", ".join(c["username"] for c in cases[:5])
-            more = f" +{len(cases) - 5}" if len(cases) > 5 else ""
-            lines.append(f"{CHANNEL_NAMES.get(ch, ch)}: {len(cases)} ({names}{more})")
-        lines += ["", "Open /cases to see them."]
+        chats = sorted({names.get(r["channel"], "") for r in rows
+                        if r["channel"] in mine and channel_chat(r["channel"])})
+        where = (f"It's in the {' and '.join(chats)} chat. " if len(blocks) == 1 and chats
+                 else "They're in your store chats. " if chats else "")
+        text = "\n\n".join(blocks) + f"\n\n{where}Open the App to see all cases."
         try:
-            await bot.send_message(pm["user_id"], "\n".join(lines))
+            await bot.send_message(pm["user_id"], text)
         except Exception as e:
             log.info("Couldn't message %s about new cases: %s", pm["user_id"], e)
 
@@ -2658,30 +2658,48 @@ def render_case(c: dict) -> str:
     return out
 
 
-def render_handover(cases: list, who: str, the_date: date,
-                    closed: list | None = None) -> str:
-    out = ["⭐️ Live Chat Agent Closing Handover ⭐️"]
-    now_cases = [c for c in cases if c["section"] == "open"]
-    later = [c for c in cases if c["section"] == "follow"]
+def shift_start(user_id: int) -> datetime:
+    """When this person's shift began: their latest clock-in if it was within
+    the last 16 hours, else the start of today."""
+    row = q1("SELECT clock_in FROM time_entries WHERE agent_id=? ORDER BY id DESC LIMIT 1",
+             (user_id,))
+    if row:
+        started = datetime.fromisoformat(row["clock_in"])
+        if started > now() - timedelta(hours=16):
+            return started
+    return datetime.combine(now().date(), time(0, 0), TZ)
 
-    if now_cases:
-        out += ["", f"🔸{the_date.strftime('%-d %b %Y')}, Open Cases", ""]
-        out += ["\n\n".join(render_case(c) for c in now_cases)]
-    if later:
-        nd = next_working_day(the_date)
-        out += ["", f"🔹Follow Up on {nd.strftime('%A, %-d %b %Y')}", ""]
-        out += ["\n\n".join(render_case(c) for c in later)]
-    if not cases:
-        out += ["", f"🔸{the_date.strftime('%-d %b %Y')} — no open cases"]
+
+def render_shift_summary(user_id: int, who: str) -> tuple:
+    """The end-of-shift post for TC Online: the cases this person raised this
+    shift, in full with how they stand now, what they closed, and a count of
+    what's still open from before. Returns (text, closed count)."""
+    since = shift_start(user_id).isoformat()
+    raised = q("SELECT * FROM ho_cases WHERE agent_id=? AND origin='sh' AND created_at >= ?"
+               " ORDER BY id", (user_id, since))
+    ids = {r["id"] for r in raised}
+    closed = [r for r in q("SELECT * FROM ho_cases WHERE sh_closed=1 AND sh_closed_by=?"
+                           " AND sh_closed_at >= ? ORDER BY sh_closed_at", (user_id, since))
+              if r["id"] not in ids]
+    earlier = [r for r in open_cases() if r["id"] not in ids]
+
+    out = ["⭐️ Live Chat Agent Closing Handover ⭐️",
+           f"{now().strftime('%a %-d %b')} · {who}"]
+    if raised:
+        out += ["", f"🆕 Raised this shift ({len(raised)})"]
+        for r in raised:
+            out += ["", case_status_line(r), render_case(case_row_to_dict(r))]
+            if note_line(r["id"]):
+                out.append(note_line(r["id"]))
+    else:
+        out += ["", "🆕 No new cases this shift"]
     if closed:
-        out += ["", "✔️ Closed this shift"]
-        out += [
-            f"  {c['prio']} {c['username']}"
-            + (f" — {c['store']}" if c.get("store") else f" — {c['platform']}")
-            for c in closed
-        ]
+        out += ["", f"✔️ Closed this shift ({len(closed)})"]
+        out += [f"  {r['prio']} {r['username']} — {r['store'] or r['platform']}" for r in closed]
+    if earlier:
+        out += ["", f"📂 Still open from earlier shifts: {len(earlier)} (see the App)"]
     out += ["", f"— {who}"]
-    return "\n".join(out)
+    return "\n".join(out), len(closed)
 
 
 HANDOVER_TEMPLATE = """▫️DUOKE
@@ -2722,6 +2740,16 @@ def handover_keyboard(running=None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📝 Add handover", callback_data="ho:add")],
         [InlineKeyboardButton("✅ Nothing to handover", callback_data="ho:none")],
     ])
+
+
+def handover_question() -> tuple:
+    """The closing-handover ask sent after clocking out: (text, keyboard)."""
+    running = open_cases()
+    note = ""
+    if running:
+        note = f"\n\n<i>{len(running)} case(s) still open from earlier shifts.</i>"
+    return ("<b>Closing handover</b>\n\nAnything for the next agent?" + note,
+            handover_keyboard(running))
 
 
 def open_cases() -> list:
@@ -3334,7 +3362,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .big.stop { background:var(--ink); }
   .big.ghost { background:var(--card); color:var(--ink); border:2px solid var(--ink); min-height:50px; }
   /* Add a case sits above Post handover: only one orange button per screen. */
-  #newCase:has(~ #postHo), #newCase:has(~ #postOps) { background:var(--card); color:var(--ink); border:2px solid var(--ink); }
+  #newCase:has(~ #postHo) { background:var(--card); color:var(--ink); border:2px solid var(--ink); }
   .big[disabled] { opacity:.5; }
   .big[style*="secondary-bg"] { background:var(--card) !important; color:var(--ink) !important;
     border:2px solid var(--ink); min-height:48px; }
@@ -3710,7 +3738,7 @@ async function doClockOut(btn) {
   if (out.ot) h += `<div class="card"><div class="n">+${esc(out.ot)}</div><div class="l">Overtime</div></div>`;
   if (out.pay) h += `<div class="card pay wide"><div class="n">${esc(out.pay)}</div><div class="l">This shift</div></div>`;
   h += '</div>';
-  h += '<div class="note">Do your handover in Telegram — the bot will ask.</div>';
+  h += '<div class="note">Now do your handover: the bot has sent you the question in the chat.</div>';
   app.innerHTML = h + navBar();
   wire();
 }
@@ -3733,7 +3761,7 @@ function wire() {
   });
 }
 
-let HO = null, HO_FORM = null, HO_SHOWN = {}, HO_CHOOSE = false;
+let HO = null, HO_FORM = null, HO_SHOWN = {};
 let AGENT = null;   // whose detail we're looking at
 
 function caseCard(c, closed) {
@@ -3888,11 +3916,8 @@ async function loadHandover() {
   }
 
   h += '<button class="big" id="newCase" style="margin-top:14px">Add a case</button>';
-  if (HO_CHOOSE) {
-    h += '<div class="note">TC Online always gets the full handover. Store chats get only their own new cases.</div>';
-    h += '<button class="big" id="postOps" style="margin-top:8px">TC Online only</button>';
-    h += '<button class="big" id="postAll" style="margin-top:8px">TC Online + store chats</button>';
-    h += '<button class="big" id="postBack" style="margin-top:8px;background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111)">Back</button>';
+  if (!d.canPost) {
+    // FS add and update cases; posting the handover is Livechat's and SH's.
   } else if (n) {
     h += '<button class="big" id="postHo" style="margin-top:8px">Post handover</button>';
   } else {
@@ -3969,28 +3994,18 @@ function wireHandover() {
     save.disabled = false; save.textContent = ONLINE ? 'Send to SH' : 'Save this case';
     if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
     toast(out.request ? (out.sent ? 'Sent to SH' : 'Saved — SH will see it in /handover')
-                      : 'Added ' + out.username);
+                      : out.sent ? 'Added and sent to the ' + out.chat + ' chat' : 'Added ' + out.username);
     HO_FORM = null;
     await loadHandover();
   };
 
   const pb = document.getElementById('postHo');
-  if (pb) pb.onclick = () => {
-    if (HO && HO.storeChatsPending) { HO_CHOOSE = true; loadHandover(); }
-    else postHandover(true, pb);
-  };
-  const po = document.getElementById('postOps');
-  if (po) po.onclick = () => postHandover(false, po);
-  const pa = document.getElementById('postAll');
-  if (pa) pa.onclick = () => postHandover(true, pa);
-  const bk = document.getElementById('postBack');
-  if (bk) bk.onclick = () => { HO_CHOOSE = false; loadHandover(); };
+  if (pb) pb.onclick = () => postHandover(pb);
 }
 
-async function postHandover(storeChats, btn) {
+async function postHandover(btn) {
   btn.disabled = true; btn.textContent = 'Posting…';
-  HO_CHOOSE = false;
-  const out = await post('/api/handover/post', { storeChats });
+  const out = await post('/api/handover/post');
   if (!out.ok) { toast('Could not post that.'); btn.disabled = false; return; }
   const app = document.getElementById('app');
   let h = '<h1>Posted</h1>';
@@ -3999,7 +4014,7 @@ async function postHandover(storeChats, btn) {
     h += '<div class="note">I could not reach TC Online, so here it is to copy:</div>';
     h += `<div class="case"><div class="body">${esc(out.text)}</div></div>`;
   } else {
-    h += '<div class="note">It is in TC Online now.</div>';
+    h += '<div class="note">Your shift summary is in TC Online now.</div>';
   }
   h += '<button class="big" id="backHo" style="margin-top:14px">Back to handover</button>';
   app.innerHTML = h + navBar();

@@ -365,6 +365,10 @@ def web_clock_out(user_id: int) -> dict:
     fresh = q1("SELECT * FROM time_entries WHERE id=?", (row["id"],))
     base, ot = entry_split(fresh)
     cents = round((base + ot) / 60 * rate_for(user_id, date.fromisoformat(row["the_date"])))
+    # Same as clocking out in the chat: the bot asks for the closing handover.
+    text, kb = handover_question()
+    on_bot_loop(bot_ref().send_message(user_id, text, parse_mode=constants.ParseMode.HTML,
+                                       reply_markup=kb))
 
     return {
         "ok": True, "at": when.strftime("%H:%M"),
@@ -559,6 +563,11 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
     return out
 
 
+def may_post_handover(user_id: int) -> bool:
+    """Livechat and SH both talk to customers, so both post a closing handover."""
+    return is_livechat(user_id) or "SH" in depts_of(user_id)
+
+
 def handover_payload(user_id: int) -> dict:
     """Open cases, recently closed ones, and the pickers for a new case."""
     today = now().date()
@@ -570,6 +579,7 @@ def handover_payload(user_id: int) -> dict:
 
     return {
         "isOnline": online_view(user_id),
+        "canPost": may_post_handover(user_id),
         "myChannels": online_channels(user_id),
         "openCases": [case_shape(r, today) for r in open_rows],
         "closedCases": [case_shape(r, today, True) for r in closed_rows],
@@ -586,7 +596,6 @@ def handover_payload(user_id: int) -> dict:
                        "channel": CHANNEL_NAMES[STORE_CHANNEL[st]],
                        "orderExample": case_example("order_no", "LIVECHAT", st)}
                       for f, st in WEBSTORES],
-        "storeChatsPending": store_chats_pending(),
         "platforms": PLATFORMS,
         "priorities": [{"emoji": e, "name": n} for e, n in PRIORITIES],
         "nextWorking": next_working_day(today).strftime("%A %-d %b"),
@@ -767,24 +776,18 @@ def web_case_add(user_id: int, c: dict) -> dict:
         log_case(cid, user_id, "on", "raised")
         sent = bool(on_bot_loop(post_request(bot_ref(), cid, user_id), timeout=30))
         return {"ok": True, "username": d["username"], "request": True, "sent": sent}
-    insert_case(user_id, d, now().date())
-    return {"ok": True, "username": d["username"]}
+    cid = insert_case(user_id, d, now().date())
+    sent = bool(on_bot_loop(post_case_now(bot_ref(), cid, user_id), timeout=30))
+    return {"ok": True, "username": d["username"], "sent": sent,
+            "chat": CHANNEL_NAMES.get(d["channel"] or "", "")}
 
 
-def web_handover_post(user_id: int, store_chats: bool = True) -> dict:
-    """Post whatever is open, noting what this person closed today."""
+def web_handover_post(user_id: int) -> dict:
+    """Post this person's shift summary to TC Online. Their new cases already
+    went to the store chats as they were added; any that didn't go now."""
     today = now().date()
-    cases = [case_row_to_dict(r) for r in
-             open_cases()]
-    closed = [
-        case_row_to_dict(r) for r in q(
-            "SELECT * FROM ho_cases WHERE sh_closed=1 AND sh_closed_by=? "
-            "AND sh_closed_at >= ? ORDER BY sh_closed_at",
-            (user_id, today.isoformat()),
-        )
-    ]
-    who = display_name_of(user_id, "")
-    text = render_handover(cases, who, today, closed)
+    cases = [case_row_to_dict(r) for r in open_cases()]
+    text, closed = render_shift_summary(user_id, display_name_of(user_id, ""))
 
     run(
         "INSERT INTO handovers (agent_id, the_date, body, created_at) "
@@ -793,13 +796,10 @@ def web_handover_post(user_id: int, store_chats: bool = True) -> dict:
          "\n\n".join(render_case(c) for c in cases), now().isoformat()),
     )
     posted = bool(on_bot_loop(post_ops(bot_ref(), text)))
-    if store_chats:
-        on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
-    else:
-        skip_store_chats()
+    on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
     on_bot_loop(notify_pms(bot_ref(), user_id), timeout=30)
     return {
-        "ok": True, "posted": posted, "open": len(cases), "closed": len(closed),
+        "ok": True, "posted": posted, "open": len(cases), "closed": closed,
         "text": text if not posted else "",
     }
 
@@ -1225,7 +1225,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if not web_has_access(uid):
             self._send(403, b'{"error":"no access"}')
             return
-        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | {"/api/feedback"}:
+        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | {"/api/feedback"} \
+                and not (path == "/api/handover/post" and may_post_handover(uid)):
             self._send(403, b'{"error":"online team: handover only"}')
             return
 
@@ -1292,7 +1293,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = (web_case_note(uid, cid, str(body.get("note", "")))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/handover/post":
-            out = web_handover_post(uid, body.get("storeChats", True) is not False)
+            out = web_handover_post(uid)
         elif path == "/api/claim":
             try:
                 sid = int(body.get("slot", 0))
