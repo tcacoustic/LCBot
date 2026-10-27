@@ -2686,8 +2686,9 @@ def render_shift_summary(user_id: int, who: str) -> tuple:
     if not raised and not closed:
         return "", 0
 
-    out = ["⭐️ Live Chat Agent Closing Handover ⭐️",
-           f"{now().strftime('%a %-d %b')} · {who}"]
+    team = "Livechat" if is_livechat(user_id) else "SH" if "SH" in depts_of(user_id) else ""
+    out = ["⭐️ Closing Handover ⭐️",
+           f"{now().strftime('%a %-d %b')} · {who}" + (f" · {team}" if team else "")]
     if raised:
         out += ["", f"🆕 Raised this shift ({len(raised)})"]
         for r in raised:
@@ -3751,6 +3752,7 @@ function renderTeamHome(d) {
     h += cards([[d.bookedWeek, 'Booked this week'], [d.requestsOpen, 'Requests open']]);
     h += '<button class="big" id="hBook">Book an appointment</button>';
     h += requestButton();
+    h += '<h2>Look up a case</h2>' + searchBar() + '<div id="fsResults"></div>';
     if (d.booked.length) h += '<h2>Appointments you booked</h2>' + d.booked.map(v => visitRow(v, v.day)).join('');
     h += mine();
   } else if (d.teamHome === 'ONSITE') {
@@ -3802,10 +3804,34 @@ function renderTeamHome(d) {
     if (!el.dataset.link) return;
     el.onclick = () => { if (tg && tg.openTelegramLink) tg.openTelegramLink(el.dataset.link); else window.open(el.dataset.link, '_blank'); };
   });
+  if (d.teamHome === 'FS') wireFsSearch();
   const bk = document.getElementById('hBook');
   if (bk) bk.onclick = () => { VS.form = { country: '', spec: '', visit_type: 'SETUP', date: '', time: '' }; VIEW = 'vis'; render(); };
   const no = document.getElementById('hNewOnline');
   if (no) no.onclick = () => { HO_FORM = { section: 'open', prio: '', platform: '', store: '' }; VIEW = 'ho'; render(); };
+}
+
+// FS look cases up from Home: read only, as each case stands now.
+function wireFsSearch() {
+  const box = document.getElementById('csq'), out = document.getElementById('fsResults');
+  const show = async () => {
+    if (!CS_Q) { out.innerHTML = ''; return; }
+    out.innerHTML = '<div class="note">Searching…</div>';
+    const res = (await getJSON('/api/cases/search?q=' + encodeURIComponent(CS_Q))).results || [];
+    out.innerHTML = '<div class="note">' + res.length + (res.length === 30 ? '+' : '') + ' found</div>'
+      + (res.length ? res.map(c => '<div class="p">' + caseTags(c)
+          + '<div class="pn">' + esc(c.username) + '</div>'
+          + '<div class="t">' + esc([c.channelName || c.platform, c.store, c.status].filter(Boolean).join(' · ')) + '</div>'
+          + '<div class="t" style="white-space:pre-wrap;margin-top:6px">' + esc(c.body) + '</div>'
+          + (c.note ? '<div class="t" style="margin-top:6px">' + esc(c.note) + '</div>' : '') + '</div>').join('')
+        : '<div class="empty">No cases found. Try part of the name, order number or product, or a date like 16/10.</div>');
+  };
+  const go = () => { CS_Q = (box.value || '').trim(); show(); };
+  document.getElementById('csGo').onclick = go;
+  box.onkeydown = e => { if (e.key === 'Enter') go(); };
+  const clear = document.getElementById('csClear');
+  if (clear) clear.onclick = () => { CS_Q = ''; box.value = ''; clear.remove(); show(); };
+  show();
 }
 
 async function doClockIn(btn, slots) {
