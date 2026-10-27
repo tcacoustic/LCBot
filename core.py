@@ -3530,6 +3530,12 @@ MINIAPP_HTML = """<!DOCTYPE html>
     display:flex; align-items:center; gap:6px; font-size:12px; font-weight:800; letter-spacing:.06em;
     text-transform:uppercase; line-height:1; }
   #app > h1 { padding-right:132px; }
+  /* Phones: just a round 🔧, so it never covers the title. */
+  @media (max-width:520px) {
+    #fbBtn { width:34px; padding:0; justify-content:center; font-size:15px; }
+    #fbBtn .fb-word { display:none; }
+    #app > h1 { padding-right:56px; }
+  }
   .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
   .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
     color:#fff; padding:12px 16px; border-radius:8px; font-size:14px; font-weight:700; text-align:center; }
@@ -4959,7 +4965,7 @@ function feedbackButton() {
   if (document.getElementById('fbBtn')) return;
   const b = document.createElement('button');
   b.id = 'fbBtn'; b.type = 'button'; b.setAttribute('aria-label', 'Feedback');
-  b.innerHTML = '<span aria-hidden="true">🔧</span><span>Feedback</span>';
+  b.innerHTML = '<span aria-hidden="true">🔧</span><span class="fb-word">Feedback</span>';
   b.onclick = () => { if (VIEW !== 'fb') { FB.back = VIEW; VIEW = 'fb'; render(); } };
   document.body.appendChild(b);
 }
