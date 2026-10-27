@@ -4035,7 +4035,16 @@ async function loadHandover() {
     wireHandover();
     return;
   }
-  h += searchBar();
+  // The two things you came to do first, then the cases.
+  h += '<button class="big" id="newCase" style="margin-top:0">Add a case</button>';
+  if (!d.canPost) {
+    // FS add and update cases; posting the handover is Livechat's and SH's.
+  } else if (n) {
+    h += '<button class="big" id="postHo" style="margin-top:8px">Post handover</button>';
+  } else {
+    h += '<button class="big" id="postHo" style="margin-top:8px">Post "nothing open"</button>';
+  }
+  h += '<div style="margin-top:16px">' + searchBar() + '</div>';
 
   if (n) {
     h += '<h2>Still open</h2>';
@@ -4047,14 +4056,6 @@ async function loadHandover() {
     for (const c of order) h += caseCard(c, false);
   }
 
-  h += '<button class="big" id="newCase" style="margin-top:14px">Add a case</button>';
-  if (!d.canPost) {
-    // FS add and update cases; posting the handover is Livechat's and SH's.
-  } else if (n) {
-    h += '<button class="big" id="postHo" style="margin-top:8px">Post handover</button>';
-  } else {
-    h += '<button class="big" id="postHo" style="margin-top:8px">Post "nothing open"</button>';
-  }
 
   if (d.closedCases.length) {
     h += '<h2>Closed recently</h2>';
