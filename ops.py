@@ -171,7 +171,7 @@ def request_text(r, head: str = "") -> str:
     lines = [head] if head else []
     tag = "🔴 <b>URGENT · SAME DAY</b> · " if r["urgent"] else "⏰ <b>AFTER CUT-OFF</b> · " if r["after_cutoff"] else ""
     if is_flagged(r["id"]):
-        tag = "🚩 <b>ANGRY CUSTOMER</b> · " + tag
+        tag = "🚩 <b>ESCALATION</b> · " + tag
     lines += [
         f"{tag}📦 <b>Special request #{r['id']}</b> · {esc(REQUEST_COUNTRY_NAMES.get(r['country'] or '', ''))}",
         f"<b>{esc(CATEGORY_NAMES[r['category']])}</b>",
@@ -227,7 +227,7 @@ def get_request(rid: int):
     return q1("SELECT * FROM special_requests WHERE id=?", (rid,))
 
 
-# 🚩 Angry customer: shown to Ops in Telegram and the App only, never in the
+# 🚩 Escalation: shown to Ops in Telegram and the App only, never in the
 # sheet. Kept as one line per request in the settings table (red_flag:<id>).
 def is_flagged(rid: int) -> bool:
     return setting(f"red_flag:{rid}", "") == "yes"
@@ -371,7 +371,7 @@ def date_label(d: date) -> str:
 
 def confirm_buttons(flagged: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚩 Angry customer: " + ("Yes" if flagged else "No"), callback_data="sr:flag")],
+        [InlineKeyboardButton("🚩 Escalation: " + ("Yes" if flagged else "No"), callback_data="sr:flag")],
         [InlineKeyboardButton("📤 Send to Ops", callback_data="sr:send"),
          InlineKeyboardButton("✖️ Cancel", callback_data="sr:stop")],
         [BACK],
@@ -430,7 +430,7 @@ def draft_text(d: dict) -> str:
              f"Delivery: {date_label(date.fromisoformat(d['delivery_date']))} · {esc(tf)}",
              "", esc(d["details"])]
     if d.get("red_flag"):
-        lines += ["", "🚩 <b>Angry customer</b>: Ops see it straight away, at the top."]
+        lines += ["", "🚩 <b>Escalation</b>: Ops see it straight away, at the top."]
     warn = cutoff_warning(d)
     if warn:
         lines += ["", warn]
@@ -901,7 +901,7 @@ async def cmd_opsrounds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     choice = next((a for a in args if a in ("30", "60", "OFF")), "")
     if not country or not choice:
         lines = ["🕒 <b>Ops rounds</b>", "On a busy day, a country's requests can go to Ops every 30 or 60 "
-                 "minutes in one batch, instead of one message each. 🔴 Same-day and 🚩 angry-customer "
+                 "minutes in one batch, instead of one message each. 🔴 Same-day and 🚩 escalated "
                  "requests always go straight away.", ""]
         for cc, name in REQUEST_COUNTRIES:
             every = rounds_for(cc)
