@@ -472,6 +472,12 @@ async def post_init(app: Application) -> None:
         job_sheet_retry, interval=timedelta(minutes=15), first=timedelta(minutes=2),
         name="ops-sheet-retry",
     )
+    # Ops rounds: every half hour, a minute past :00 and :30.
+    t = now()
+    first = t.replace(minute=0 if t.minute < 30 else 30, second=0, microsecond=0) + timedelta(minutes=31)
+    app.job_queue.run_repeating(
+        job_ops_rounds, interval=timedelta(minutes=30), first=first, name="ops-rounds",
+    )
     rmins = parse_time_token(os.environ.get("REPORT_TIME", "").strip() or "09:00")
     app.job_queue.run_daily(
         job_case_report, time(rmins // 60, rmins % 60, tzinfo=TZ),
@@ -719,6 +725,7 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(on_ops_button, pattern=r"^sr:(tk|ok|no|bk):\d+$|^sr:nr:\d+:[A-Z]+$"))
     app.add_handler(CommandHandler("opschat", cmd_opschat))
+    app.add_handler(CommandHandler("opsrounds", cmd_opsrounds))
     app.add_handler(CommandHandler("requests", cmd_requests))
     app.add_handler(
         ConversationHandler(

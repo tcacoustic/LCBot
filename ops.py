@@ -69,6 +69,33 @@ def ops_target(country: str = "") -> dict | None:
     return None
 
 
+# Busy days: a country's requests can go to Ops in rounds (every 30 or 60
+# minutes) instead of one message each. Same-day ones never wait.
+ROUND_LENGTHS = (30, 60)
+
+
+def rounds_for(country: str) -> int:
+    """Minutes between rounds for this country, or 0 when they're off."""
+    raw = setting(f"ops_rounds:{country}", "")
+    return int(raw) if raw.isdigit() and int(raw) in ROUND_LENGTHS else 0
+
+
+def next_round(country: str, when: datetime | None = None) -> datetime | None:
+    """When the next round for this country goes out (on the hour, or :30)."""
+    every = rounds_for(country)
+    if not every:
+        return None
+    when = when or now()
+    start = when.replace(minute=0, second=0, microsecond=0)
+    while start <= when:
+        start += timedelta(minutes=every)
+    return start
+
+
+def round_time(t: datetime) -> str:
+    return t.strftime("%-I:%M%p").lower()
+
+
 # Public holidays: no courier deliveries and no Ops, so they're skipped like
 # weekends. Built-in yearly lists (Malaysia: national holidays only).
 @lru_cache(maxsize=32)
@@ -614,9 +641,12 @@ async def on_request_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-def sent_text(rid: int, posted: bool, kind: str) -> str:
+def sent_text(rid: int, posted, kind: str) -> str:
     late = {"LATE": " It's after the cut-off, so it may move to a later day.",
             "URGENT": " It's same-day, so Ops see it as URGENT."}.get(kind, "")
+    if isinstance(posted, str):   # held for the next round
+        return (f"✅ Saved as <b>request #{rid}</b>.{late}\nOps are working in rounds today, so they'll "
+                f"see it at <b>{posted}</b>. I'll message you when they pick it up.")
     if posted:
         return f"✅ Sent to Ops as <b>request #{rid}</b>.{late}\nI'll message you when they pick it up."
     return (f"✅ Saved as <b>request #{rid}</b>, but there's no Ops chat for that country yet, "
@@ -626,7 +656,8 @@ def sent_text(rid: int, posted: bool, kind: str) -> str:
 async def create_request(bot, d: dict, created_by: int, source: str = "bot",
                          submitted_name: str = "") -> tuple:
     """Save a request, post it to Ops and copy it to the sheet. The same for the
-    bot chat, the App form and the Paperform. Returns (id, posted, cut-off kind)."""
+    bot chat, the App form and the Paperform. Returns (id, posted, cut-off kind);
+    posted is the round's time ("3:00pm") when it waits for the next round."""
     created = now()
     kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]), d.get("country") or "")
     async with write_lock:
@@ -638,6 +669,11 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
              d["timeframe"], d.get("timeframe_other"), created_by, created.isoformat(),
              1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0,
              0 if source == "paperform" else 1, source, submitted_name or None)).lastrowid
+    due = next_round(d.get("country") or "", created)
+    if due and kind != "URGENT" and ops_target(d.get("country") or ""):
+        if source != "paperform":
+            await sync_to_sheet(rid)
+        return rid, round_time(due), kind
     posted = await post_to_ops(bot, rid)
     if not posted:
         for admin in ADMIN_IDS:
@@ -800,6 +836,72 @@ async def on_ops_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 
+async def post_round(bot, country: str, label: str) -> int:
+    """Post every request for this country still waiting for a round, under one
+    heading. Returns how many went."""
+    rows = q("SELECT * FROM special_requests WHERE country=? AND status IN ('OPEN','TAKEN')"
+             " AND ops_msg_id IS NULL ORDER BY delivery_date, id", (country,))
+    target = ops_target(country)
+    if not rows or not target:
+        return 0
+    kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
+    try:
+        await bot.send_message(target["chat"], f"🕒 <b>{esc(label)} · {REQUEST_COUNTRY_NAMES[country]}"
+                               f" · {len(rows)} request{'' if len(rows) == 1 else 's'}</b>\nSoonest delivery first.",
+                               parse_mode=constants.ParseMode.HTML, **kw)
+    except Exception as e:
+        log.warning("Couldn't post the %s round: %s", country, e)
+        return 0
+    sent = 0
+    for r in rows:
+        sent += await post_to_ops(bot, r["id"])
+    return sent
+
+
+async def job_ops_rounds(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every half hour: post the rounds that are due (60-minute rounds on the hour)."""
+    t = now()
+    on_the_hour = t.minute < 5
+    for country in REQUEST_COUNTRY_NAMES:
+        every = rounds_for(country)
+        if every and (on_the_hour or (every == 30 and 30 <= t.minute < 35)):
+            slot = t.replace(minute=0 if on_the_hour else 30, second=0, microsecond=0)
+            await post_round(context.bot, country, f"Round {round_time(slot)}")
+
+
+async def cmd_opsrounds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/opsrounds — busy days: requests to Ops in rounds, per country.
+    /opsrounds SG 30 · /opsrounds MY 60 · /opsrounds SG off"""
+    if not admin_for(update.effective_user.id, "OPS"):
+        return
+    args = [a.upper() for a in context.args]
+    country = next((a for a in args if a in REQUEST_COUNTRY_NAMES), "")
+    choice = next((a for a in args if a in ("30", "60", "OFF")), "")
+    if not country or not choice:
+        lines = ["🕒 <b>Ops rounds</b>", "On a busy day, a country's requests can go to Ops every 30 or 60 "
+                 "minutes in one batch, instead of one message each. 🔴 Same-day requests always "
+                 "go straight away.", ""]
+        for cc, name in REQUEST_COUNTRIES:
+            every = rounds_for(cc)
+            lines.append(f"{name}: " + (f"<b>every {every} min</b>, next at {round_time(next_round(cc))}"
+                                        if every else "off (one message each)"))
+        lines += ["", "<code>/opsrounds SG 30</code> · <code>/opsrounds MY 60</code> · <code>/opsrounds SG off</code>"]
+        await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
+        return
+    async with write_lock:
+        set_setting(f"ops_rounds:{country}", "" if choice == "OFF" else choice)
+    name = REQUEST_COUNTRY_NAMES[country]
+    if choice == "OFF":
+        # Anything still waiting goes now, so nothing is left behind.
+        n = await post_round(context.bot, country, "Rounds off: waiting requests")
+        await update.message.reply_text(f"✅ {name}: rounds off. Requests go to Ops one by one again"
+                                        + (f" ({n} waiting just went)." if n else "."))
+        return
+    await update.message.reply_text(f"✅ {name}: requests go to Ops every {choice} minutes, next at "
+                                    f"{round_time(next_round(country))}. 🔴 Same-day ones still go "
+                                    "straight away. Turn off with /opsrounds {country} off.".replace("{country}", country))
+
+
 async def job_carry_over(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Working mornings: re-post after-cut-off requests still open, per Ops chat."""
     today = now()
@@ -895,7 +997,8 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if r["country"] != last:
             last = r["country"]
             lines += ["", f"<b>{esc(REQUEST_COUNTRY_NAMES.get(last or '', 'No country'))}</b>"]
-        flags = ("🔴 " if r["urgent"] else "⏰ " if r["after_cutoff"] else "") + ("🙋 " if r["status"] == "TAKEN" else "")
+        flags = ("🔴 " if r["urgent"] else "⏰ " if r["after_cutoff"] else "") \
+            + ("🙋 " if r["status"] == "TAKEN" else "") + ("🕒 " if not r["ops_msg_id"] else "")
         lines.append(f"{flags}<b>#{r['id']}</b> {esc(CATEGORY_NAMES[r['category']])} · "
                      f"<code>{esc(r['order_no'])}</code> · "
                      f"{date_label(date.fromisoformat(r['delivery_date']))}, {esc(timeframe_text(r))}"
@@ -1068,6 +1171,7 @@ def ops_home(user_id: int) -> dict:
                 "from": sender_name(r),
                 "at": datetime.fromisoformat(r["created_at"]).strftime("%-I:%M%p").lower(),
                 "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]),
+                "round": "" if r["ops_msg_id"] else round_time(next_round(r["country"] or "") or now()),
                 "takenBy": "You" if r["taken_by"] == user_id and taker else taker, "link": link}
     today = now().date().isoformat()
     return {

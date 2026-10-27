@@ -3044,6 +3044,7 @@ ADMIN_GROUPS = [
         ("request", "Send a special request to Ops"),
         ("requests", "Special requests still open"),
         ("opschat", "Post special requests in this group (Ops)"),
+        ("opsrounds", "Busy day: post requests to Ops in rounds (Ops)"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -3131,7 +3132,7 @@ ADMIN_TEAMS = {
     "onchat": ("ON",), "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
     "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
     "departments": (), "access": (), "roster": (), "pending": (),
-    "request": ("SH", "LIVECHAT", "ON", "FS"), "requests": ("OPS",), "opschat": ("OPS",),
+    "request": ("SH", "LIVECHAT", "ON", "FS"), "requests": ("OPS",), "opschat": ("OPS",), "opsrounds": ("OPS",),
 }
 
 
@@ -3782,8 +3783,9 @@ function renderTeamHome(d) {
     h += cards([[o.mine, 'Yours (on it)'], [o.doneToday, 'Done today']]);
     const row = r => `<div class="p${r.link ? ' tappable' : ''}" data-link="${esc(r.link)}"><div class="tags">`
       + (r.urgent ? '<span class="tag red">URGENT</span>' : r.late ? '<span class="tag amber">AFTER CUT-OFF</span>' : '')
+      + (r.round ? '<span class="tag">IN THE ' + esc(r.round.toUpperCase()) + ' ROUND</span>' : '')
       + (r.takenBy ? '<span class="tag blue">ON IT · ' + esc(r.takenBy.toUpperCase()) + '</span>'
-                   : (r.urgent || r.late) ? '' : '<span class="tag">OPEN</span>')
+                   : (r.urgent || r.late || r.round) ? '' : '<span class="tag">OPEN</span>')
       + `</div><div class="ptop"><div class="pn">${esc(r.order)} · ${esc(r.category)}</div><div class="t">${r.link ? '›' : ''}</div></div>`
       + `<div class="t">${esc([r.flag, r.delivery, 'from ' + r.from, r.at].filter(Boolean).join(' · '))}</div></div>`;
     const urgent = o.requests.filter(r => r.urgent), rest = o.requests.filter(r => !r.urgent);
