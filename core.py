@@ -4910,7 +4910,7 @@ async function loadRequest() {
   const d = await getJSON('/api/requests?country=' + encodeURIComponent(RQ.form.country || ''));
   const f = RQ.form;
   f.country = d.country;
-  if (f.delivery_date && !d.days.some(x => x.iso === f.delivery_date)) f.delivery_date = '';
+  if (f.delivery_date && !f.otherDate && !d.days.some(x => x.iso === f.delivery_date)) f.delivery_date = '';
   const pick = (attr, items, cur) => '<div class="pick">' + items.map(it =>
     '<button data-' + attr + '="' + it.key + '" class="' + (cur === it.key ? 'on' : '') + '">' + esc(it.name) + '</button>').join('') + '</div>';
   let h = '<div class="back" id="rqBack">‹ Back</div><h1>Special request</h1><div class="sub">To Ops</div>';
@@ -4924,7 +4924,11 @@ async function loadRequest() {
   h += '<div class="fld"><label>' + (f.category === 'DATE' ? 'New delivery date' : 'Delivery date') + '</label><div class="pick">'
      + d.days.map(x => '<button data-rqd="' + x.iso + '" class="' + (f.delivery_date === x.iso ? 'on' : '') + '">'
        + esc(x.label) + (x.kind === 'URGENT' ? ' · URGENT' : x.kind === 'LATE' ? ' · late' : '') + '</button>').join('')
-     + '</div><div class="note" style="margin-top:6px">Public holidays are left out (no deliveries). '
+     + '<button data-rqother="1" class="' + (f.otherDate ? 'on' : '') + '">Another date…</button>'
+     + '</div>'
+     + (f.otherDate ? '<input type="date" id="rq_other_date" style="margin-top:6px" min="' + esc(d.days[0] ? d.days[0].iso : '')
+       + '" value="' + esc(f.delivery_date || '') + '">' : '')
+     + '<div class="note" style="margin-top:6px">Public holidays are left out (no deliveries). '
      + 'Next-working-day deliveries asked for after ' + esc(d.cutoff) + ' are after cut-off.</div></div>';
   h += '<div class="fld"><label>Time frame</label>' + pick('rqt', d.timeframes, f.timeframe);
   if (f.timeframe === 'OTHER') h += '<input id="rq_timeframe_other" placeholder="e.g. after 7pm" style="margin-top:6px" value="' + esc(f.timeframe_other || '') + '">';
@@ -4946,7 +4950,10 @@ async function loadRequest() {
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => { keepRequest(); fn(el); }; });
   on('[data-rqc]', el => { f.country = el.dataset.rqc; f.delivery_date = ''; loadRequest(); });
   on('[data-rqcat]', el => { f.category = el.dataset.rqcat; loadRequest(); });
-  on('[data-rqd]', el => { f.delivery_date = el.dataset.rqd; loadRequest(); });
+  on('[data-rqd]', el => { f.delivery_date = el.dataset.rqd; f.otherDate = false; loadRequest(); });
+  on('[data-rqother]', () => { f.otherDate = true; f.delivery_date = ''; loadRequest(); });
+  const od = document.getElementById('rq_other_date');
+  if (od) od.onchange = () => { keepRequest(); f.delivery_date = od.value; loadRequest(); };
   on('[data-rqflag]', el => { f.red_flag = el.dataset.rqflag === '1'; loadRequest(); });
   on('[data-rqt]', el => { f.timeframe = el.dataset.rqt; loadRequest(); });
   document.getElementById('rqBack').onclick = () => { keepRequest(); VIEW = RQ.back || 'home'; render(); };
