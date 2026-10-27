@@ -2582,7 +2582,8 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
                                             f"{note}\n\nOpen the App to see the case.")
         if waiting:
             sends[waiting] = f"💬 {who} replied on {r['username']} ({where}):\n{note}\n\nOpen the App to reply."
-    sends.pop(author_id, None)
+    if not (TEST_MODE and is_owner(author_id)):
+        sends.pop(author_id, None)   # no one hears about their own note (the test bot's owner does, to try both sides)
     for pm, text in sends.items():
         try:
             await bot.send_message(pm, text)
