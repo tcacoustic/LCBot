@@ -595,7 +595,7 @@ db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
 _cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
 for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER",
              "urgent INTEGER NOT NULL DEFAULT 0", "source TEXT NOT NULL DEFAULT 'bot'",
-             "submitted_name TEXT", "red_flag INTEGER NOT NULL DEFAULT 0"):   # 🚩 angry customer
+             "submitted_name TEXT"):
     if _col.split()[0] not in _cols:
         db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
 db.execute("""CREATE TABLE IF NOT EXISTS case_log (
@@ -3777,15 +3777,14 @@ function renderTeamHome(d) {
     h += hero('Open requests', String(o.open), '🔴 ' + o.urgent + ' same-day · ⏰ ' + o.late + ' after cut-off');
     h += cards([[o.mine, 'Yours (on it)'], [o.doneToday, 'Done today']]);
     const row = r => `<div class="p${r.link ? ' tappable' : ''}" data-link="${esc(r.link)}"><div class="tags">`
-      + (r.redFlag ? '<span class="tag red">🚩 ANGRY CUSTOMER</span>' : '')
       + (r.urgent ? '<span class="tag red">URGENT</span>' : r.late ? '<span class="tag amber">AFTER CUT-OFF</span>' : '')
       + (r.round ? '<span class="tag">IN THE ' + esc(r.round.toUpperCase()) + ' ROUND</span>' : '')
       + (r.takenBy ? '<span class="tag blue">ON IT · ' + esc(r.takenBy.toUpperCase()) + '</span>'
-                   : (r.urgent || r.late || r.redFlag || r.round) ? '' : '<span class="tag">OPEN</span>')
+                   : (r.urgent || r.late || r.round) ? '' : '<span class="tag">OPEN</span>')
       + `</div><div class="ptop"><div class="pn">${esc(r.order)} · ${esc(r.category)}</div><div class="t">${r.link ? '›' : ''}</div></div>`
       + `<div class="t">${esc([r.flag, r.delivery, 'from ' + r.from, r.at].filter(Boolean).join(' · '))}</div></div>`;
-    const urgent = o.requests.filter(r => r.urgent || r.redFlag), rest = o.requests.filter(r => !r.urgent && !r.redFlag);
-    if (urgent.length) h += '<h2>Urgent · same day · 🚩</h2>' + urgent.map(row).join('');
+    const urgent = o.requests.filter(r => r.urgent), rest = o.requests.filter(r => !r.urgent);
+    if (urgent.length) h += '<h2>Urgent · same day</h2>' + urgent.map(row).join('');
     if (rest.length) h += '<h2>' + (urgent.length ? 'Other open' : 'Open') + '</h2>' + rest.map(row).join('');
     if (!o.open) h += '<div class="empty">Nothing open. 🎉</div>';
     else h += '<div class="note">Tap a request to jump to it in the Ops chat, and answer it there.</div>';
@@ -4830,7 +4829,7 @@ function wireRequestButton() {
 }
 // URGENT / AFTER CUT-OFF, then where it stands (ON IT shows who).
 function requestTags(r) {
-  const tags = r.redFlag ? [['🚩 ANGRY CUSTOMER', 'red']] : [];
+  const tags = [];
   if (r.urgent) tags.push(['URGENT', 'red']); else if (r.late) tags.push(['AFTER CUT-OFF', 'amber']);
   if (r.statusKey === 'TAKEN' && r.takenBy) tags.push(['ON IT · ' + r.takenBy.toUpperCase(), 'blue']);
   else if (r.status) tags.push([r.status.toUpperCase(), r.statusKey === 'DONE' ? 'green' : r.statusKey === 'CANT' ? 'red' : '']);
@@ -4877,10 +4876,6 @@ async function loadRequest() {
   if (day && day.kind === 'URGENT') h += '<div class="warn">Same-day delivery: Ops will see it marked URGENT.</div>';
   if (day && day.kind === 'LATE') h += '<div class="warn">After the ' + esc(d.cutoff) + ' cut-off for ' + esc(day.label)
     + '. Ops will try, but it may move to the next working day: check the customer is OK with that.</div>';
-  h += '<div class="fld"><label>Angry customer?</label><div class="pick">'
-     + '<button data-rqflag="1" class="' + (f.red_flag ? 'on' : '') + '">🚩 Yes</button>'
-     + '<button data-rqflag="0" class="' + (f.red_flag ? '' : 'on') + '">No</button></div>'
-     + (f.red_flag ? '<div class="note" style="margin-top:6px">Ops see it straight away, marked 🚩, at the top of their list.</div>' : '') + '</div>';
   h += '<button class="big" id="rqSend">Send to Ops</button>';
   if (d.mine.length) {
     h += '<h2>Your recent requests</h2>' + requestCards(d.mine);
@@ -4891,7 +4886,6 @@ async function loadRequest() {
   on('[data-rqc]', el => { f.country = el.dataset.rqc; f.delivery_date = ''; loadRequest(); });
   on('[data-rqcat]', el => { f.category = el.dataset.rqcat; loadRequest(); });
   on('[data-rqd]', el => { f.delivery_date = el.dataset.rqd; loadRequest(); });
-  on('[data-rqflag]', el => { f.red_flag = el.dataset.rqflag === '1'; loadRequest(); });
   on('[data-rqt]', el => { f.timeframe = el.dataset.rqt; loadRequest(); });
   document.getElementById('rqBack').onclick = () => { keepRequest(); VIEW = RQ.back || 'home'; render(); };
   const send = document.getElementById('rqSend');
