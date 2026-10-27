@@ -3767,8 +3767,9 @@ function renderTeamHome(d) {
               d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
                                 : 'No channels yet: ask an admin to set yours');
     if (d.channels.length) h += '<div class="cards" style="margin-top:20px">' + d.channels.map((c, i) =>
-      `<div class="card${d.channels.length % 2 && i === d.channels.length - 1 ? ' wide' : ''}"><div class="n">${c.n}</div>`
-      + `<div class="l" style="display:flex;align-items:center;gap:5px">${channelLogos(c.key)}${esc(c.name)}</div></div>`).join('') + '</div>';
+      `<div class="card${d.channels.length % 2 && i === d.channels.length - 1 ? ' wide' : ''}">`
+      + `<div class="l" style="display:flex;align-items:center;gap:6px;margin-top:0">${channelLogos(c.key)}${esc(c.name)}</div>`
+      + `<div class="n" style="margin-top:4px">${c.n}</div></div>`).join('') + '</div>';
     h += '<button class="big" id="hNewOnline">New Online request</button>';
     h += requestButton();
     if (d.oldest.length) h += '<h2>Oldest first</h2>' + d.oldest.map(c => caseRow(c)).join('');
