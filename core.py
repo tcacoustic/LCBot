@@ -2551,34 +2551,43 @@ async def post_request(bot, case_id: int, pm_id: int) -> bool:
 
 async def notify_reply(bot, case_id: int, author_id: int, note: str | None = None,
                        closed: bool = False) -> None:
-    """SH answered something Online is waiting on: tell that PM privately.
-    Covers Online requests (the PM who raised it) and handed-back cases (the PM
-    who handed it back). Online's own notes and closes don't ping anyone."""
+    """Livechat or SH did something on a case: tell the Online side privately.
+    A note goes to every PM who looks after that channel, and to the PM waiting
+    on it (who raised the Online request, or handed it back). A close only goes
+    to the waiting PM. Online's own notes and closes don't ping anyone."""
     if is_online(author_id):
         return
     r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if not r:
         return
     if r["origin"] == "on":
-        pm = r["agent_id"]
+        waiting = r["agent_id"]
     else:
         back = q1("SELECT user_id FROM case_log WHERE case_id=? AND action='handed back' "
                   "ORDER BY id DESC LIMIT 1", (case_id,))
-        pm = back["user_id"] if back else None
-    if not pm or pm == author_id:
-        return
+        waiting = back["user_id"] if back else None
     who = display_name_of(author_id, "SH")
     where = CHANNEL_NAMES.get(r["channel"] or "", "")
+    sends = {}
     if closed:
-        text = (f"✅ {who} has done {r['username']} ({where}).\n"
-                + ("Confirm it in /cases to close it."
-                   if not r["on_closed"] else "It's fully closed now."))
+        if waiting:
+            sends[waiting] = (f"✅ {who} has done {r['username']} ({where}).\n"
+                              + ("Confirm it in the App to close it."
+                                 if not r["on_closed"] else "It's fully closed now."))
     else:
-        text = f"💬 {who} replied on {r['username']} ({where}):\n{note}\n\nOpen /cases to reply."
-    try:
-        await bot.send_message(pm, text)
-    except Exception as e:
-        log.info("Couldn't tell %s about a reply: %s", pm, e)
+        if setting("pm_alerts", "on") != "off":
+            for pm in online_team():
+                if r["channel"] in json.loads(pm["channels"] or "[]"):
+                    sends[pm["user_id"]] = (f"💬 {who} added a note on {r['username']} ({where}):\n"
+                                            f"{note}\n\nOpen the App to see the case.")
+        if waiting:
+            sends[waiting] = f"💬 {who} replied on {r['username']} ({where}):\n{note}\n\nOpen the App to reply."
+    sends.pop(author_id, None)
+    for pm, text in sends.items():
+        try:
+            await bot.send_message(pm, text)
+        except Exception as e:
+            log.info("Couldn't tell %s about a reply: %s", pm, e)
 
 
 async def notify_pms(bot, agent_id: int) -> None:
