@@ -233,6 +233,12 @@ def is_flagged(rid: int) -> bool:
     return setting(f"red_flag:{rid}", "") == "yes"
 
 
+def in_ops_chat(r) -> bool:
+    """Which requests Ops see in Telegram: after the cut-off, same-day or 🚩.
+    The rest (on time) go only to the Special Req sheet; Ops work them there."""
+    return bool(r["after_cutoff"] or r["urgent"] or is_flagged(r["id"]))
+
+
 def flagged_first(rows: list) -> list:
     """The same order, with 🚩 requests moved to the top."""
     return sorted(rows, key=lambda r: not is_flagged(r["id"]))
@@ -664,6 +670,9 @@ async def on_request_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def sent_text(rid: int, posted, kind: str) -> str:
     late = {"LATE": " It's after the cut-off, so it may move to a later day.",
             "URGENT": " It's same-day, so Ops see it as URGENT."}.get(kind, "")
+    if posted == "SHEET":         # on time: the Ops sheet only
+        return (f"✅ Sent to Ops as <b>request #{rid}</b>. It's before the cut-off, so it goes "
+                "straight into the Ops sheet. I'll message you when it's done.")
     if isinstance(posted, str):   # held for the next round
         return (f"✅ Saved as <b>request #{rid}</b>.{late}\nOps are working in rounds today, so they'll "
                 f"see it at <b>{posted}</b>. I'll message you when they pick it up.")
@@ -677,7 +686,8 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
                          submitted_name: str = "") -> tuple:
     """Save a request, post it to Ops and copy it to the sheet. The same for the
     bot chat, the App form and the Paperform. Returns (id, posted, cut-off kind);
-    posted is the round's time ("3:00pm") when it waits for the next round."""
+    posted is "SHEET" for an on-time request (sheet only, no Ops chat post), or
+    the round's time ("3:00pm") when it waits for the next round."""
     created = now()
     kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]), d.get("country") or "")
     async with write_lock:
@@ -691,6 +701,11 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
              0 if source == "paperform" else 1, source, submitted_name or None)).lastrowid
         if d.get("red_flag"):
             set_setting(f"red_flag:{rid}", "yes")
+    if not kind and not d.get("red_flag"):
+        # On time: the sheet only, the Ops chat is for after the cut-off.
+        if source != "paperform":
+            await sync_to_sheet(rid)
+        return rid, "SHEET", kind
     due = next_round(d.get("country") or "", created)
     if due and kind != "URGENT" and not d.get("red_flag") and ops_target(d.get("country") or ""):
         if source != "paperform":
@@ -861,8 +876,8 @@ async def on_ops_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def post_round(bot, country: str, label: str) -> int:
     """Post every request for this country still waiting for a round, under one
     heading. Returns how many went."""
-    rows = q("SELECT * FROM special_requests WHERE country=? AND status IN ('OPEN','TAKEN')"
-             " AND ops_msg_id IS NULL ORDER BY delivery_date, id", (country,))
+    rows = [r for r in q("SELECT * FROM special_requests WHERE country=? AND status IN ('OPEN','TAKEN')"
+                         " AND ops_msg_id IS NULL ORDER BY delivery_date, id", (country,)) if in_ops_chat(r)]
     target = ops_target(country)
     if not rows or not target:
         return 0
@@ -1021,7 +1036,8 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             last = r["country"]
             lines += ["", f"<b>{esc(REQUEST_COUNTRY_NAMES.get(last or '', 'No country'))}</b>"]
         flags = ("🚩 " if is_flagged(r["id"]) else "") + ("🔴 " if r["urgent"] else "⏰ " if r["after_cutoff"] else "") \
-            + ("🙋 " if r["status"] == "TAKEN" else "") + ("🕒 " if not r["ops_msg_id"] else "")
+            + ("🙋 " if r["status"] == "TAKEN" else "") \
+            + ("" if r["ops_msg_id"] else "🕒 " if in_ops_chat(r) else "📄 ")
         lines.append(f"{flags}<b>#{r['id']}</b> {esc(CATEGORY_NAMES[r['category']])} · "
                      f"<code>{esc(r['order_no'])}</code> · "
                      f"{date_label(date.fromisoformat(r['delivery_date']))}, {esc(timeframe_text(r))}"
@@ -1194,7 +1210,8 @@ def ops_home(user_id: int) -> dict:
                 "from": sender_name(r),
                 "at": datetime.fromisoformat(r["created_at"]).strftime("%-I:%M%p").lower(),
                 "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]), "redFlag": is_flagged(r["id"]),
-                "round": "" if r["ops_msg_id"] else round_time(next_round(r["country"] or "") or now()),
+                "round": "" if r["ops_msg_id"] or not in_ops_chat(r) else round_time(next_round(r["country"] or "") or now()),
+                "sheetOnly": not in_ops_chat(r),
                 "takenBy": "You" if r["taken_by"] == user_id and taker else taker, "link": link}
     today = now().date().isoformat()
     return {
