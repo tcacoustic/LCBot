@@ -3802,7 +3802,7 @@ function renderTeamHome(d) {
     h += hero('Open requests', String(o.open), '🔴 ' + o.urgent + ' same-day · ⏰ ' + o.late + ' after cut-off');
     h += cards([[o.mine, 'Yours (on it)'], [o.doneToday, 'Done today']]);
     const row = r => `<div class="p${r.link ? ' tappable' : ''}" data-link="${esc(r.link)}"><div class="tags">`
-      + (r.redFlag ? '<span class="tag red">🚩 ANGRY CUSTOMER</span>' : '')
+      + (r.redFlag ? '<span class="tag red">🚩 ESCALATION</span>' : '')
       + (r.urgent ? '<span class="tag red">URGENT</span>' : r.late ? '<span class="tag amber">AFTER CUT-OFF</span>' : '')
       + (r.round ? '<span class="tag">IN THE ' + esc(r.round.toUpperCase()) + ' ROUND</span>' : '')
       + (r.takenBy ? '<span class="tag blue">ON IT · ' + esc(r.takenBy.toUpperCase()) + '</span>'
@@ -4885,7 +4885,7 @@ function wireRequestButton() {
 }
 // URGENT / AFTER CUT-OFF, then where it stands (ON IT shows who).
 function requestTags(r) {
-  const tags = r.redFlag ? [['🚩 ANGRY CUSTOMER', 'red']] : [];
+  const tags = r.redFlag ? [['🚩 ESCALATION', 'red']] : [];
   if (r.urgent) tags.push(['URGENT', 'red']); else if (r.late) tags.push(['AFTER CUT-OFF', 'amber']);
   if (r.statusKey === 'TAKEN' && r.takenBy) tags.push(['ON IT · ' + r.takenBy.toUpperCase(), 'blue']);
   else if (r.status) tags.push([r.status.toUpperCase(), r.statusKey === 'DONE' ? 'green' : r.statusKey === 'CANT' ? 'red' : '']);
@@ -4932,7 +4932,7 @@ async function loadRequest() {
   if (day && day.kind === 'URGENT') h += '<div class="warn">Same-day delivery: Ops will see it marked URGENT.</div>';
   if (day && day.kind === 'LATE') h += '<div class="warn">After the ' + esc(d.cutoff) + ' cut-off for ' + esc(day.label)
     + '. Ops will try, but it may move to the next working day: check the customer is OK with that.</div>';
-  h += '<div class="fld"><label>Angry customer?</label><div class="pick">'
+  h += '<div class="fld"><label>Escalation?</label><div class="pick">'
      + '<button data-rqflag="1" class="' + (f.red_flag ? 'on' : '') + '">🚩 Yes</button>'
      + '<button data-rqflag="0" class="' + (f.red_flag ? '' : 'on') + '">No</button></div>'
      + (f.red_flag ? '<div class="note" style="margin-top:6px">Ops see it straight away, marked 🚩, at the top of their list.</div>' : '') + '</div>';
