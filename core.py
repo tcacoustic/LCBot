@@ -2686,8 +2686,9 @@ def render_shift_summary(user_id: int, who: str) -> tuple:
     if not raised and not closed:
         return "", 0
 
-    out = ["⭐️ Live Chat Agent Closing Handover ⭐️",
-           f"{now().strftime('%a %-d %b')} · {who}"]
+    team = "Livechat" if is_livechat(user_id) else "SH" if "SH" in depts_of(user_id) else ""
+    out = ["⭐️ Closing Handover ⭐️",
+           f"{now().strftime('%a %-d %b')} · {who}" + (f" · {team}" if team else "")]
     if raised:
         out += ["", f"🆕 Raised this shift ({len(raised)})"]
         for r in raised:
@@ -3752,6 +3753,7 @@ function renderTeamHome(d) {
     h += cards([[d.bookedWeek, 'Booked this week'], [d.requestsOpen, 'Requests open']]);
     h += '<button class="big" id="hBook">Book an appointment</button>';
     h += requestButton();
+    h += '<h2>Look up a case</h2>' + searchBar() + '<div id="fsResults"></div>';
     if (d.booked.length) h += '<h2>Appointments you booked</h2>' + d.booked.map(v => visitRow(v, v.day)).join('');
     h += mine();
   } else if (d.teamHome === 'ONSITE') {
@@ -3767,7 +3769,10 @@ function renderTeamHome(d) {
     h += hero('Open on your channels', plural(d.open, 'case'),
               d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
                                 : 'No channels yet: ask an admin to set yours');
-    if (d.channels.length) h += cards(d.channels.map(c => [c.n, c.name]));
+    if (d.channels.length) h += '<div class="cards" style="margin-top:20px">' + d.channels.map((c, i) =>
+      `<div class="card${d.channels.length % 2 && i === d.channels.length - 1 ? ' wide' : ''}">`
+      + `<div class="l" style="display:flex;align-items:center;gap:6px;margin-top:0">${channelLogos(c.key)}${esc(c.name)}</div>`
+      + `<div class="n" style="margin-top:4px">${c.n}</div></div>`).join('') + '</div>';
     h += '<button class="big" id="hNewOnline">New Online request</button>';
     h += requestButton();
     if (d.oldest.length) h += '<h2>Oldest first</h2>' + d.oldest.map(c => caseRow(c)).join('');
@@ -3804,10 +3809,34 @@ function renderTeamHome(d) {
     if (!el.dataset.link) return;
     el.onclick = () => { if (tg && tg.openTelegramLink) tg.openTelegramLink(el.dataset.link); else window.open(el.dataset.link, '_blank'); };
   });
+  if (d.teamHome === 'FS') wireFsSearch();
   const bk = document.getElementById('hBook');
   if (bk) bk.onclick = () => { VS.form = { country: '', spec: '', visit_type: 'SETUP', date: '', time: '' }; VIEW = 'vis'; render(); };
   const no = document.getElementById('hNewOnline');
   if (no) no.onclick = () => { HO_FORM = { section: 'open', prio: '', platform: '', store: '' }; VIEW = 'ho'; render(); };
+}
+
+// FS look cases up from Home: read only, as each case stands now.
+function wireFsSearch() {
+  const box = document.getElementById('csq'), out = document.getElementById('fsResults');
+  const show = async () => {
+    if (!CS_Q) { out.innerHTML = ''; return; }
+    out.innerHTML = '<div class="note">Searching…</div>';
+    const res = (await getJSON('/api/cases/search?q=' + encodeURIComponent(CS_Q))).results || [];
+    out.innerHTML = '<div class="note">' + res.length + (res.length === 30 ? '+' : '') + ' found</div>'
+      + (res.length ? res.map(c => '<div class="p">' + caseTags(c)
+          + '<div class="pn">' + esc(c.username) + '</div>'
+          + '<div class="t">' + esc([c.channelName || c.platform, c.store, c.status].filter(Boolean).join(' · ')) + '</div>'
+          + '<div class="t" style="white-space:pre-wrap;margin-top:6px">' + esc(c.body) + '</div>'
+          + (c.note ? '<div class="t" style="margin-top:6px">' + esc(c.note) + '</div>' : '') + '</div>').join('')
+        : '<div class="empty">No cases found. Try part of the name, order number or product, or a date like 16/10.</div>');
+  };
+  const go = () => { CS_Q = (box.value || '').trim(); show(); };
+  document.getElementById('csGo').onclick = go;
+  box.onkeydown = e => { if (e.key === 'Enter') go(); };
+  const clear = document.getElementById('csClear');
+  if (clear) clear.onclick = () => { CS_Q = ''; box.value = ''; clear.remove(); show(); };
+  show();
 }
 
 async function doClockIn(btn, slots) {
@@ -4005,7 +4034,16 @@ async function loadHandover() {
     wireHandover();
     return;
   }
-  h += searchBar();
+  // The two things you came to do first, then the cases.
+  h += '<button class="big" id="newCase" style="margin-top:0">Add a case</button>';
+  if (!d.canPost) {
+    // FS add and update cases; posting the handover is Livechat's and SH's.
+  } else if (n) {
+    h += '<button class="big" id="postHo" style="margin-top:8px">Post handover</button>';
+  } else {
+    h += '<button class="big" id="postHo" style="margin-top:8px">Post "nothing open"</button>';
+  }
+  h += '<div style="margin-top:16px">' + searchBar() + '</div>';
 
   if (n) {
     h += '<h2>Still open</h2>';
@@ -4017,14 +4055,6 @@ async function loadHandover() {
     for (const c of order) h += caseCard(c, false);
   }
 
-  h += '<button class="big" id="newCase" style="margin-top:14px">Add a case</button>';
-  if (!d.canPost) {
-    // FS add and update cases; posting the handover is Livechat's and SH's.
-  } else if (n) {
-    h += '<button class="big" id="postHo" style="margin-top:8px">Post handover</button>';
-  } else {
-    h += '<button class="big" id="postHo" style="margin-top:8px">Post "nothing open"</button>';
-  }
 
   if (d.closedCases.length) {
     h += '<h2>Closed recently</h2>';
@@ -4143,12 +4173,17 @@ const REGION_FLAGS = { SG: '🇸🇬', MY: '🇲🇾', TH: '🇹🇭', HK: '🇭
 // vanishes into the orange) and TC turns white on black.
 function platformLogo(g, on) {
   const file = { SHOPEE: 'shopee', LAZADA: 'lazada', WEBSTORE: on ? 'tc-white' : 'tc' }[g];
+  if (!file) return '';
   const img = '<img class="plogo" src="/logos/' + file + '.png" alt="">';
   return g === 'SHOPEE' && on ? '<span class="plchip">' + img + '</span>' : img;
 }
 const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
                    LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE',
                    WEBSTORE_MY: 'WEBSTORE', WEBSTORE_HK: 'WEBSTORE', WEBSTORE_TH: 'WEBSTORE' };
+// A channel's logo(s): TH is one channel for both Shopee and Lazada.
+function channelLogos(key) {
+  return key === 'TH' ? platformLogo('SHOPEE', false) + platformLogo('LAZADA', false) : platformLogo(CH_GROUP[key], false);
+}
 
 function onlineCard(c, mine) {
   let h = '<div class="case"><div class="top"><div style="flex:1">';
@@ -4436,7 +4471,7 @@ async function loadVisits() {
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
-        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + esc(c.code) + '</button>').join('') + '</div>';
+        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + (REGION_FLAGS[c.code] || '') + ' ' + esc(c.code) + '</button>').join('') + '</div>';
     const team = d.countries.find(c => c.code === d.country).specialists;
     if (team.length > 1) {
       h += '<div class="otabs small">' + team.map(s =>
@@ -4858,7 +4893,7 @@ async function loadRequest() {
     '<button data-' + attr + '="' + it.key + '" class="' + (cur === it.key ? 'on' : '') + '">' + esc(it.name) + '</button>').join('') + '</div>';
   let h = '<div class="back" id="rqBack">‹ Back</div><h1>Special request</h1><div class="sub">To Ops</div>';
   h += '<div class="fld"><label>Order number</label><input id="rq_order_no" value="' + esc(f.order_no || '') + '"></div>';
-  h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: c.key })), f.country) + '</div>';
+  h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: (REGION_FLAGS[c.key] || '') + ' ' + c.key })), f.country) + '</div>';
   h += '<div class="fld"><label>What is the request?</label>' + pick('rqcat', d.categories, f.category) + '</div>';
   const cat = d.categories.find(c => c.key === f.category);
   h += '<div class="fld"><label>Details</label>'
