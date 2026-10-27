@@ -178,7 +178,7 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 def handover_header(the_date: date) -> str:
     return (
-        "⭐️ Live Chat Agent Closing Handover ⭐️\n\n"
+        "⭐️ Closing Handover ⭐️\n\n"
         f"🔸{the_date.strftime('%-d %b %Y')}, Open Cases"
     )
 

@@ -368,11 +368,7 @@ def home_payload(user_id: int) -> dict:
     next_shift = ""
     if nxt:
         d = date.fromisoformat(nxt["the_date"])
-        when = "Today" if d == today else (
-            "Tomorrow" if d == today + timedelta(days=1)
-            else d.strftime("%a %-d %b")
-        )
-        next_shift = f"{when} · {nxt['label']}"
+        next_shift = f"{d.strftime('%a %-d %b')} · {nxt['label']}"
 
     first, last = week_bounds(today)
     t = timesheet(user_id, first, last)
