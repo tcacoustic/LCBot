@@ -3806,7 +3806,8 @@ function renderTeamHome(d) {
       + (r.urgent ? '<span class="tag red">URGENT</span>' : r.late ? '<span class="tag amber">AFTER CUT-OFF</span>' : '')
       + (r.round ? '<span class="tag">IN THE ' + esc(r.round.toUpperCase()) + ' ROUND</span>' : '')
       + (r.takenBy ? '<span class="tag blue">ON IT · ' + esc(r.takenBy.toUpperCase()) + '</span>'
-                   : (r.urgent || r.late || r.redFlag || r.round) ? '' : '<span class="tag">OPEN</span>')
+                   : (r.urgent || r.late || r.redFlag || r.round || r.sheetOnly) ? '' : '<span class="tag">OPEN</span>')
+      + (r.sheetOnly ? '<span class="tag">IN THE SHEET</span>' : '')
       + `</div><div class="ptop"><div class="pn">${esc(r.order)} · ${esc(r.category)}</div><div class="t">${r.link ? '›' : ''}</div></div>`
       + `<div class="t">${esc([r.flag, r.delivery, 'from ' + r.from, r.at].filter(Boolean).join(' · '))}</div></div>`;
     const urgent = o.requests.filter(r => r.urgent || r.redFlag), rest = o.requests.filter(r => !r.urgent && !r.redFlag);
