@@ -2567,26 +2567,30 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
                   "ORDER BY id DESC LIMIT 1", (case_id,))
         waiting = back["user_id"] if back else None
     who = display_name_of(author_id, "SH")
-    where = CHANNEL_NAMES.get(r["channel"] or "", "")
+    # Who the case is, then what was said: customer · platform · order.
+    about = "\n".join([f"👤 <b>{esc(r['username'])}</b>",
+                        " · ".join(x for x in (CHANNEL_NAMES.get(r["channel"] or "", ""),
+                                               f"Order {esc(r['order_no'])}" if r["order_no"] else "") if x)])
     sends = {}
     if closed:
         if waiting:
-            sends[waiting] = (f"✅ {who} has done {r['username']} ({where}).\n"
+            sends[waiting] = (f"✅ <b>{esc(who)} has done this</b>\n{about}\n\n"
                               + ("Confirm it in the App to close it."
                                  if not r["on_closed"] else "It's fully closed now."))
     else:
         if setting("pm_alerts", "on") != "off":
             for pm in online_team():
                 if r["channel"] in json.loads(pm["channels"] or "[]"):
-                    sends[pm["user_id"]] = (f"💬 {who} added a note on {r['username']} ({where}):\n"
-                                            f"{note}\n\nOpen the App to see the case.")
+                    sends[pm["user_id"]] = (f"💬 <b>{esc(who)} added a note</b>\n{about}\n\n"
+                                            f"{esc(note)}\n\nOpen the App to see the case.")
         if waiting:
-            sends[waiting] = f"💬 {who} replied on {r['username']} ({where}):\n{note}\n\nOpen the App to reply."
+            sends[waiting] = (f"💬 <b>{esc(who)} replied</b>\n{about}\n\n"
+                              f"{esc(note)}\n\nOpen the App to reply.")
     if not (TEST_MODE and is_owner(author_id)):
         sends.pop(author_id, None)   # no one hears about their own note (the test bot's owner does, to try both sides)
     for pm, text in sends.items():
         try:
-            await bot.send_message(pm, text)
+            await bot.send_message(pm, text, parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             log.info("Couldn't tell %s about a reply: %s", pm, e)
 
