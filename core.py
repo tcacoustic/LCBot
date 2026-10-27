@@ -3769,7 +3769,10 @@ function renderTeamHome(d) {
     h += hero('Open on your channels', plural(d.open, 'case'),
               d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
                                 : 'No channels yet: ask an admin to set yours');
-    if (d.channels.length) h += cards(d.channels.map(c => [c.n, c.name]));
+    if (d.channels.length) h += '<div class="cards" style="margin-top:20px">' + d.channels.map((c, i) =>
+      `<div class="card${d.channels.length % 2 && i === d.channels.length - 1 ? ' wide' : ''}">`
+      + `<div class="l" style="display:flex;align-items:center;gap:6px;margin-top:0">${channelLogos(c.key)}${esc(c.name)}</div>`
+      + `<div class="n" style="margin-top:4px">${c.n}</div></div>`).join('') + '</div>';
     h += '<button class="big" id="hNewOnline">New Online request</button>';
     h += requestButton();
     if (d.oldest.length) h += '<h2>Oldest first</h2>' + d.oldest.map(c => caseRow(c)).join('');
@@ -4170,12 +4173,17 @@ const REGION_FLAGS = { SG: '🇸🇬', MY: '🇲🇾', TH: '🇹🇭', HK: '🇭
 // vanishes into the orange) and TC turns white on black.
 function platformLogo(g, on) {
   const file = { SHOPEE: 'shopee', LAZADA: 'lazada', WEBSTORE: on ? 'tc-white' : 'tc' }[g];
+  if (!file) return '';
   const img = '<img class="plogo" src="/logos/' + file + '.png" alt="">';
   return g === 'SHOPEE' && on ? '<span class="plchip">' + img + '</span>' : img;
 }
 const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
                    LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE',
                    WEBSTORE_MY: 'WEBSTORE', WEBSTORE_HK: 'WEBSTORE', WEBSTORE_TH: 'WEBSTORE' };
+// A channel's logo(s): TH is one channel for both Shopee and Lazada.
+function channelLogos(key) {
+  return key === 'TH' ? platformLogo('SHOPEE', false) + platformLogo('LAZADA', false) : platformLogo(CH_GROUP[key], false);
+}
 
 function onlineCard(c, mine) {
   let h = '<div class="case"><div class="top"><div style="flex:1">';
@@ -4463,7 +4471,7 @@ async function loadVisits() {
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
-        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + esc(c.code) + '</button>').join('') + '</div>';
+        '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + (REGION_FLAGS[c.code] || '') + ' ' + esc(c.code) + '</button>').join('') + '</div>';
     const team = d.countries.find(c => c.code === d.country).specialists;
     if (team.length > 1) {
       h += '<div class="otabs small">' + team.map(s =>
@@ -4885,7 +4893,7 @@ async function loadRequest() {
     '<button data-' + attr + '="' + it.key + '" class="' + (cur === it.key ? 'on' : '') + '">' + esc(it.name) + '</button>').join('') + '</div>';
   let h = '<div class="back" id="rqBack">‹ Back</div><h1>Special request</h1><div class="sub">To Ops</div>';
   h += '<div class="fld"><label>Order number</label><input id="rq_order_no" value="' + esc(f.order_no || '') + '"></div>';
-  h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: c.key })), f.country) + '</div>';
+  h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: (REGION_FLAGS[c.key] || '') + ' ' + c.key })), f.country) + '</div>';
   h += '<div class="fld"><label>What is the request?</label>' + pick('rqcat', d.categories, f.category) + '</div>';
   const cat = d.categories.find(c => c.key === f.category);
   h += '<div class="fld"><label>Details</label>'
