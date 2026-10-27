@@ -715,7 +715,7 @@ def main() -> None:
                 R_DATE_TYPED: [MessageHandler(text_in, on_request_date_typed)],
                 R_TIME: [CallbackQueryHandler(on_request_time, pattern=r"^sr:t:[A-Z]+$")],
                 R_TIME_TYPED: [MessageHandler(text_in, on_request_time_typed)],
-                R_CONFIRM: [CallbackQueryHandler(on_request_confirm, pattern=r"^sr:(send|stop)$")],
+                R_CONFIRM: [CallbackQueryHandler(on_request_confirm, pattern=r"^sr:(send|stop|flag)$")],
             },
             fallbacks=[CommandHandler("cancel", cancel),
                        CallbackQueryHandler(on_request_back, pattern=r"^sr:back$")],

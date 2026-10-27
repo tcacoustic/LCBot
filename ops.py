@@ -70,7 +70,7 @@ def ops_target(country: str = "") -> dict | None:
 
 
 # Busy days: a country's requests can go to Ops in rounds (every 30 or 60
-# minutes) instead of one message each. Same-day ones never wait.
+# minutes) instead of one message each. Same-day and 🚩 ones never wait.
 ROUND_LENGTHS = (30, 60)
 
 
@@ -170,6 +170,8 @@ def request_text(r, head: str = "") -> str:
     d = date.fromisoformat(r["delivery_date"])
     lines = [head] if head else []
     tag = "🔴 <b>URGENT · SAME DAY</b> · " if r["urgent"] else "⏰ <b>AFTER CUT-OFF</b> · " if r["after_cutoff"] else ""
+    if is_flagged(r["id"]):
+        tag = "🚩 <b>ESCALATION</b> · " + tag
     lines += [
         f"{tag}📦 <b>Special request #{r['id']}</b> · {esc(REQUEST_COUNTRY_NAMES.get(r['country'] or '', ''))}",
         f"<b>{esc(CATEGORY_NAMES[r['category']])}</b>",
@@ -223,6 +225,17 @@ def cant_buttons(rid: int, bot_username: str = "") -> InlineKeyboardMarkup:
 
 def get_request(rid: int):
     return q1("SELECT * FROM special_requests WHERE id=?", (rid,))
+
+
+# 🚩 Escalation: shown to Ops in Telegram and the App only, never in the
+# sheet. Kept as one line per request in the settings table (red_flag:<id>).
+def is_flagged(rid: int) -> bool:
+    return setting(f"red_flag:{rid}", "") == "yes"
+
+
+def flagged_first(rows: list) -> list:
+    """The same order, with 🚩 requests moved to the top."""
+    return sorted(rows, key=lambda r: not is_flagged(r["id"]))
 
 
 # --------------------------------------------------------------------------
@@ -356,8 +369,9 @@ def date_label(d: date) -> str:
     return f"{d:%a %-d %b}"
 
 
-def confirm_buttons() -> InlineKeyboardMarkup:
+def confirm_buttons(flagged: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚩 Escalation: " + ("Yes" if flagged else "No"), callback_data="sr:flag")],
         [InlineKeyboardButton("📤 Send to Ops", callback_data="sr:send"),
          InlineKeyboardButton("✖️ Cancel", callback_data="sr:stop")],
         [BACK],
@@ -415,6 +429,8 @@ def draft_text(d: dict) -> str:
              f"Request: <b>{esc(CATEGORY_NAMES[d['category']])}</b>",
              f"Delivery: {date_label(date.fromisoformat(d['delivery_date']))} · {esc(tf)}",
              "", esc(d["details"])]
+    if d.get("red_flag"):
+        lines += ["", "🚩 <b>Escalation</b>: Ops see it straight away, at the top."]
     warn = cutoff_warning(d)
     if warn:
         lines += ["", warn]
@@ -460,7 +476,7 @@ def step_prompt(step: int, d: dict) -> tuple:
                                 for key, name in TIMEFRAMES]))
     if step == R_TIME_TYPED:
         return "Type the time frame, e.g. <code>after 7pm</code>.", rows_with_back([])
-    return draft_text(d), confirm_buttons()
+    return draft_text(d), confirm_buttons(bool(d.get("red_flag")))
 
 
 async def show_step(update: Update, context: ContextTypes.DEFAULT_TYPE, step: int) -> int:
@@ -632,6 +648,10 @@ def about(r) -> str:
 async def on_request_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    if query.data == "sr:flag" and "sr" in context.user_data:
+        d = context.user_data["sr"]
+        d["red_flag"] = not d.get("red_flag")
+        return await show_step(update, context, R_CONFIRM)
     d = context.user_data.pop("sr", None)
     if query.data == "sr:stop" or not d:
         await query.edit_message_text("Cancelled. Nothing was sent.")
@@ -669,8 +689,10 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
              d["timeframe"], d.get("timeframe_other"), created_by, created.isoformat(),
              1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0,
              0 if source == "paperform" else 1, source, submitted_name or None)).lastrowid
+        if d.get("red_flag"):
+            set_setting(f"red_flag:{rid}", "yes")
     due = next_round(d.get("country") or "", created)
-    if due and kind != "URGENT" and ops_target(d.get("country") or ""):
+    if due and kind != "URGENT" and not d.get("red_flag") and ops_target(d.get("country") or ""):
         if source != "paperform":
             await sync_to_sheet(rid)
         return rid, round_time(due), kind
@@ -879,8 +901,8 @@ async def cmd_opsrounds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     choice = next((a for a in args if a in ("30", "60", "OFF")), "")
     if not country or not choice:
         lines = ["🕒 <b>Ops rounds</b>", "On a busy day, a country's requests can go to Ops every 30 or 60 "
-                 "minutes in one batch, instead of one message each. 🔴 Same-day requests always "
-                 "go straight away.", ""]
+                 "minutes in one batch, instead of one message each. 🔴 Same-day and 🚩 escalated "
+                 "requests always go straight away.", ""]
         for cc, name in REQUEST_COUNTRIES:
             every = rounds_for(cc)
             lines.append(f"{name}: " + (f"<b>every {every} min</b>, next at {round_time(next_round(cc))}"
@@ -898,7 +920,7 @@ async def cmd_opsrounds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                                         + (f" ({n} waiting just went)." if n else "."))
         return
     await update.message.reply_text(f"✅ {name}: requests go to Ops every {choice} minutes, next at "
-                                    f"{round_time(next_round(country))}. 🔴 Same-day ones still go "
+                                    f"{round_time(next_round(country))}. 🔴 Same-day and 🚩 ones still go "
                                     "straight away. Turn off with /opsrounds {country} off.".replace("{country}", country))
 
 
@@ -988,6 +1010,7 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     rows = q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN')"
              " ORDER BY country, urgent DESC, after_cutoff DESC, delivery_date, id")
+    rows = sorted(rows, key=lambda r: (r["country"] or "", not is_flagged(r["id"])))
     if not rows:
         await update.message.reply_text("No special requests open. 🎉")
         return
@@ -997,7 +1020,7 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if r["country"] != last:
             last = r["country"]
             lines += ["", f"<b>{esc(REQUEST_COUNTRY_NAMES.get(last or '', 'No country'))}</b>"]
-        flags = ("🔴 " if r["urgent"] else "⏰ " if r["after_cutoff"] else "") \
+        flags = ("🚩 " if is_flagged(r["id"]) else "") + ("🔴 " if r["urgent"] else "⏰ " if r["after_cutoff"] else "") \
             + ("🙋 " if r["status"] == "TAKEN" else "") + ("🕒 " if not r["ops_msg_id"] else "")
         lines.append(f"{flags}<b>#{r['id']}</b> {esc(CATEGORY_NAMES[r['category']])} · "
                      f"<code>{esc(r['order_no'])}</code> · "
@@ -1147,7 +1170,7 @@ def my_requests(user_id: int, limit: int) -> list:
         "id": r["id"], "order": r["order_no"], "category": CATEGORY_NAMES[r["category"]],
         "delivery": f"{date_label(date.fromisoformat(r['delivery_date']))} · {timeframe_text(r)}",
         "status": STATUS_NAMES.get(r["status"], r["status"]), "statusKey": r["status"],
-        "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]),
+        "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]), "redFlag": is_flagged(r["id"]),
         "takenBy": display_name_of(r["taken_by"], "") if r["status"] == "TAKEN" and r["taken_by"] else "",
         "reason": CANT_NAMES.get(r["reason"], r["reason"] or "") if r["status"] == "CANT" else "",
         "note": r["ops_note"] or "",
@@ -1158,8 +1181,8 @@ def my_requests(user_id: int, limit: int) -> list:
 def ops_home(user_id: int) -> dict:
     """Ops's Home: what's open, the urgent ones first, each linking to its
     message in the Ops chat (that's where it's answered)."""
-    rows = q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN')"
-             " ORDER BY urgent DESC, after_cutoff DESC, delivery_date, id")
+    rows = flagged_first(q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN')"
+                           " ORDER BY urgent DESC, after_cutoff DESC, delivery_date, id"))
     def item(r):
         chat = str(r["ops_chat_id"] or "")
         link = (f"https://t.me/c/{chat[4:]}/{r['ops_msg_id']}"
@@ -1170,7 +1193,7 @@ def ops_home(user_id: int) -> dict:
                 "delivery": date_label(date.fromisoformat(r["delivery_date"])),
                 "from": sender_name(r),
                 "at": datetime.fromisoformat(r["created_at"]).strftime("%-I:%M%p").lower(),
-                "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]),
+                "urgent": bool(r["urgent"]), "late": bool(r["after_cutoff"]), "redFlag": is_flagged(r["id"]),
                 "round": "" if r["ops_msg_id"] else round_time(next_round(r["country"] or "") or now()),
                 "takenBy": "You" if r["taken_by"] == user_id and taker else taker, "link": link}
     today = now().date().isoformat()
@@ -1192,7 +1215,8 @@ def web_request_add(user_id: int, body: dict) -> dict:
     get = lambda k: str(body.get(k) or "").strip()
     d = {"order_no": get("order_no")[:80], "country": get("country"), "category": get("category"),
          "details": get("details")[:2000], "delivery_date": get("delivery_date"),
-         "timeframe": get("timeframe"), "timeframe_other": get("timeframe_other")[:80] or None}
+         "timeframe": get("timeframe"), "timeframe_other": get("timeframe_other")[:80] or None,
+         "red_flag": body.get("red_flag") is True}
     if len(d["order_no"]) < 3:
         return {"ok": False, "error": "Add the full order number."}
     if d["country"] not in REQUEST_COUNTRY_NAMES:
