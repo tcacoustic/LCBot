@@ -12,6 +12,7 @@ from handover import *  # noqa: F401,F403
 from onsite import *  # noqa: F401,F403
 from ops import *  # noqa: F401,F403
 from webapp import *  # noqa: F401,F403
+from telegram.ext import AIORateLimiter
 
 async def on_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route a tap on the persistent keyboard to the right command."""
@@ -500,7 +501,10 @@ async def post_init(app: Application) -> None:
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    # The rate limiter queues messages instead of losing them when Telegram's
+    # limits are hit (about 20 a minute into one group), e.g. on 11.11.
+    app = (Application.builder().token(BOT_TOKEN).post_init(post_init)
+           .rate_limiter(AIORateLimiter(max_retries=3)).build())
 
     app.add_handler(
         ConversationHandler(

@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]>=21.0,<23.0
+python-telegram-bot[job-queue,rate-limiter]>=21.0,<23.0
 holidays>=0.58,<1
