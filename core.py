@@ -2455,26 +2455,21 @@ def render_channel_post(post_id: int) -> str:
 
 
 def channel_post_keyboard(post_id: int, bot_username: str | None):
-    """Buttons under each case. Open: ✅ Close and 📝 Note. Closed on one side:
-    ✅ Close (for the other side), ↩️ Reopen and 📝 Note. Fully closed: ↩️ Reopen,
-    in case it was a misclick. Close and Reopen work in place; Note opens a
-    private chat with the bot, so nothing is typed in the group."""
+    """One button per case that flips: ✅ Close while nobody has closed it,
+    ↩️ Reopen once someone has (to undo a misclick), plus 📝 Note while it's
+    not fully closed. Close and Reopen work in place; Note opens a private
+    chat with the bot, so nothing is typed in the group."""
     rows = []
     for r in q("SELECT id, username, closed, sh_closed, on_closed FROM ho_cases WHERE post_id=? "
                "ORDER BY id", (post_id,))[:45]:
         who = (r["username"] or "case")[:20]
-        reopen = InlineKeyboardButton(f"↩️ Reopen · {who}" if r["closed"] else "↩️ Reopen",
-                                      callback_data=f"sc:o:{r['id']}")
-        note = InlineKeyboardButton(f"📝 Note · {who}" if not (r["sh_closed"] or r["on_closed"]) else "📝 Note",
-                                    url=f"https://t.me/{bot_username}?start=note_{r['id']}") if bot_username else None
-        if r["closed"]:
-            row = [reopen]
-        elif r["sh_closed"] or r["on_closed"]:
-            row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}"), reopen]
+        if r["sh_closed"] or r["on_closed"] or r["closed"]:
+            row = [InlineKeyboardButton(f"↩️ Reopen · {who}", callback_data=f"sc:o:{r['id']}")]
         else:
             row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
-        if note and not r["closed"]:
-            row.append(note)
+        if bot_username and not r["closed"]:
+            row.append(InlineKeyboardButton(
+                f"📝 Note · {who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows) if rows else None
 

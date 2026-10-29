@@ -1144,7 +1144,9 @@ async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     side = "on" if is_online(uid) else "sh"
     if not r[f"{side}_closed"]:
         other = "SH" if side == "on" else "Online"
-        await query.answer(f"It's still open on your side. Only {other} can reopen theirs.", show_alert=True)
+        where = "Cases → Close (Online)" if side == "on" else "Handover (untick it)"
+        await query.answer(f"{other} closed their side; yours is still open. To close yours, "
+                           f"use the App: {where}.", show_alert=True)
         await refresh_case_post(context.bot, case_id)
         return
     async with write_lock:
