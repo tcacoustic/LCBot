@@ -2335,6 +2335,16 @@ def reopen_case(case_id: int, user_id: int | None = None) -> None:
              else "sh", "reopened")
 
 
+def reopen_side(case_id: int, user_id: int, side: str) -> None:
+    """Undo one side's close (a misclick in a store chat): that side is open
+    again, and so is the case. The other side's close stays."""
+    if side not in ("sh", "on"):
+        raise ValueError(side)
+    run(f"UPDATE ho_cases SET {side}_closed=0, {side}_closed_by=NULL, {side}_closed_at=NULL, "
+        "closed=0, closed_by=NULL, closed_at=NULL WHERE id=?", (case_id,))
+    log_case(case_id, user_id, side, "reopened")
+
+
 def force_close_case(case_id: int, admin_id: int) -> None:
     """Admins: close both sides when one side never will."""
     ts = now().isoformat()
@@ -2445,16 +2455,26 @@ def render_channel_post(post_id: int) -> str:
 
 
 def channel_post_keyboard(post_id: int, bot_username: str | None):
-    """✅ Close and 📝 Note under each case still open. Close works in place;
-    Note opens a private chat with the bot, so nothing is typed in the group."""
+    """Buttons under each case. Open: ✅ Close and 📝 Note. Closed on one side:
+    ✅ Close (for the other side), ↩️ Reopen and 📝 Note. Fully closed: ↩️ Reopen,
+    in case it was a misclick. Close and Reopen work in place; Note opens a
+    private chat with the bot, so nothing is typed in the group."""
     rows = []
-    for r in q("SELECT id, username FROM ho_cases WHERE post_id=? AND closed=0 "
+    for r in q("SELECT id, username, closed, sh_closed, on_closed FROM ho_cases WHERE post_id=? "
                "ORDER BY id", (post_id,))[:45]:
         who = (r["username"] or "case")[:20]
-        row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
-        if bot_username:
-            row.append(InlineKeyboardButton(
-                f"📝 Note · {who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
+        reopen = InlineKeyboardButton(f"↩️ Reopen · {who}" if r["closed"] else "↩️ Reopen",
+                                      callback_data=f"sc:o:{r['id']}")
+        note = InlineKeyboardButton(f"📝 Note · {who}" if not (r["sh_closed"] or r["on_closed"]) else "📝 Note",
+                                    url=f"https://t.me/{bot_username}?start=note_{r['id']}") if bot_username else None
+        if r["closed"]:
+            row = [reopen]
+        elif r["sh_closed"] or r["on_closed"]:
+            row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}"), reopen]
+        else:
+            row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
+        if note and not r["closed"]:
+            row.append(note)
         rows.append(row)
     return InlineKeyboardMarkup(rows) if rows else None
 
