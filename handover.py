@@ -1128,6 +1128,33 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer(f"Closed on the {'Online' if side == 'on' else 'SH'} side ✓")
 
 
+async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:o:<id> — ↩️ Reopen under a closed case in a store chat: undoes the
+    tapper's own side's close (a misclick). The message updates in place."""
+    query = update.callback_query
+    uid = query.from_user.id
+    if not may_see_cases(uid):
+        await query.answer("This is for the SH and Online teams.", show_alert=True)
+        return
+    case_id = int(query.data.split(":")[2])
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        await query.answer("That case is gone.")
+        return
+    side = "on" if is_online(uid) else "sh"
+    if not r[f"{side}_closed"]:
+        other = "SH" if side == "on" else "Online"
+        where = "Cases → Close (Online)" if side == "on" else "Handover (untick it)"
+        await query.answer(f"{other} closed their side; yours is still open. To close yours, "
+                           f"use the App: {where}.", show_alert=True)
+        await refresh_case_post(context.bot, case_id)
+        return
+    async with write_lock:
+        reopen_side(case_id, uid, side)
+    await refresh_case_post(context.bot, case_id)
+    await query.answer(f"Reopened on the {'Online' if side == 'on' else 'SH'} side ✓")
+
+
 # --------------------------------------------------------------------------
 # 📊 Case report — weekly for the Online team and admins, or /report anytime
 # --------------------------------------------------------------------------
