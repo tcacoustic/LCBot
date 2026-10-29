@@ -304,8 +304,20 @@ def _post_to_sheet(payload: dict) -> dict:
     req = urllib.request.Request(
         REQUEST_SHEET_URL, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=45) as resp:
         return json.loads(resp.read().decode() or "{}")
+
+
+_sheet_queue: list = []
+
+
+def sheet_turn() -> asyncio.Lock:
+    """One write to the sheet at a time. Its script writes one row at a time
+    and gives up after 20s waiting, so a burst sent all at once (e.g. 11.11)
+    timed out, and a row that went in late could be added again on the retry."""
+    if not _sheet_queue:
+        _sheet_queue.append(asyncio.Lock())
+    return _sheet_queue[0]
 
 
 async def sync_to_sheet(rid: int) -> None:
@@ -313,6 +325,11 @@ async def sync_to_sheet(rid: int) -> None:
     Left marked for the retry job if the sheet can't be reached."""
     if not (REQUEST_SHEET_URL and REQUEST_SHEET_SECRET):
         return
+    async with sheet_turn():
+        await _sync_to_sheet(rid)
+
+
+async def _sync_to_sheet(rid: int) -> None:
     r = get_request(rid)
     if not r:
         return
@@ -333,7 +350,7 @@ async def sync_to_sheet(rid: int) -> None:
     if out.get("row") and (r["status"] in ("DONE", "CANT") or r["ops_note"]):
         async with write_lock:
             run("UPDATE special_requests SET sheet_dirty=1 WHERE id=?", (rid,))
-        await sync_to_sheet(rid)
+        await _sync_to_sheet(rid)
 
 
 async def job_sheet_retry(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -344,7 +361,7 @@ async def job_sheet_retry(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def mark_dirty_and_sync(rid: int) -> None:
     async with write_lock:
         run("UPDATE special_requests SET sheet_dirty=1 WHERE id=?", (rid,))
-    await sync_to_sheet(rid)
+    in_background(sync_to_sheet(rid))
 
 
 # --------------------------------------------------------------------------
@@ -686,8 +703,9 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
                          submitted_name: str = "") -> tuple:
     """Save a request, post it to Ops and copy it to the sheet. The same for the
     bot chat, the App form and the Paperform. Returns (id, posted, cut-off kind);
-    posted is "SHEET" for an on-time request (sheet only, no Ops chat post), or
-    the round's time ("3:00pm") when it waits for the next round."""
+    posted is "SHEET" for an on-time request (sheet only, no Ops chat post), the
+    round's time ("3:00pm") when it waits for the next round, or whether there's
+    an Ops chat to post it in."""
     created = now()
     kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]), d.get("country") or "")
     async with write_lock:
@@ -701,28 +719,50 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
              0 if source == "paperform" else 1, source, submitted_name or None)).lastrowid
         if d.get("red_flag"):
             set_setting(f"red_flag:{rid}", "yes")
+    # Saved: the sender is answered now, and the Ops chat and the sheet are done
+    # just after. On a busy day either can take a while, and a slow answer made
+    # people press Send again.
+    sheet = source != "paperform"
     if not kind and not d.get("red_flag"):
         # On time: the sheet only, the Ops chat is for after the cut-off.
-        if source != "paperform":
-            await sync_to_sheet(rid)
+        in_background(deliver_request(bot, rid, post=False, sheet=sheet))
         return rid, "SHEET", kind
-    due = next_round(d.get("country") or "", created)
-    if due and kind != "URGENT" and not d.get("red_flag") and ops_target(d.get("country") or ""):
-        if source != "paperform":
-            await sync_to_sheet(rid)
+    country = d.get("country") or ""
+    due = next_round(country, created)
+    if due and kind != "URGENT" and not d.get("red_flag") and ops_target(country):
+        in_background(deliver_request(bot, rid, post=False, sheet=sheet))
         return rid, round_time(due), kind
-    posted = await post_to_ops(bot, rid)
-    if not posted:
+    in_background(deliver_request(bot, rid, post=True, sheet=sheet))
+    return rid, bool(ops_target(country)), kind
+
+
+_background: set = set()
+
+
+def in_background(coro) -> None:
+    """Run it on the bot's loop without waiting (kept referenced until done).
+    Sheet writes go this way: they queue (sheet_turn), and the bot answers
+    one tap at a time, so waiting on them would hold everyone up."""
+    task = asyncio.get_running_loop().create_task(coro)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def deliver_request(bot, rid: int, post: bool, sheet: bool) -> None:
+    if post and not await post_to_ops(bot, rid):
+        r = get_request(rid)
+        country = r["country"] or ""
+        why = (f"link their chat with /opschat {country} inside it" if not ops_target(country)
+               else "Telegram refused it. It's in /requests and the sheet")
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(
-                    admin, f"⚠️ Special request #{rid} ({d.get('country') or 'no country'}) couldn't "
-                    f"reach Ops: link their chat with /opschat {d.get('country') or ''} inside it.")
+                    admin, f"⚠️ Special request #{rid} ({country or 'no country'}) couldn't "
+                    f"reach Ops: {why}.")
             except Exception:
                 pass
-    if source != "paperform":
+    if sheet:
         await sync_to_sheet(rid)
-    return rid, posted, kind
 
 
 # --------------------------------------------------------------------------
@@ -760,7 +800,7 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await refresh_ops_message(context.bot, rid)
         await tell_sender(context.bot, r, f"🙋 <b>Ops are on {about(r)}.\n"
                                           f"<i>— {esc(display_name_of(uid, 'Ops'))}</i>")
-        await sync_to_sheet(rid)
+        in_background(sync_to_sheet(rid))
         return
     if action == "no":
         await query.answer()
@@ -790,7 +830,7 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         msg = (f"🚫 <b>Ops can't do {about(r)}\nReason: <b>{esc(CANT_NAMES.get(reason, reason))}</b>\n<i>— {who}</i>"
                "\n\nThey may add a note with more detail.")
     await tell_sender(context.bot, r, msg)
-    await sync_to_sheet(rid)
+    in_background(sync_to_sheet(rid))
 
 
 async def start_cant_reason(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
@@ -833,7 +873,7 @@ async def on_cant_reason_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     await refresh_ops_message(context.bot, rid)
     await tell_sender(context.bot, r, f"🚫 <b>Ops can't do {about(r)}\nReason: <b>{esc(text)}</b>\n"
                                       f"<i>— {esc(display_name_of(uid, 'Ops'))}</i>")
-    await sync_to_sheet(rid)
+    in_background(sync_to_sheet(rid))
     await update.message.reply_text(f"✅ Marked can't do, and {sender_name(r)} has been told why.")
     return ConversationHandler.END
 
