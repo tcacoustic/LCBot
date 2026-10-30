@@ -982,24 +982,7 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     async with write_lock:
-        run(
-            "UPDATE agents SET active=0, status='declined' WHERE user_id=?",
-            (row["user_id"],),
-        )
-        freed = 0
-        w = open_week() or latest_week()
-        if w:
-            cur = run(
-                """DELETE FROM signups WHERE user_id=? AND slot_id IN
-                   (SELECT s.id FROM slots s JOIN days d ON d.id=s.day_id
-                    WHERE d.week_id=?)""",
-                (row["user_id"], w["id"]),
-            )
-            freed = cur.rowcount
-            run(
-                "DELETE FROM confirmations WHERE week_id=? AND user_id=?",
-                (w["id"], row["user_id"]),
-            )
+        freed, week_id = remove_from_roster(row["user_id"])
 
     msg = f"Removed <b>{esc(row['name'])}</b> from the roster."
     if freed:
@@ -1009,8 +992,25 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     msg += "\n\n<i>Past weeks keep their history.</i>"
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-    if w:
-        await refresh_group(context, w["id"])
+    if week_id:
+        await refresh_group(context, week_id)
+
+
+def remove_from_roster(user_id: int) -> tuple:
+    """Off the bot, with any slots they held this week freed. Past weeks keep
+    their history. Returns (slots freed, the week's id or None)."""
+    run("UPDATE agents SET active=0, status='declined' WHERE user_id=?", (user_id,))
+    w = open_week() or latest_week()
+    if not w:
+        return 0, None
+    cur = run(
+        """DELETE FROM signups WHERE user_id=? AND slot_id IN
+           (SELECT s.id FROM slots s JOIN days d ON d.id=s.day_id
+            WHERE d.week_id=?)""",
+        (user_id, w["id"]),
+    )
+    run("DELETE FROM confirmations WHERE week_id=? AND user_id=?", (w["id"], user_id))
+    return cur.rowcount, w["id"]
 
 
 # --------------------------------------------------------------------------

@@ -3557,6 +3557,38 @@ MINIAPP_HTML = """<!DOCTYPE html>
     #app > h1 { padding-right:56px; }
   }
   .back { font-size:13px; font-weight:800; color:var(--accent); cursor:pointer; margin-bottom:10px; }
+  /* 🛡 Admin: left of 🔧 in the header band, scrolling with it. In admin mode the
+     band gets an orange stripe and an ADMIN label, and the pill takes you back. */
+  #admBtn { position:absolute; top:14px; right:150px; z-index:15; height:34px; padding:0 12px;
+    border-radius:17px; border:2px solid var(--accent); background:var(--ink); color:#fff; cursor:pointer;
+    display:flex; align-items:center; gap:6px; font-size:12px; font-weight:800; letter-spacing:.06em;
+    text-transform:uppercase; line-height:1; }
+  #admBtn.exit { background:var(--accent); }
+  body.has-adm #app > h1 { padding-right:270px; }
+  @media (max-width:520px) {
+    #admBtn { right:58px; }
+    body.has-adm #app > h1 { padding-right:170px; }
+  }
+  #app > .eyebrow { background:var(--ink); color:var(--accent); margin:0 -16px; padding:16px 16px 0;
+    font-size:12px; font-weight:800; letter-spacing:.1em; text-transform:uppercase; }
+  #app > .eyebrow + h1 { padding-top:2px; }
+  body.admin-mode #app > :first-child { border-top:6px solid var(--accent); }
+  #app > .back + .eyebrow { padding-top:4px; }
+  .p.wait { border-color:var(--accent); }
+  .duo { display:flex; gap:8px; margin-top:10px; }
+  .duo button { flex:1; min-height:44px; border-radius:6px; font-size:14px; font-weight:800; cursor:pointer; }
+  .duo .ok { background:var(--green); color:#fff; border:2px solid var(--green); }
+  .duo .no { background:var(--card); color:var(--ink); border:2px solid var(--line); }
+  .psearch input { width:100%; min-height:46px; border:2px solid #8A9099; border-radius:6px; padding:0 12px;
+    font:inherit; font-size:16px; margin-bottom:10px; background:#fff; }
+  .filt { display:flex; gap:6px; overflow-x:auto; margin-bottom:12px; padding-bottom:2px; }
+  .filt button { flex:0 0 auto; min-height:38px; padding:0 12px; border:2px solid var(--line); border-radius:6px;
+    background:var(--card); color:var(--ink); font-size:13px; font-weight:800; white-space:nowrap; cursor:pointer; }
+  .filt button.on { background:var(--ink); border-color:var(--ink); color:#fff; }
+  .pick button:has(.plogo) { display:inline-flex; align-items:center; justify-content:center; gap:5px; }
+  .pick button .plogo { height:16px; }
+  .p .t .plogo { height:14px; vertical-align:-2px; }
+  .big.danger { color:var(--red); border-color:var(--red); margin-top:20px; }
   .toast { position:fixed; left:16px; right:16px; bottom:84px; z-index:20; background:var(--ink);
     color:#fff; padding:12px 16px; border-radius:8px; font-size:14px; font-weight:700; text-align:center; }
 </style>
@@ -3597,7 +3629,8 @@ const ICONS = {
   hours: 'M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zM12 7v5l3 2',
   cases: 'M9 3h6v3H9zM7 4.5H5V21h14V4.5h-2M8 11h8M8 15h5',
   visits: 'M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zM12 8a2 2 0 1 0 0 4a2 2 0 1 0 0-4',
-  team: 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6'
+  team: 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6',
+  shield: 'M12 3l7 3v5c0 4.5-3 8.3-7 10c-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4'
 };
 function icon(path) {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
@@ -3618,10 +3651,12 @@ function caseTags(c, extra) {
 
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
-              ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'] };
+              ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'],
+              people: [ICONS.shield, 'People'] };
 let TAB_NAMES = {};
 function navBar() {
-  const tabs = TABS || ['home', 'week', 'me', 'ho'].concat(IS_ADMIN ? ['vis', 'team'] : []);
+  const tabs = ADMIN_MODE ? ADMIN_TABS
+    : TABS || ['home', 'week', 'me', 'ho'].concat(IS_ADMIN ? ['vis'] : []);
   if (tabs.length < 2) return '';
   return '<div class="nav-bar">'
     + tabs.filter(v => NAV[v]).map(v =>
@@ -3916,7 +3951,7 @@ function wire() {
     el.onclick = () => { AGENT = Number(el.dataset.agent); START = ''; render(); };
   });
   document.querySelectorAll('.nav-bar div').forEach(el => {
-    el.onclick = () => { VIEW = el.dataset.v; START = ''; AGENT = null; render(); };
+    el.onclick = () => { VIEW = el.dataset.v; START = ''; AGENT = PERSON = APPROVE = null; render(); };
   });
   document.querySelectorAll('.tab').forEach(el => {
     el.onclick = () => { VIEW = el.dataset.v; START = ''; render(); };
@@ -4732,7 +4767,7 @@ async function loadAgent() {
   const qs = '?id=' + AGENT + '&mode=' + MODE + (START ? '&start=' + START : '');
   const d = await getJSON('/api/agent' + qs);
 
-  let h = `<div class="back" id="toTeam">‹ Back to the team</div>`;
+  let h = `<div class="back" id="toTeam">‹ Back to the team</div>` + adminHead();
   h += `<h1>${esc(d.name)}</h1>`;
 
   h += '<div class="seg">'
@@ -4840,7 +4875,7 @@ async function loadTeam() {
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
 
-  let h = '<h1>Team</h1><div class="seg">'
+  let h = adminHead() + '<h1>Team</h1><div class="seg">'
     + `<div data-p="week" class="${MODE === 'week' ? 'on' : ''}">Week</div>`
     + `<div data-p="month" class="${MODE === 'month' ? 'on' : ''}">Month</div>`
     + '</div>';
@@ -5030,8 +5065,213 @@ function loadFeedback() {
   };
 }
 
+// 🛡 Admin: admins flip between their own App and the admin side (People, Team).
+let ADMIN_TABS = null, ADMIN_MODE = false;
+let PEOPLE = null, PERSON = null, APPROVE = null, P_TEAM = 'ALL', P_FIND = '';
+let AP = { teams: [], channels: [], country: '' };
+async function adminButton() {
+  if (ADMIN_TABS === null) {
+    ADMIN_TABS = [];
+    try { ADMIN_TABS = (await getJSON('/api/admin')).tabs || []; } catch (e) {}
+  }
+  let b = document.getElementById('admBtn');
+  if (!ADMIN_TABS.length) { if (b) b.remove(); document.body.classList.remove('has-adm'); return; }
+  if (!b) {
+    b = document.createElement('button');
+    b.id = 'admBtn'; b.type = 'button';
+    b.onclick = () => {
+      ADMIN_MODE = !ADMIN_MODE;
+      VIEW = ADMIN_MODE ? ADMIN_TABS[0] : ((TABS && TABS[0]) || 'home');
+      AGENT = PERSON = APPROVE = null; START = '';
+      window.scrollTo(0, 0); render();
+    };
+    document.body.appendChild(b);
+  }
+  document.body.classList.add('has-adm');
+  document.body.classList.toggle('admin-mode', ADMIN_MODE);
+  b.classList.toggle('exit', ADMIN_MODE);
+  b.setAttribute('aria-label', ADMIN_MODE ? 'Back to my App' : 'Admin');
+  b.innerHTML = ADMIN_MODE ? '<span aria-hidden="true">←</span><span>My App</span>'
+                           : '<span aria-hidden="true">🛡</span><span>Admin</span>';
+  b.style.display = VIEW === 'fb' ? 'none' : '';
+}
+function adminHead() { return ADMIN_MODE ? '<div class="eyebrow">Admin</div>' : ''; }
+function askSure(msg) {
+  return new Promise(ok => {
+    if (tg?.showConfirm) { try { tg.showConfirm(msg, ok); return; } catch (e) {} }
+    ok(window.confirm(msg));
+  });
+}
+const attr = s => esc(s).replace(/"/g, '&quot;');
+function teamName(k) { const t = (PEOPLE?.teams || []).find(x => x[0] === k); return t ? t[1] : k; }
+function chLabel(key, on) {
+  const c = (PEOPLE?.channels || []).find(x => x[0] === key);
+  if (!c) return esc(key);
+  const logos = key === 'TH' ? platformLogo('SHOPEE', on) + platformLogo('LAZADA', on)
+                             : platformLogo(CH_GROUP[key], on);
+  return `${c[1]} ${logos} ${esc(c[2])}`;
+}
+function pickRow(name, items, chosen) {
+  return '<div class="pick">' + items.map(([k, label]) =>
+    `<button data-${name}="${k}" class="${chosen.includes(k) ? 'on' : ''}">${label}</button>`).join('') + '</div>';
+}
+
+async function loadPeople() {
+  const app = document.getElementById('app');
+  PEOPLE = await getJSON('/api/admin/people');
+  if (APPROVE) return approveScreen();
+  if (PERSON) return personScreen();
+  const d = PEOPLE;
+  let h = adminHead() + '<h1>People</h1>';
+  if (d.pending.length) {
+    h += `<h2>Waiting for you · ${d.pending.length}</h2>`;
+    for (const p of d.pending) {
+      h += '<div class="p wait"><div class="ptop">'
+        + `<span class="pn">${esc(p.name)}</span><span class="t">${esc(p.today ? p.time : p.day)}</span></div>`
+        + `<div class="t">${p.username ? '@' + esc(p.username) + ' · ' : ''}started the bot ${esc(p.day)}`
+        + `${p.tgName ? ' · Telegram name: ' + esc(p.tgName) : ''}</div>`
+        + `<div class="duo"><button class="ok" data-approve="${p.id}">✅ Approve</button>`
+        + `<button class="no" data-decline="${p.id}">Decline</button></div></div>`;
+    }
+  }
+  const count = k => d.people.filter(p => k === 'ALL' || p.teams.includes(k)).length;
+  h += `<h2>Everyone · ${d.people.length}</h2>`;
+  h += `<div class="psearch"><input id="pFind" placeholder="Name or @username" value="${attr(P_FIND)}"></div>`;
+  h += '<div class="filt">' + [['ALL', 'All']].concat(d.teams).map(([k, n]) =>
+    `<button data-pteam="${k}" class="${P_TEAM === k ? 'on' : ''}">${esc(n)} ${count(k)}</button>`).join('') + '</div>';
+  h += '<div id="pList"></div>';
+  app.innerHTML = h + navBar();
+  wire();
+  drawPeople();
+  const f = document.getElementById('pFind');
+  f.oninput = () => { P_FIND = f.value; drawPeople(); };
+  document.querySelectorAll('[data-pteam]').forEach(el => el.onclick = () => {
+    P_TEAM = el.dataset.pteam;
+    document.querySelectorAll('[data-pteam]').forEach(x => x.classList.toggle('on', x === el));
+    drawPeople();
+  });
+  document.querySelectorAll('[data-approve]').forEach(el => el.onclick = () => {
+    APPROVE = Number(el.dataset.approve); AP = { teams: [], channels: [], country: '' };
+    window.scrollTo(0, 0); approveScreen();
+  });
+  document.querySelectorAll('[data-decline]').forEach(el => el.onclick = async () => {
+    const p = d.pending.find(x => x.id === Number(el.dataset.decline));
+    if (!await askSure(`Decline ${p.name}? They'll be told it wasn't approved.`)) return;
+    const out = await post('/api/admin/decline', { id: p.id });
+    toast(out.ok ? `${p.name} declined` : (out.error || 'Could not do that.'));
+    loadPeople();
+  });
+}
+function drawPeople() {
+  const box = document.getElementById('pList');
+  if (!box) return;
+  const find = P_FIND.trim().toLowerCase().replace(/^@/, '');
+  const list = PEOPLE.people.filter(p => (P_TEAM === 'ALL' || p.teams.includes(P_TEAM))
+    && (!find || p.name.toLowerCase().includes(find) || p.username.toLowerCase().includes(find)));
+  box.innerHTML = list.length ? list.map(p =>
+    `<div class="p tappable" data-person="${p.id}"><div class="ptop"><span class="pn">${esc(p.name)}</span>`
+    + (p.owner ? '<span class="tag amber">OWNER</span>' : p.admin ? '<span class="tag amber">ADMIN</span>' : '') + '</div>'
+    + '<div class="tags" style="margin-top:6px">' + p.teams.map(k => `<span class="tag">${esc(teamName(k).toUpperCase())}</span>`).join('') + '</div>'
+    + (p.channels.length ? '<div class="t">' + p.channels.map(k => chLabel(k, false)).join(' · ') + '</div>' : '')
+    + '</div>').join('') : '<div class="empty">No one matches.</div>';
+  box.querySelectorAll('[data-person]').forEach(el => el.onclick = () => {
+    PERSON = Number(el.dataset.person); window.scrollTo(0, 0); personScreen();
+  });
+}
+
+function teamExtras(teams, channels, country, d) {
+  let h = '';
+  if (teams.includes('ON') && d.canChannels) {
+    h += '<div class="fld"><label>Channels</label>'
+      + pickRow('ch', d.channels.map(([k]) => [k, chLabel(k, channels.includes(k))]), channels)
+      + '<div class="note">They get a DM for new cases and notes on these.</div></div>';
+  }
+  if (teams.includes('ONSITE') && d.canCountry) {
+    h += '<div class="fld"><label>Country they do visits in</label>'
+      + pickRow('cy', d.countries, country ? [country] : []) + '</div>';
+  }
+  return h;
+}
+
+function approveScreen() {
+  const app = document.getElementById('app');
+  const d = PEOPLE, p = d.pending.find(x => x.id === APPROVE);
+  if (!p) { APPROVE = null; return loadPeople(); }
+  let h = '<div class="back" id="pBack">‹ People</div>' + adminHead()
+    + `<h1>Approve ${esc(p.name)}</h1><div class="sub">${p.username ? '@' + esc(p.username) : 'no username'}</div>`;
+  h += '<div class="fld"><label>Which teams?</label>' + pickRow('tm', d.teams, AP.teams)
+    + '<div class="note">Pick one or more. You can change this later.</div></div>';
+  h += teamExtras(AP.teams, AP.channels, AP.country, d);
+  if (AP.teams.includes('FS')) h += '<div class="note">FS: they’ll be asked to pick their store.</div>';
+  h += '<button class="big" id="doApprove">Approve</button>'
+    + `<div class="note" style="text-align:center">${esc(p.name)} gets the ✅ welcome message straight away.</div>`;
+  app.innerHTML = h + navBar();
+  wire();
+  document.getElementById('pBack').onclick = () => { APPROVE = null; render(); };
+  const flip = (list, k) => list.includes(k) ? list.filter(x => x !== k) : list.concat(k);
+  document.querySelectorAll('[data-tm]').forEach(el => el.onclick = () => { AP.teams = flip(AP.teams, el.dataset.tm); approveScreen(); });
+  document.querySelectorAll('[data-ch]').forEach(el => el.onclick = () => { AP.channels = flip(AP.channels, el.dataset.ch); approveScreen(); });
+  document.querySelectorAll('[data-cy]').forEach(el => el.onclick = () => { AP.country = el.dataset.cy; approveScreen(); });
+  document.getElementById('doApprove').onclick = async (ev) => {
+    ev.target.disabled = true;
+    const out = await post('/api/admin/approve', { id: p.id, ...AP });
+    if (!out.ok) { ev.target.disabled = false; toast(out.error || 'Could not approve.'); return; }
+    toast(`${p.name} approved ✅`);
+    APPROVE = null; loadPeople();
+  };
+}
+
+function personScreen() {
+  const app = document.getElementById('app');
+  const d = PEOPLE, p = d.people.find(x => x.id === PERSON);
+  if (!p) { PERSON = null; return loadPeople(); }
+  let h = '<div class="back" id="pBack">‹ People</div>' + adminHead()
+    + `<h1>${esc(p.name)}</h1><div class="sub">${p.username ? '@' + esc(p.username) : 'no username'}`
+    + `${p.joined ? ' · joined ' + esc(p.joined) : ''}</div>`;
+  h += '<div class="fld"><label>Teams</label>' + pickRow('tm', d.teams, p.teams) + '</div>';
+  h += teamExtras(p.teams, p.channels, p.country, d);
+  if (p.store) h += `<div class="note">Store: <b>${esc(p.store)}</b> (they change it with /store)</div>`;
+  if (d.canRole && !p.owner) {
+    h += '<h2>Settings</h2><div class="row"><div class="lbl">Admin<small>Admin tools for their teams</small></div>'
+      + `<div class="sw${p.admin ? ' on' : ''}" id="pAdmin"><i></i></div></div>`;
+  }
+  h += '<h2>Name in the bot</h2><div class="nameedit">'
+    + `<input id="pName" value="${attr(p.name)}"><button id="pSaveName">Save</button></div>`;
+  if (!p.owner && p.id !== d.me) {
+    h += '<button class="big ghost danger" id="pRemove">Remove from the bot</button>'
+      + '<div class="note" style="text-align:center">Frees any slots they hold this week. Their history is kept.</div>';
+  }
+  app.innerHTML = h + navBar();
+  wire();
+  document.getElementById('pBack').onclick = () => { PERSON = null; render(); };
+  const save = async (field, value, said) => {
+    const out = await post('/api/admin/person', { id: p.id, field, value });
+    if (!out.ok) { toast(out.error || 'Could not change that.'); personScreen(); return false; }
+    if (out.person) Object.assign(p, out.person);
+    if (said) toast(said);
+    personScreen();
+    return out;
+  };
+  const flip = (list, k) => list.includes(k) ? list.filter(x => x !== k) : list.concat(k);
+  document.querySelectorAll('[data-tm]').forEach(el => el.onclick = () => save('teams', flip(p.teams, el.dataset.tm), 'Teams saved'));
+  document.querySelectorAll('[data-ch]').forEach(el => el.onclick = () => save('channels', flip(p.channels, el.dataset.ch), 'Channels saved'));
+  document.querySelectorAll('[data-cy]').forEach(el => el.onclick = () => save('country', el.dataset.cy, 'Country saved'));
+  const adm = document.getElementById('pAdmin');
+  if (adm) adm.onclick = () => save('admin', !p.admin, p.admin ? 'Admin removed' : 'Now an admin');
+  document.getElementById('pSaveName').onclick = () => save('name', document.getElementById('pName').value, 'Name saved');
+  const rm = document.getElementById('pRemove');
+  if (rm) rm.onclick = async () => {
+    if (!await askSure(`Remove ${p.name} from the bot? Any slots they hold this week are freed.`)) return;
+    const out = await post('/api/admin/person', { id: p.id, field: 'remove', value: true });
+    if (!out.ok) { toast(out.error || 'Could not remove them.'); return; }
+    toast(`${p.name} removed`);
+    PERSON = null; loadPeople();
+  };
+}
+
 async function render() {
   feedbackButton();
+  await adminButton();
   const fb = document.getElementById('fbBtn');
   if (fb) fb.style.display = VIEW === 'fb' ? 'none' : '';
   if (VIEW === 'fb') { loadFeedback(); return; }
@@ -5063,6 +5303,11 @@ async function render() {
   if (VIEW === 'team') {
     try { AGENT ? await loadAgent() : await loadTeam(); }
     catch (e) { showFatal('The team view would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'people') {
+    try { await loadPeople(); }
+    catch (e) { showFatal('People would not load', e.message || e); }
     return;
   }
   await load();
