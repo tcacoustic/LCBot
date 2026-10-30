@@ -5034,7 +5034,7 @@ function feedbackButton() {
 }
 function loadFeedback() {
   const app = document.getElementById('app');
-  const kinds = [['IDEA', 'Idea'], ['PROBLEM', 'Problem'], ['QUESTION', 'Question']];
+  const kinds = [['IDEA', 'Idea'], ['QUESTION', 'Question'], ['PROBLEM', 'Problem']];
   let h = '<div class="back" id="fbBack">‹ Back</div><h1>Feedback</h1>'
     + '<div class="sub">Goes straight to the bot’s owner</div>';
   h += '<div class="fld"><label>What is it?</label><div class="pick">' + kinds.map(([k, n]) =>
