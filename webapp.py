@@ -6,7 +6,7 @@ Part of the LC avails bot. Shared helpers live in core.py.
 from core import *  # noqa: F401,F403
 from onsite import *  # noqa: F401,F403
 from ops import may_request, my_requests, ops_home, request_form_payload, web_request_add
-from people import send_feedback
+from people import channels_text, remove_from_roster, send_feedback, welcome_to_team
 
 async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open the hours summary."""
@@ -219,9 +219,7 @@ def app_tabs(user_id: int) -> list:
         tabs.add("vis")
     if admin_for(user_id, "SH", "FS", "ONSITE"):
         tabs.add("vis")
-    if admin_for(user_id, "LIVECHAT"):
-        tabs.add("team")
-    return [t for t in TAB_ORDER if t in tabs]
+    return [t for t in TAB_ORDER if t in tabs]   # Team is in 🛡 Admin (admin_tabs)
 
 
 def tab_names(user_id: int) -> dict:
@@ -1008,6 +1006,222 @@ def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
     return {"ok": True, "field": field, "value": want}
 
 
+# --------------------------------------------------------------------------
+# 🛡 Admin in the App: People (sign-ups, teams, channels, admin) and Team.
+# The same rules as the commands: any admin approves and sets teams, Online
+# admins set channels, On-Site admins set the country, only an owner makes admins.
+# --------------------------------------------------------------------------
+
+ADMIN_POSTS = {"/api/admin/approve", "/api/admin/decline", "/api/admin/person"}
+
+
+def admin_tabs(user_id: int) -> list:
+    if not is_admin(user_id):
+        return []
+    return ["people"] + (["team"] if admin_for(user_id, "LIVECHAT") else [])
+
+
+def teams_of(user_id: int) -> list:
+    """Someone's own teams (not what the owner is viewing as)."""
+    have = {r["dept"] for r in q("SELECT dept FROM memberships WHERE user_id=?", (user_id,))}
+    return [k for k, _ in DEPARTMENTS if k in have]
+
+
+def person_dict(r) -> dict:
+    uid = r["user_id"]
+    teams = teams_of(uid)
+    return {
+        "id": uid, "name": r["display_name"] or r["name"] or "", "username": r["username"] or "",
+        "teams": teams, "admin": bool(is_owner(uid) or r["role"] == "admin"), "owner": is_owner(uid),
+        "channels": online_channels(uid) if "ON" in teams else [],
+        "country": (r["country"] or "") if "ONSITE" in teams else "",
+        "store": store_of(uid) if "FS" in teams else "",
+        "joined": datetime.fromisoformat(r["requested_at"]).strftime("%a %-d %b")
+                  if r["requested_at"] else "",
+    }
+
+
+def admin_people_payload(user_id: int) -> dict:
+    pending = []
+    for r in q("SELECT * FROM agents WHERE status='pending' ORDER BY requested_at DESC"):
+        at = datetime.fromisoformat(r["requested_at"]) if r["requested_at"] else None
+        pending.append({
+            "id": r["user_id"], "name": r["display_name"] or r["name"] or "",
+            "username": r["username"] or "",
+            "tgName": r["name"] if (r["name"] or "").lower() != (r["display_name"] or "").lower() else "",
+            "day": at.strftime("%a %-d %b") if at else "",
+            "time": at.strftime("%-I:%M%p").lower() if at else "",
+            "today": bool(at and at.date() == now().date()),
+        })
+    people = [person_dict(r) for r in q(
+        "SELECT * FROM agents WHERE status='active' AND active=1 "
+        "ORDER BY lower(COALESCE(display_name, name))")]
+    return {
+        "pending": pending, "people": people,
+        "teams": [[k, "Online" if k == "ON" else n] for k, n in DEPARTMENTS],
+        "channels": [[k, f, n] for k, f, n in CHANNELS],
+        "countries": [[c, f"{flag} {name}"] for c, flag, name, _ in COUNTRIES],
+        "canChannels": admin_for(user_id, "ON"), "canCountry": admin_for(user_id, "ONSITE"),
+        "canRole": is_owner(user_id), "me": user_id,
+    }
+
+
+def save_teams(uid: int, want: list) -> None:
+    """Teams, as the team picker saves them: joining Livechat puts them on the
+    avails and shift calls; leaving Online clears their channels."""
+    had = teams_of(uid)
+    set_depts(uid, want)
+    if "LIVECHAT" in want and "LIVECHAT" not in had:
+        run("UPDATE agents SET on_avails=1, tag_calls=1 WHERE user_id=?", (uid,))
+    if "ON" in want and "ON" not in had:
+        run("UPDATE agents SET channels=COALESCE(channels, '[]') WHERE user_id=?", (uid,))
+    if "ON" not in want and "ON" in had:
+        run("UPDATE agents SET channels=NULL WHERE user_id=?", (uid,))
+
+
+def clean_list(value, allowed) -> list:
+    return [x for x in allowed if isinstance(value, list) and x in value]
+
+
+def web_admin_approve(admin_id: int, body: dict) -> dict:
+    try:
+        uid = int(body.get("id", 0))
+    except (TypeError, ValueError):
+        uid = 0
+    row = q1("SELECT * FROM agents WHERE user_id=?", (uid,))
+    if not row:
+        return {"ok": False, "error": "That request no longer exists."}
+    if row["status"] != "pending":
+        return {"ok": False, "error": f"Already handled: they're {row['status']}."}
+    teams = clean_list(body.get("teams"), [k for k, _ in DEPARTMENTS])
+    if not teams:
+        return {"ok": False, "error": "Pick at least one team."}
+    channels = clean_list(body.get("channels"), [k for k, _, _ in CHANNELS])
+    country = str(body.get("country") or "")
+    if "ON" in teams and not admin_for(admin_id, "ON"):
+        channels = []
+    if "ONSITE" in teams and admin_for(admin_id, "ONSITE") and country not in COUNTRY_NAMES:
+        return {"ok": False, "error": "Pick the country they do visits in."}
+    run("UPDATE agents SET status='active', decided_by=?, decided_at=? WHERE user_id=?",
+        (admin_id, now().isoformat(), uid))
+    save_teams(uid, teams)
+    if "ON" in teams:
+        run("UPDATE agents SET channels=? WHERE user_id=?", (json.dumps(channels), uid))
+    if "ONSITE" in teams and admin_for(admin_id, "ONSITE"):
+        run("UPDATE agents SET country=? WHERE user_id=?", (country, uid))
+    log.info("%s approved %s in the App: %s", admin_id, uid, teams)
+    on_bot_loop(after_access(bot_ref(), row, admin_id, True), timeout=20)
+    return {"ok": True}
+
+
+def web_admin_decline(admin_id: int, body: dict) -> dict:
+    try:
+        uid = int(body.get("id", 0))
+    except (TypeError, ValueError):
+        uid = 0
+    row = q1("SELECT * FROM agents WHERE user_id=?", (uid,))
+    if not row or row["status"] != "pending":
+        return {"ok": False, "error": "That request was already handled."}
+    run("UPDATE agents SET status='declined', decided_by=?, decided_at=? WHERE user_id=?",
+        (admin_id, now().isoformat(), uid))
+    log.info("%s declined %s in the App", admin_id, uid)
+    on_bot_loop(after_access(bot_ref(), row, admin_id, False), timeout=20)
+    return {"ok": True}
+
+
+async def after_access(bot, row, admin_id: int, approve: bool) -> None:
+    """The Telegram side of a decision made in the App: the request messages
+    the admins got say who decided, and the person is told."""
+    uid = row["user_id"]
+    shown = row["display_name"] or row["name"]
+    verdict = "approved ✅" if approve else "declined 🚫"
+    try:
+        sent = json.loads(row["req_msgs"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        sent = []
+    if sent:
+        await settle_admin_messages(
+            bot, sent, f"🔔 <b>Access request</b>\n\n<b>{esc(shown)}</b>\n\n"
+                       f"{verdict} by {esc(display_name_of(admin_id, 'an admin'))} in the App")
+    if not approve:
+        try:
+            await bot.send_message(uid, "Your access request wasn't approved. "
+                                        "Please speak to your manager if you think that's a mistake.")
+        except Exception:
+            pass
+        return
+    await welcome_to_team(bot, uid)
+    teams = teams_of(uid)
+    if "ON" in teams:
+        try:
+            await bot.send_message(uid, f"You're set up for: {channels_text(uid)}.\n\n"
+                                        "The App shows those first.")
+        except Exception:
+            pass
+    if "FS" in teams:
+        await ask_store(bot, uid, uid)
+
+
+def web_admin_person(admin_id: int, body: dict) -> dict:
+    """One change to one person: teams, channels, country, admin, name, remove."""
+    try:
+        uid = int(body.get("id", 0))
+    except (TypeError, ValueError):
+        uid = 0
+    row = q1("SELECT * FROM agents WHERE user_id=? AND status='active'", (uid,))
+    if not row:
+        return {"ok": False, "error": "That person isn't on the list any more."}
+    field, value = str(body.get("field") or ""), body.get("value")
+    menus = False
+    if field == "teams":
+        teams = clean_list(value, [k for k, _ in DEPARTMENTS])
+        if not teams:
+            return {"ok": False, "error": "Keep at least one team. To take them off the bot, use Remove."}
+        if ("ON" in teams) != ("ON" in teams_of(uid)) and not admin_for(admin_id, "ON"):
+            return {"ok": False, "error": "Only Online admins add or remove the Online team."}
+        save_teams(uid, teams)
+        menus = True
+    elif field == "channels":
+        if not admin_for(admin_id, "ON"):
+            return {"ok": False, "error": "Only Online admins change channels."}
+        run("UPDATE agents SET channels=? WHERE user_id=?",
+            (json.dumps(clean_list(value, [k for k, _, _ in CHANNELS])), uid))
+    elif field == "country":
+        if not admin_for(admin_id, "ONSITE") or value not in COUNTRY_NAMES:
+            return {"ok": False, "error": "Only On-Site admins set the country."}
+        run("UPDATE agents SET country=? WHERE user_id=?", (value, uid))
+    elif field == "admin":
+        if not is_owner(admin_id):
+            return {"ok": False, "error": "Only the owner makes or removes admins."}
+        if is_owner(uid):
+            return {"ok": False, "error": "The owner is set in the bot's settings, not here."}
+        run("UPDATE agents SET role=? WHERE user_id=?", ("admin" if value else "agent", uid))
+        menus = True
+        if value:
+            on_bot_loop(bot_ref().send_message(
+                uid, "You've been given admin rights. Send /help to see what's new."))
+    elif field == "name":
+        nm = " ".join(str(value or "").split())
+        if not 2 <= len(nm) <= 40:
+            return {"ok": False, "error": "Give a name between 2 and 40 characters."}
+        run("UPDATE agents SET display_name=? WHERE user_id=?", (nm, uid))
+        run("UPDATE signups SET name=? WHERE user_id=?", (nm, uid))
+    elif field == "remove":
+        if is_owner(uid) or uid == admin_id:
+            return {"ok": False, "error": "You can't remove yourself or the owner."}
+        freed, week_id = remove_from_roster(uid)
+        log.info("%s removed %s in the App (%s slots freed)", admin_id, uid, freed)
+        if week_id:
+            on_bot_loop(refresh_group(bot_ref(), week_id))
+        return {"ok": True, "removed": True, "freed": freed}
+    else:
+        return {"ok": False, "error": "Unknown setting."}
+    log.info("%s set %s for %s in the App", admin_id, field, uid)
+    if menus:
+        on_bot_loop(refresh_menu_for(bot_ref(), uid))
+    return {"ok": True, "person": person_dict(q1("SELECT * FROM agents WHERE user_id=?", (uid,)))}
+
+
 def web_has_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -1058,7 +1272,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/") and path not in ("/api/handover", "/api/home",
                                                      "/api/visits", "/api/cases/search",
-                                                     "/api/requests"):
+                                                     "/api/requests", "/api/admin",
+                                                     "/api/admin/people"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
@@ -1264,6 +1479,29 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return
+        if path in ("/api/admin", "/api/admin/people"):
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                if path == "/api/admin":
+                    self._send(200, json.dumps({"tabs": admin_tabs(uid)}).encode())
+                elif not is_admin(uid):
+                    self._send(403, b'{"error":"admins only"}')
+                else:
+                    self._send(200, json.dumps(admin_people_payload(uid)).encode())
+            except Exception as e:
+                log.warning("Admin view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
         if path == "/api/me":
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
@@ -1324,7 +1562,10 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if not web_has_access(uid):
             self._send(403, b'{"error":"no access"}')
             return
-        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | {"/api/feedback"} \
+        if path in ADMIN_POSTS and not is_admin(uid):
+            self._send(403, b'{"error":"admins only"}')
+            return
+        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | ADMIN_POSTS | {"/api/feedback"} \
                 and not (path == "/api/handover/post" and may_post_handover(uid)):
             self._send(403, b'{"error":"online team: handover only"}')
             return
@@ -1356,6 +1597,12 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = (web_agent_set(uid, who, str(body.get("field", "")),
                                  body.get("value"))
                    if who else {"ok": False, "error": "No agent given."})
+        elif path == "/api/admin/approve":
+            out = web_admin_approve(uid, body if isinstance(body, dict) else {})
+        elif path == "/api/admin/decline":
+            out = web_admin_decline(uid, body if isinstance(body, dict) else {})
+        elif path == "/api/admin/person":
+            out = web_admin_person(uid, body if isinstance(body, dict) else {})
         elif path == "/api/case":
             out = web_case_add(uid, body if isinstance(body, dict) else {})
         elif path == "/api/case/toggle":
