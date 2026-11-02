@@ -1113,23 +1113,27 @@ def pay_summary(user_id: int, first: date) -> dict:
 def pay_payload(user_id: int, month: str = "") -> dict:
     first, label, prev, nxt, current = month_bounds(month)
     s = pay_summary(user_id, first)
-    each = s["rate"]
-    counted = [{"day": datetime.fromisoformat(v["left_at"]).strftime("%a %-d %b"),
-                "type": VISIT_NAMES[v["visit_type"]],
-                "outcome": OUTCOME_NAMES.get(v["outcome"], "Completed"), "amount": each or "—"}
+    counted = [{**pay_visit(v), "outcome": OUTCOME_NAMES.get(v["outcome"], "Completed")}
                for v in s["rows"]]
     cancelled = q("SELECT * FROM appointments WHERE specialist_id=? AND status='CANCELLED'"
                   " AND substr(starts_at,1,7)=? ORDER BY starts_at DESC",
                   (user_id, first.strftime("%Y-%m")))
     return {
         "label": label, "prev": prev, "next": nxt, "hasNext": not current,
-        "count": s["count"], "total": s["total"], "rate": each,
+        "count": s["count"], "total": s["total"],
         "resolved": sum(1 for v in s["rows"] if v["outcome"] == "RESOLVED"),
         "followup": sum(1 for v in s["rows"] if v["outcome"] in ("RETURN", "REPLACE")),
         "counted": counted,
-        "notCounted": [{"day": span_of(v)[0].strftime("%a %-d %b"), "type": VISIT_NAMES[v["visit_type"]],
-                        "outcome": "Cancelled", "amount": "—"} for v in cancelled],
+        "notCounted": [{**pay_visit(v), "outcome": "Cancelled"} for v in cancelled],
     }
+
+
+def pay_visit(v) -> dict:
+    """A visit on the Pay tab: when, what, who and where (no amount per visit)."""
+    start = span_of(v)[0]
+    return {"day": start.strftime("%a %-d %b"), "time": start.strftime("%H:%M"),
+            "type": VISIT_NAMES[v["visit_type"]], "customer": v["customer_name"],
+            "address": v["address"], "product": v["product"] or ""}
 
 
 def onsite_team_payload(month: str = "") -> dict:
