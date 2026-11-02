@@ -296,7 +296,8 @@ def team_home_payload(user_id: int) -> dict:
                   "day": span_of(nxt)[0].strftime("%a %-d %b")} if nxt else None,
             todayVisits=[visit_item(r, "specialist") for r in todays],
             weekVisits=len(rows),
-            pay={**{k: v for k, v in pay_summary(user_id, today.replace(day=1)).items() if k != "rows"},
+            pay={**{k: v for k, v in pay_summary(user_id, today.replace(day=1)).items()
+                    if k in ("count", "total")},
                  "label": today.strftime("%B") + " so far"},
             notFree=[date.fromisoformat(b["starts_at"][:10]).strftime("%a %-d %b") + " "
                      + parts.get(b["part"], b["part"]) for b in blocks])

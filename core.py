@@ -3838,7 +3838,7 @@ function renderTeamHome(d) {
     if (d.pay) h += '<div class="p tappable paycard" data-gopay="1"><div class="ptop"><div>'
        + `<div class="k">${esc(d.pay.label)}</div><div class="v">${esc(d.pay.total || plural(d.pay.count, 'visit'))}</div></div>`
        + '<div class="t">›</div></div>'
-       + `<div class="t">${esc(plural(d.pay.count, 'visit'))}${d.pay.rate ? ' · ' + esc(d.pay.rate) + ' each' : ''} · see Pay</div></div>`;
+       + `<div class="t">${esc(plural(d.pay.count, 'visit'))} · see Pay</div></div>`;
     h += cards([[d.todayVisits.length, 'Visits today'], [d.weekVisits, 'This week']]);
     if (d.todayVisits.length) h += '<h2>Today</h2>' + d.todayVisits.map(v => visitRow({ ...v, specialist: '' })).join('');
     h += '<div class="note">At the visit, send /visits to the bot to tap 📍 Arrived and 🏁 Leave.</div>';
@@ -5091,15 +5091,18 @@ function wireMonthNav(go) {
 async function loadPay() {
   const app = document.getElementById('app');
   const d = await getJSON('/api/pay' + (PAY_MONTH ? '?month=' + PAY_MONTH : ''));
-  const row = (v, counts) => `<div class="p${counts ? '' : ' quiet'}"><div class="ptop"><div class="pn">${esc(v.day)}</div>`
-    + `<div class="pp">${esc(v.amount)}</div></div><div class="t">${esc(v.type)} · ${esc(v.outcome)}</div></div>`;
+  const row = (v, counts) => `<div class="p${counts ? '' : ' quiet'}"><div class="ptop"><div class="pn">${esc(v.day)} · ${esc(v.time)}</div>`
+    + `<div class="t">${esc(v.type)}</div></div>`
+    + `<div class="t">${esc(v.customer)} · ${esc(v.address)}</div>`
+    + (v.product ? `<div class="t">${esc(v.product)}</div>` : '')
+    + `<div class="t"><b>${esc(v.outcome)}</b></div></div>`;
   let h = '<h1>Pay</h1><div class="sub">Paid per visit</div>' + monthNav(d);
   h += '<div class="cards">'
     + `<div class="card pay wide"><div class="n">${esc(d.total || (d.count + ' visit' + (d.count === 1 ? '' : 's')))}</div>`
-    + `<div class="l">${d.rate ? d.count + ' visit' + (d.count === 1 ? '' : 's') + ' × ' + esc(d.rate) : 'Rate not set yet: ask an admin'}</div></div>`
-    + `<div class="card"><div class="n">${d.resolved}</div><div class="l">Resolved</div></div>`
-    + `<div class="card"><div class="n">${d.followup}</div><div class="l">Follow-up needed</div></div></div>`;
-  h += d.counted.length ? '<h2>Visits that count</h2>' + d.counted.map(v => row(v, true)).join('')
+    + `<div class="l">${d.total ? 'Total pay' : 'Pay not set yet: ask an admin'}</div></div>`
+    + `<div class="card"><div class="n">${d.count}</div><div class="l">Visits</div></div>`
+    + `<div class="card"><div class="n">${d.resolved}</div><div class="l">Resolved</div></div></div>`;
+  h += d.counted.length ? '<h2>Your visits</h2>' + d.counted.map(v => row(v, true)).join('')
                         : '<div class="empty">No finished visits this month yet.</div>';
   if (d.notCounted.length) h += '<h2>Not counted</h2>' + d.notCounted.map(v => row(v, false)).join('');
   h += '<div class="note">A visit counts once you tap 🏁 Leave. Wrong? Tap 🔧 and tell us which visit.</div>';
