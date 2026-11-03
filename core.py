@@ -4037,20 +4037,32 @@ function caseForm(d) {
     + d.priorities.map(p =>
         `<button data-f="prio" data-v="${p.emoji}" class="${f.prio === p.emoji ? 'on' : ''}">${p.emoji} ${esc(p.name)}</button>`
       ).join('') + '</div></div>';
-  h += '<div class="fld"><label>Where from</label><div class="pick">'
-    + d.platforms.map(p =>
-        `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">${esc(p)}</button>`
-      ).join('') + '</div></div>';
-  const storeList = f.platform === 'LIVECHAT' ? d.webstores : d.stores;
-  if (f.platform) {
+  // SH and Livechat say where the chat came from (Duoke or Livechat). The Online
+  // team don't use those tools: they pick from their own channels' stores.
+  let storeList;
+  if (req) {
+    const all = d.stores.map(s => ({ ...s, platform: 'DUOKE' }))
+      .concat(d.webstores.map(s => ({ ...s, platform: 'LIVECHAT' })));
+    const mine = d.myChannels || [];
+    storeList = mine.length ? all.filter(s => mine.includes(s.key)) : all;
+    if (storeList.length === 1 && !f.store) f.store = storeList[0].store;
+  } else {
+    h += '<div class="fld"><label>Where from</label><div class="pick">'
+      + d.platforms.map(p =>
+          `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">${esc(p)}</button>`
+        ).join('') + '</div></div>';
+    storeList = f.platform === 'LIVECHAT' ? d.webstores : d.stores;
+  }
+  if (req || f.platform) {
     h += '<div class="fld"><label>Store</label><select id="store">'
       + '<option value="">Pick one…</option>'
       + storeList.map(s =>
-          `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)}${esc(s.store)} · ${esc(s.channel)}</option>`
+          `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)} ${esc(req ? s.channel.replace(/^\S+\s/, '') + ' · ' + s.store : s.store + ' · ' + s.channel)}</option>`
         ).join('') + '</select></div>';
   }
   const long = { happened: 1, done: 1, need: 1 };
   const picked = storeList.find(s => s.store === f.store);
+  if (req && picked) f.platform = picked.platform;   // the server files it by Duoke/Livechat
   for (const fd of d.fields) {
     const v = esc(f[fd.key] || '');
     let eg = (req && fd.key in d.request.examples) ? d.request.examples[fd.key] : fd.example;
