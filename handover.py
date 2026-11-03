@@ -886,7 +886,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             close_case(case_id, uid, side="on")
         await refresh_case_post(context.bot, case_id)
         await query.answer("Closed on the Online side ✓")
-    elif action == "s" and not is_online(uid):
+    elif action == "s" and not online_view(uid):
         async with write_lock:
             close_case(case_id, uid, side="sh")
         await refresh_case_post(context.bot, case_id)
@@ -1009,7 +1009,7 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["case_note"] = (action, case_id)
         await update.message.reply_text("Type a few words, or /cancel.")
         return CASE_NOTE
-    side = "on" if is_online(uid) else "sh"
+    side = "on" if online_view(uid) else "sh"
     async with write_lock:
         if action == "h":
             hand_back_case(case_id, uid, note)
@@ -1115,7 +1115,7 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("That case is already closed.")
         await refresh_case_post(context.bot, case_id)
         return
-    side = "on" if is_online(uid) else "sh"
+    side = "on" if online_view(uid) else "sh"
     if r[f"{side}_closed"]:
         other = "SH" if side == "on" else "Online"
         await query.answer(f"Already closed on your side — waiting on {other}.",
@@ -1141,7 +1141,7 @@ async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not r:
         await query.answer("That case is gone.")
         return
-    side = "on" if is_online(uid) else "sh"
+    side = "on" if online_view(uid) else "sh"
     if not r[f"{side}_closed"]:
         other = "SH" if side == "on" else "Online"
         where = "Cases → Close (Online)" if side == "on" else "Handover (untick it)"
