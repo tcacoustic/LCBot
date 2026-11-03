@@ -822,7 +822,7 @@ def web_case_note(user_id: int, case_id: int, note: str) -> dict:
     row = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
     if not row:
         return {"ok": False, "error": "That case is gone."}
-    log_case(case_id, user_id, "on" if is_online(user_id) else "sh", "note", note[:500])
+    log_case(case_id, user_id, "on" if online_view(user_id) else "sh", "note", note[:500])
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
     on_bot_loop(notify_reply(bot_ref(), case_id, user_id, note=note[:500]))
     return {"ok": True, "username": row["username"]}
@@ -833,7 +833,7 @@ def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
     if not row:
         return {"ok": False, "error": "That case is gone."}
     if close:
-        close_case(case_id, user_id, "on" if is_online(user_id) else "sh")
+        close_case(case_id, user_id, "on" if online_view(user_id) else "sh")
     else:
         reopen_case(case_id, user_id)
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
