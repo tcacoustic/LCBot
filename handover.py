@@ -766,7 +766,8 @@ CASES_PER_PAGE = 15
 
 def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     mine = set(online_channels(user_id))
-    rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    info = info_only_ids()
+    rows = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id") if r["id"] not in info]
     own = [r for r in rows if r["channel"] in mine]
     rest = [r for r in rows if r["channel"] not in mine]
     new_btn = ([[InlineKeyboardButton("➕ New Online request", callback_data="cs:new")]]

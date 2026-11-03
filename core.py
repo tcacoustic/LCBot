@@ -2233,6 +2233,17 @@ def online_covers(channel: str | None) -> bool:
     return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
 
 
+def is_info_only(case_id: int) -> bool:
+    """SH said Online doesn't need to do anything: it went to TC Online only,
+    and SH's close is enough. Kept in settings, not a new column."""
+    return setting(f"case_info:{case_id}") == "1"
+
+
+def info_only_ids() -> set:
+    return {int(r["key"].split(":")[1])
+            for r in q("SELECT key FROM settings WHERE key LIKE 'case_info:%' AND value='1'")}
+
+
 def log_case(case_id: int, user_id: int | None, side: str, action: str,
              note: str = "") -> None:
     run("INSERT INTO case_log (case_id, user_id, side, action, note, created_at)"
@@ -2295,7 +2306,7 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
     log_case(case_id, user_id, side, "closed")
     row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if row and row["sh_closed"] and (
-        row["on_closed"] or not online_covers(row["channel"])
+        row["on_closed"] or not online_covers(row["channel"]) or is_info_only(case_id)
     ):
         run(
             "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
@@ -2545,6 +2556,20 @@ async def post_case_now(bot, case_id: int, agent_id: int) -> bool:
     sent = bool(await send_channel_post(bot, r["channel"], [r], agent_id, kind="case"))
     await notify_pms(bot, agent_id)
     return sent
+
+
+async def post_info_case(bot, case_id: int, agent_id: int) -> bool:
+    """A case Online doesn't need to act on: TC Online only, never the store
+    chat, and no PM DM."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return False
+    who = display_name_of(agent_id, "")
+    return await post_ops(
+        bot, f"ℹ️ For your info · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
+             f"{now().strftime('%a %-d %b')}" + (f" · from {who}" if who else "") + "\n\n"
+             + render_case(case_row_to_dict(r))
+             + "\n\nNothing needed from Online. SH will close it.")
 
 
 async def post_request(bot, case_id: int, pm_id: int) -> bool:
@@ -3372,6 +3397,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:4px; background:var(--ink); }
   .tag.red { background:var(--red); } .tag.amber { background:var(--amber); }
   .tag.green { background:var(--green); } .tag.blue { background:var(--blue); }
+  .tag.grey { background:var(--soft); }
 
   .cards { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:16px; }
   .card { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; }
@@ -3985,7 +4011,8 @@ function caseCard(c, closed) {
   h += `<div class="tick${ticked ? '' : ' on'}" data-id="${c.id}" `
      + `data-close="${ticked ? '0' : '1'}">${ticked ? '' : '✓'}</div>`;
   h += '<div style="flex:1">';
-  h += caseTags(c, c.handedBack ? [['HANDED BACK', '']] : (c.request && !c.shClosed) ? [['ONLINE REQUEST', 'blue']] : []);
+  h += caseTags(c, c.handedBack ? [['HANDED BACK', '']] : (c.request && !c.shClosed) ? [['ONLINE REQUEST', 'blue']]
+    : c.infoOnly ? [['INFO ONLY', 'grey']] : []);
   h += `<div class="nm">${esc(c.username)}</div>`;
   const bits = [];
   if (c.channelName) bits.push(esc(c.channelName));
@@ -4001,6 +4028,7 @@ function caseCard(c, closed) {
   h += `<div class="meta">${bits.join(' · ')}</div>`;
   if (c.request && !c.shClosed && !c.handedBack) h += `<div class="st">From ${esc(c.request)} (Online)</div>`;
   else if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  else if (c.infoOnly && !closed) h += '<div class="st" style="color:var(--muted)">TC Online only · SH closes it</div>';
   h += '</div></div>';
   if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
   if (HO_SHOWN[c.id]) {
@@ -4062,6 +4090,17 @@ function caseForm(d) {
   }
   const long = { happened: 1, done: 1, need: 1 };
   const picked = storeList.find(s => s.store === f.store);
+  if (!req && f.platform) {
+    // "No" skips the store chat: TC Online only, and SH’s untick closes it.
+    const no = f.online === 'no';
+    h += '<div class="fld"><label>Does Online need to do anything?</label><div class="pick">'
+      + `<button data-f="online" data-v="yes" class="${no ? '' : 'on'}">Yes</button>`
+      + `<button data-f="online" data-v="no" class="${no ? 'on' : ''}">No</button>`
+      + '</div>';
+    h += '<div class="note" style="margin-top:4px">' + (no
+      ? 'Goes to TC Online only' + (picked ? ', not the ' + esc(picked.channel) + ' chat' : '') + '. Your untick closes it.'
+      : 'Goes to the store chat. The PM closes it too.') + '</div></div>';
+  }
   if (req && picked) f.platform = picked.platform;   // the server files it by Duoke/Livechat
   for (const fd of d.fields) {
     const v = esc(f[fd.key] || '');

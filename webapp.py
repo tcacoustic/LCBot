@@ -303,8 +303,9 @@ def team_home_payload(user_id: int) -> dict:
                      + parts.get(b["part"], b["part"]) for b in blocks])
     elif kind == "ON":
         mine = online_channels(user_id)
+        info = info_only_ids()
         running = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 AND on_closed=0 ORDER BY id")
-                   if r["channel"] in mine]
+                   if r["channel"] in mine and r["id"] not in info]
         out.update(
             channels=[{"key": key, "name": f"{name}", "n": sum(1 for r in running if r["channel"] == key)}
                       for key, _, name in CHANNELS if key in mine],
@@ -632,6 +633,7 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
         "shClosed": bool(r["sh_closed"]),
         "onClosed": bool(r["on_closed"]),
         "handedBack": bool(r["handed_back"]),
+        "infoOnly": is_info_only(r["id"]),
         "waiting": (not closed) and bool(r["sh_closed"] or r["on_closed"]
                                          or r["handed_back"] or r["origin"] == "on"),
         "status": case_status_line(r),
@@ -666,6 +668,9 @@ def handover_payload(user_id: int) -> dict:
     """Open cases, recently closed ones, and the pickers for a new case."""
     today = now().date()
     open_rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    if online_view(user_id):
+        info = info_only_ids()
+        open_rows = [r for r in open_rows if r["id"] not in info]
     closed_rows = q(
         "SELECT * FROM ho_cases WHERE closed=1 ORDER BY closed_at DESC LIMIT 12"
     )
@@ -871,6 +876,11 @@ def web_case_add(user_id: int, c: dict) -> dict:
         sent = bool(on_bot_loop(post_request(bot_ref(), cid, user_id), timeout=30))
         return {"ok": True, "username": d["username"], "request": True, "sent": sent}
     cid = insert_case(user_id, d, now().date())
+    if c.get("online") == "no":
+        set_setting(f"case_info:{cid}", "1")
+        run("UPDATE ho_cases SET chat_posted=1, pm_notified=1 WHERE id=?", (cid,))
+        sent = bool(on_bot_loop(post_info_case(bot_ref(), cid, user_id), timeout=30))
+        return {"ok": True, "username": d["username"], "sent": sent, "chat": "TC Online"}
     sent = bool(on_bot_loop(post_case_now(bot_ref(), cid, user_id), timeout=30))
     return {"ok": True, "username": d["username"], "sent": sent,
             "chat": CHANNEL_NAMES.get(d["channel"] or "", "")}
