@@ -672,7 +672,7 @@ def handover_payload(user_id: int) -> dict:
         "myChannels": online_channels(user_id),
         "openCases": [case_shape(r, today) for r in open_rows],
         "closedCases": [case_shape(r, today, True) for r in closed_rows],
-        "stores": [{"flag": f, "store": st,
+        "stores": [{"flag": f, "store": st, "key": STORE_CHANNEL.get(st, ""),
                     "channel": CHANNEL_NAMES.get(STORE_CHANNEL.get(st, ""), ""),
                     "orderExample": case_example("order_no", "DUOKE", st)}
                    for f, st in STORES],
@@ -681,7 +681,7 @@ def handover_payload(user_id: int) -> dict:
         "fields": [{"key": k, "label": lb, "required": req,
                     "hint": CASE_HINTS[k], "example": CASE_EXAMPLES.get(k, "")}
                    for k, lb, req in CASE_FIELDS],
-        "webstores": [{"flag": f, "store": st,
+        "webstores": [{"flag": f, "store": st, "key": STORE_CHANNEL[st],
                        "channel": CHANNEL_NAMES[STORE_CHANNEL[st]],
                        "orderExample": case_example("order_no", "LIVECHAT", st)}
                       for f, st in WEBSTORES],
