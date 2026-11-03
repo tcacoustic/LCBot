@@ -4084,8 +4084,8 @@ function caseForm(d) {
     // "No" skips the store chat: TC Online only, and SH’s untick closes it.
     const no = f.online === 'no';
     h += '<div class="fld"><label>Does Online need to do anything?</label><div class="pick">'
-      + `<button data-f="online" data-v="yes" class="${no ? '' : 'on'}">📣 Yes</button>`
-      + `<button data-f="online" data-v="no" class="${no ? 'on' : ''}">ℹ️ No, just so they know</button>`
+      + `<button data-f="online" data-v="yes" class="${no ? '' : 'on'}">Yes</button>`
+      + `<button data-f="online" data-v="no" class="${no ? 'on' : ''}">No</button>`
       + '</div>';
     h += '<div class="note" style="margin-top:4px">' + (no
       ? 'Goes to TC Online only' + (picked ? ', not the ' + esc(picked.channel) + ' chat' : '') + '. Your untick closes it.'
