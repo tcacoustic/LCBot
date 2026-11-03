@@ -2267,7 +2267,8 @@ def pm_will_help(case_id: int, user_id: int) -> None:
 
 
 def pm_not_needed(case_id: int, user_id: int) -> None:
-    """Counts as Online's close. SH isn't told; SH's close finishes it."""
+    """Counts as Online's close. SH isn't told; SH's close finishes it. The
+    caller moves it out of the store chat (move_to_tc_online)."""
     set_setting(f"case_pick:{case_id}", f"skip:{user_id}")
     close_case(case_id, user_id, "on", action="not needed")
 
@@ -2716,6 +2717,42 @@ async def refresh_case_post(bot, case_id: int) -> None:
             log.warning("Couldn't update the %s chat: %s", p["channel"], e)
     except Exception as e:
         log.warning("Couldn't update the %s chat: %s", p["channel"], e)
+
+
+async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
+    """A PM said Not needed: take the case out of its store chat (delete the
+    message, or just its part of a shared one) and post it to TC Online."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return
+    p = q1("SELECT * FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
+    run("UPDATE ho_cases SET post_id=NULL WHERE id=?", (case_id,))
+    if p and p["message_id"]:
+        rest = q1("SELECT COUNT(*) AS n FROM ho_cases WHERE post_id=?", (p["id"],))["n"]
+        try:
+            if rest:
+                await bot.edit_message_text(
+                    render_channel_post(p["id"]), chat_id=p["chat_id"], message_id=p["message_id"],
+                    reply_markup=channel_post_keyboard(p["id"], bot.username))
+            else:
+                await bot.delete_message(p["chat_id"], p["message_id"])
+        except Exception as e:
+            log.info("Couldn't take case %s out of the %s chat: %s", case_id, p["channel"], e)
+            if not rest:    # Telegram only lets bots delete for 48 hours: shrink it instead
+                try:
+                    await bot.edit_message_text(
+                        f"➖ {r['username']} · not needed · moved to TC Online",
+                        chat_id=p["chat_id"], message_id=p["message_id"])
+                except Exception:
+                    pass
+    who = display_name_of(r["agent_id"], "")
+    day = date.fromisoformat(r["the_date"]).strftime("%a %-d %b")
+    await post_ops(
+        bot, f"ℹ️ For your info · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
+             f"{day}" + (f" · from {who}" if who else "")
+             + f" · {display_name_of(pm_id, 'Online')}: not needed\n\n"
+             + render_case(case_row_to_dict(r))
+             + "\n\nNothing needed from Online. SH will close it.")
 
 
 # Sort cases from before channels existed into one, by their store.
@@ -4469,7 +4506,7 @@ function renderOnline(d) {
       const help = el.dataset.help === '1';
       const out = await post('/api/case/pick', { id: Number(el.dataset.pick), help });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not save that.'); return; }
-      toast(help ? 'On your list' : 'Off your list');
+      toast(help ? 'On your list' : 'Off your list · moved to TC Online');
       await loadHandover();
     };
   });

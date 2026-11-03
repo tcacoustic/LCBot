@@ -725,7 +725,8 @@ def web_case_pick(user_id: int, case_id: int, help: bool) -> dict:
         pm_will_help(case_id, user_id)
     else:
         pm_not_needed(case_id, user_id)
-    on_bot_loop(refresh_case_post(bot_ref(), case_id))
+    on_bot_loop(refresh_case_post(bot_ref(), case_id) if help
+                else move_to_tc_online(bot_ref(), case_id, user_id))
     return {"ok": True}
 
 
