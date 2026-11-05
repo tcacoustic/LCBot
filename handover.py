@@ -747,7 +747,15 @@ def may_edit_cases(user_id: int) -> bool:
 
 def case_button_label(r) -> str:
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
-    label = f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '?')}"
+    # The order number tells cases apart better than the platform name; the
+    # flag keeps the country. No order: the platform name, as before.
+    order = (r["order_no"] or "").strip()
+    if order and order.lower() not in ("none", "-", "na", "n/a"):
+        flag = next((f for k, f, _ in CHANNELS if k == r["channel"]), "")
+        where = f"{flag} {order}".strip()
+    else:
+        where = CHANNEL_NAMES.get(r["channel"] or "", "?")
+    label = f"{r['prio']} {r['username']} · {where}"
     if r["handed_back"]:
         label = "↩️ " + label
     elif r["origin"] == "on" and not r["sh_closed"]:
@@ -791,10 +799,10 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     here = f"cs:l:{page}"
     buttons, heading = [], None
     for r, is_own in ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]:
-        if mine and is_own != heading:
-            heading = is_own
-            title = "— Your channels —" if is_own else "— Other channels —"
-            buttons.append([InlineKeyboardButton(title, callback_data=here)])
+        if mine and not is_own and heading is not False:
+            # Own channels come first with no heading; one divider where the rest start.
+            heading = False
+            buttons.append([InlineKeyboardButton("— Other channels —", callback_data=here)])
         buttons.append([InlineKeyboardButton(case_button_label(r),
                                              callback_data=f"cs:v:{r['id']}")])
     if pages > 1:
