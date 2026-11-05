@@ -2318,7 +2318,7 @@ def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
         d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
         run("UPDATE ho_cases SET body=? WHERE id=?",
             (compose_body(d, r["origin"]), case_id))
-    side = "on" if is_online(user_id) else "sh"
+    side = "on" if online_view(user_id) else "sh"
     log_case(case_id, user_id, side, "edited",
              f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
 
@@ -2331,7 +2331,7 @@ def reopen_case(case_id: int, user_id: int | None = None) -> None:
         "on_closed=0, on_closed_by=NULL, on_closed_at=NULL WHERE id=?",
         (case_id,),
     )
-    log_case(case_id, user_id, "on" if user_id and is_online(user_id)
+    log_case(case_id, user_id, "on" if user_id and online_view(user_id)
              else "sh", "reopened")
 
 
@@ -2570,7 +2570,7 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
     A note goes to every PM who looks after that channel, and to the PM waiting
     on it (who raised the Online request, or handed it back). A close only goes
     to the waiting PM. Online's own notes and closes don't ping anyone."""
-    if is_online(author_id):
+    if online_view(author_id):
         return
     r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if not r:
