@@ -799,10 +799,10 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     here = f"cs:l:{page}"
     buttons, heading = [], None
     for r, is_own in ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]:
-        if mine and is_own != heading:
-            heading = is_own
-            title = "— Your channels —" if is_own else "— Other channels —"
-            buttons.append([InlineKeyboardButton(title, callback_data=here)])
+        if mine and not is_own and heading is not False:
+            # Own channels come first with no heading; one divider where the rest start.
+            heading = False
+            buttons.append([InlineKeyboardButton("— Other channels —", callback_data=here)])
         buttons.append([InlineKeyboardButton(case_button_label(r),
                                              callback_data=f"cs:v:{r['id']}")])
     if pages > 1:
