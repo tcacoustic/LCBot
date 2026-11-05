@@ -5085,6 +5085,13 @@ function keepRequest() {
     const el = document.getElementById('rq_' + k);
     if (el) RQ.form[k] = el.value;
   }
+  RQ.form.answers = RQ.form.answers || {};
+  document.querySelectorAll('[data-rqa]').forEach(el => { RQ.form.answers[el.dataset.rqa] = el.value; });
+}
+// Send stays greyed out until every question for this type has an answer.
+function requestReady(cats) {
+  const f = RQ.form, cat = cats.find(c => c.key === f.category);
+  return !!cat && cat.questions.every(qn => ((f.answers || {})[qn.key] || '').trim());
 }
 async function loadRequest() {
   const app = document.getElementById('app');
@@ -5099,9 +5106,26 @@ async function loadRequest() {
   h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: (REGION_FLAGS[c.key] || '') + ' ' + c.key })), f.country) + '</div>';
   h += '<div class="fld"><label>What is the request?</label>' + pick('rqcat', d.categories, f.category) + '</div>';
   const cat = d.categories.find(c => c.key === f.category);
-  h += '<div class="fld"><label>Details</label>'
-     + '<div class="note" style="margin:0 0 6px">' + esc(cat ? cat.hint : 'As fully as you can.') + ' No phone or ID numbers.</div>'
-     + '<textarea id="rq_details" rows="3">' + esc(f.details || '') + '</textarea></div>';
+  f.answers = f.answers || {};
+  if (cat) {
+    // This type's questions: every one must be answered before Send works.
+    for (const qn of cat.questions) {
+      h += '<div class="fld"><label>' + esc(qn.label) + ' <span style="color:var(--red)">*</span></label>';
+      if (qn.options) {
+        h += '<div class="pick">' + qn.options.map(o => '<button data-rqq="' + qn.key + '" data-rqv="' + esc(o) + '" class="'
+           + (f.answers[qn.key] === o ? 'on' : '') + '">' + esc(o) + '</button>').join('') + '</div>';
+      } else {
+        const tag = qn.key === 'address' || qn.key === 'todo' ? 'textarea rows="2"' : 'input';
+        h += (qn.hint ? '<div class="note" style="margin:0 0 6px">' + esc(qn.hint) + '</div>' : '')
+           + '<' + tag + ' data-rqa="' + qn.key + '"' + (tag === 'input' ? ' value="' + esc(f.answers[qn.key] || '') + '">'
+             : '>' + esc(f.answers[qn.key] || '') + '</textarea>');
+      }
+      h += '</div>';
+    }
+    h += '<div class="fld"><label>Anything else? (optional)</label>'
+       + '<div class="note" style="margin:0 0 6px">No phone or ID numbers.</div>'
+       + '<textarea id="rq_details" rows="2">' + esc(f.details || '') + '</textarea></div>';
+  }
   h += '<div class="fld"><label>' + (f.category === 'DATE' ? 'New delivery date' : 'Delivery date') + '</label><div class="pick">'
      + d.days.map(x => '<button data-rqd="' + x.iso + '" class="' + (f.delivery_date === x.iso ? 'on' : '') + '">'
        + esc(x.label) + (x.kind === 'URGENT' ? ' · URGENT' : x.kind === 'LATE' ? ' · late' : '') + '</button>').join('')
@@ -5130,7 +5154,8 @@ async function loadRequest() {
   wire();
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => { keepRequest(); fn(el); }; });
   on('[data-rqc]', el => { f.country = el.dataset.rqc; f.delivery_date = ''; loadRequest(); });
-  on('[data-rqcat]', el => { f.category = el.dataset.rqcat; loadRequest(); });
+  on('[data-rqcat]', el => { if (f.category !== el.dataset.rqcat) f.answers = {}; f.category = el.dataset.rqcat; loadRequest(); });
+  on('[data-rqq]', el => { f.answers[el.dataset.rqq] = el.dataset.rqv; loadRequest(); });
   on('[data-rqd]', el => { f.delivery_date = el.dataset.rqd; f.otherDate = false; loadRequest(); });
   on('[data-rqother]', () => { f.otherDate = true; f.delivery_date = ''; loadRequest(); });
   const od = document.getElementById('rq_other_date');
@@ -5139,8 +5164,17 @@ async function loadRequest() {
   on('[data-rqt]', el => { f.timeframe = el.dataset.rqt; loadRequest(); });
   document.getElementById('rqBack').onclick = () => { keepRequest(); VIEW = RQ.back || 'home'; render(); };
   const send = document.getElementById('rqSend');
+  const ready = () => { keepRequest(); send.style.opacity = requestReady(d.categories) ? '' : '.45'; };
+  document.querySelectorAll('[data-rqa]').forEach(el => { el.oninput = ready; });
+  ready();
   send.onclick = async () => {
     keepRequest();
+    if (!requestReady(d.categories)) {
+      const cat = d.categories.find(c => c.key === f.category);
+      const gap = cat && cat.questions.find(qn => !((f.answers || {})[qn.key] || '').trim());
+      toast(gap ? 'Answer “' + gap.label + '” first.' : 'Pick what the request is.');
+      return;
+    }
     send.disabled = true; send.textContent = 'Sending…';
     const out = await post('/api/request', f);
     send.disabled = false; send.textContent = 'Send to Ops';
