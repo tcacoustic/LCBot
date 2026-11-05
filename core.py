@@ -2267,7 +2267,8 @@ def pm_will_help(case_id: int, user_id: int) -> None:
 
 
 def pm_not_needed(case_id: int, user_id: int) -> None:
-    """Counts as Online's close. SH isn't told; SH's close finishes it."""
+    """Counts as Online's close. SH isn't told; SH's close finishes it. The
+    caller moves it out of the store chat (move_to_tc_online)."""
     set_setting(f"case_pick:{case_id}", f"skip:{user_id}")
     close_case(case_id, user_id, "on", action="not needed")
 
@@ -2504,26 +2505,26 @@ def render_channel_post(post_id: int) -> str:
 
 
 def channel_post_keyboard(post_id: int, bot_username: str | None):
-    """One button per case that flips: ✅ Close while nobody has closed it,
-    ↩️ Reopen once someone has (to undo a misclick), plus 📝 Note while it's
-    not fully closed. Close and Reopen work in place; Note opens a private
-    chat with the bot, so nothing is typed in the group."""
+    """Two buttons per case. A new case waits on its PM: 🙋 I'll help /
+    Not needed. Then ✅ Close while nobody has closed it, ↩️ Reopen once
+    someone has (to undo a misclick), plus 📝 Note while it's not fully
+    closed. Note opens a private chat with the bot, so nothing is typed in the
+    group. The name only goes on the buttons when a message has several cases."""
     rows = []
     cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))[:45]
-    room = 100 - 2 * len(cases)          # Telegram allows 100 buttons a message
     for r in cases:
-        who = (r["username"] or "case")[:20]
-        if room >= 2 and awaiting_pm(r):     # the PM's answer, until they give it
-            room -= 2
-            rows.append([InlineKeyboardButton(f"I'll help · {who}", callback_data=f"sc:h:{r['id']}"),
-                         InlineKeyboardButton(f"Not needed · {who}", callback_data=f"sc:n:{r['id']}")])
+        who = "" if len(cases) == 1 else f" · {(r['username'] or 'case')[:20]}"
+        if awaiting_pm(r):
+            rows.append([InlineKeyboardButton(f"🙋 I'll help{who}", callback_data=f"sc:h:{r['id']}"),
+                         InlineKeyboardButton(f"Not needed{who}", callback_data=f"sc:n:{r['id']}")])
+            continue
         if r["sh_closed"] or r["on_closed"] or r["closed"]:
-            row = [InlineKeyboardButton(f"↩️ Reopen · {who}", callback_data=f"sc:o:{r['id']}")]
+            row = [InlineKeyboardButton(f"↩️ Reopen{who}", callback_data=f"sc:o:{r['id']}")]
         else:
-            row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
+            row = [InlineKeyboardButton(f"✅ Close{who}", callback_data=f"sc:x:{r['id']}")]
         if bot_username and not r["closed"]:
             row.append(InlineKeyboardButton(
-                f"📝 Note · {who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
+                f"📝 Note{who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -2716,6 +2717,42 @@ async def refresh_case_post(bot, case_id: int) -> None:
             log.warning("Couldn't update the %s chat: %s", p["channel"], e)
     except Exception as e:
         log.warning("Couldn't update the %s chat: %s", p["channel"], e)
+
+
+async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
+    """A PM said Not needed: take the case out of its store chat (delete the
+    message, or just its part of a shared one) and post it to TC Online."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return
+    p = q1("SELECT * FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
+    run("UPDATE ho_cases SET post_id=NULL WHERE id=?", (case_id,))
+    if p and p["message_id"]:
+        rest = q1("SELECT COUNT(*) AS n FROM ho_cases WHERE post_id=?", (p["id"],))["n"]
+        try:
+            if rest:
+                await bot.edit_message_text(
+                    render_channel_post(p["id"]), chat_id=p["chat_id"], message_id=p["message_id"],
+                    reply_markup=channel_post_keyboard(p["id"], bot.username))
+            else:
+                await bot.delete_message(p["chat_id"], p["message_id"])
+        except Exception as e:
+            log.info("Couldn't take case %s out of the %s chat: %s", case_id, p["channel"], e)
+            if not rest:    # Telegram only lets bots delete for 48 hours: shrink it instead
+                try:
+                    await bot.edit_message_text(
+                        f"➖ {r['username']} · not needed · moved to TC Online",
+                        chat_id=p["chat_id"], message_id=p["message_id"])
+                except Exception:
+                    pass
+    who = display_name_of(r["agent_id"], "")
+    day = date.fromisoformat(r["the_date"]).strftime("%a %-d %b")
+    await post_ops(
+        bot, f"ℹ️ For your info · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
+             f"{day}" + (f" · from {who}" if who else "")
+             + f" · {display_name_of(pm_id, 'Online')}: not needed\n\n"
+             + render_case(case_row_to_dict(r))
+             + "\n\nNothing needed from Online. SH will close it.")
 
 
 # Sort cases from before channels existed into one, by their store.
@@ -4479,7 +4516,7 @@ function renderOnline(d) {
       const help = el.dataset.help === '1';
       const out = await post('/api/case/pick', { id: Number(el.dataset.pick), help });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not save that.'); return; }
-      toast(help ? 'On your list' : 'Off your list');
+      toast(help ? 'On your list' : 'Off your list · moved to TC Online');
       await loadHandover();
     };
   });
