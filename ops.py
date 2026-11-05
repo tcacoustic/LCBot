@@ -233,10 +233,18 @@ def is_flagged(rid: int) -> bool:
     return setting(f"red_flag:{rid}", "") == "yes"
 
 
+def on_sg_sheet(country: str) -> bool:
+    """Only SG has a Special Req sheet linked. MY, HK and TH requests stay out
+    of it (no country column there) and go to the Ops chat instead."""
+    return (country or "SG") == "SG"
+
+
 def in_ops_chat(r) -> bool:
-    """Which requests Ops see in Telegram: after the cut-off, same-day or 🚩.
-    The rest (on time) go only to the Special Req sheet; Ops work them there."""
-    return bool(r["after_cutoff"] or r["urgent"] or is_flagged(r["id"]))
+    """Which requests Ops see in Telegram: after the cut-off, same-day or 🚩,
+    and every MY/HK/TH one (no sheet for them yet). The rest (SG on time) go
+    only to the Special Req sheet; Ops work them there."""
+    return bool(r["after_cutoff"] or r["urgent"] or is_flagged(r["id"])
+                or not on_sg_sheet(r["country"]))
 
 
 def flagged_first(rows: list) -> list:
@@ -324,6 +332,12 @@ async def sync_to_sheet(rid: int) -> None:
     """Add this request's row, or bring its tick and remarks up to date.
     Left marked for the retry job if the sheet can't be reached."""
     if not (REQUEST_SHEET_URL and REQUEST_SHEET_SECRET):
+        return
+    r = get_request(rid)
+    if r and r["source"] != "paperform" and not on_sg_sheet(r["country"]):
+        # Not for the SG sheet: nothing to send, so don't leave it to retry.
+        async with write_lock:
+            run("UPDATE special_requests SET sheet_dirty=0 WHERE id=?", (rid,))
         return
     async with sheet_turn():
         await _sync_to_sheet(rid)
@@ -716,18 +730,19 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
             (d["order_no"], d.get("country") or "", d["category"], d["details"], d["delivery_date"],
              d["timeframe"], d.get("timeframe_other"), created_by, created.isoformat(),
              1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0,
-             0 if source == "paperform" else 1, source, submitted_name or None)).lastrowid
+             1 if source != "paperform" and on_sg_sheet(d.get("country") or "") else 0,
+             source, submitted_name or None)).lastrowid
         if d.get("red_flag"):
             set_setting(f"red_flag:{rid}", "yes")
     # Saved: the sender is answered now, and the Ops chat and the sheet are done
     # just after. On a busy day either can take a while, and a slow answer made
     # people press Send again.
-    sheet = source != "paperform"
-    if not kind and not d.get("red_flag"):
-        # On time: the sheet only, the Ops chat is for after the cut-off.
+    country = d.get("country") or ""
+    sheet = source != "paperform" and on_sg_sheet(country)
+    if not kind and not d.get("red_flag") and on_sg_sheet(country):
+        # SG on time: the sheet only, the Ops chat is for after the cut-off.
         in_background(deliver_request(bot, rid, post=False, sheet=sheet))
         return rid, "SHEET", kind
-    country = d.get("country") or ""
     due = next_round(country, created)
     if due and kind != "URGENT" and not d.get("red_flag") and ops_target(country):
         in_background(deliver_request(bot, rid, post=False, sheet=sheet))
