@@ -627,6 +627,8 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
         "shClosed": bool(r["sh_closed"]),
         "onClosed": bool(r["on_closed"]),
         "handedBack": bool(r["handed_back"]),
+        "helper": display_name_of(helper_of(r["id"]), "Online") if helper_of(r["id"]) else "",
+        "canPick": awaiting_pm(r),
         "waiting": (not closed) and bool(r["sh_closed"] or r["on_closed"]
                                          or r["handed_back"] or r["origin"] == "on"),
         "status": case_status_line(r),
@@ -661,6 +663,9 @@ def handover_payload(user_id: int) -> dict:
     """Open cases, recently closed ones, and the pickers for a new case."""
     today = now().date()
     open_rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    if online_view(user_id):            # Not needed: off the Online team's list
+        skipped = skipped_ids()
+        open_rows = [r for r in open_rows if r["id"] not in skipped]
     closed_rows = q(
         "SELECT * FROM ho_cases WHERE closed=1 ORDER BY closed_at DESC LIMIT 12"
     )
@@ -706,7 +711,23 @@ def case_history_lines(case_id: int, limit: int = 8) -> list:
 
 # What the Online team may do from the app.
 ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback",
-                "/api/case/edit", "/api/case"}
+                "/api/case/edit", "/api/case", "/api/case/pick"}
+
+
+def web_case_pick(user_id: int, case_id: int, help: bool) -> dict:
+    """A PM's I'll help / Not needed on a new SH case."""
+    if not online_view(user_id):
+        return {"ok": False, "error": "This is for the platform managers."}
+    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not row or not awaiting_pm(row):
+        return {"ok": False, "error": "Someone already answered this one."}
+    if help:
+        pm_will_help(case_id, user_id)
+    else:
+        pm_not_needed(case_id, user_id)
+    on_bot_loop(refresh_case_post(bot_ref(), case_id) if help
+                else move_to_tc_online(bot_ref(), case_id, user_id))
+    return {"ok": True}
 
 
 def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
@@ -1616,6 +1637,13 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = web_request_add(uid, body)
         elif path in VISIT_POSTS:
             out = web_visit_post(uid, path, body if isinstance(body, dict) else {})
+        elif path == "/api/case/pick":
+            try:
+                cid = int(body.get("id", 0))
+            except (TypeError, ValueError):
+                cid = 0
+            out = (web_case_pick(uid, cid, bool(body.get("help")))
+                   if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/case/handback":
             try:
                 cid = int(body.get("id", 0))

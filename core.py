@@ -2233,6 +2233,50 @@ def online_covers(channel: str | None) -> bool:
     return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
 
 
+def pm_pick(case_id: int) -> tuple[str, int] | None:
+    """A PM's answer to a new SH case: ('help', who) or ('skip', who).
+    Kept in settings, not a new column."""
+    v = setting(f"case_pick:{case_id}")
+    if not v:
+        return None
+    kind, who = v.split(":")
+    return kind, int(who)
+
+
+def helper_of(case_id: int) -> int | None:
+    p = pm_pick(case_id)
+    return p[1] if p and p[0] == "help" else None
+
+
+def skipped_ids() -> set:
+    """Cases a PM said Not needed: off the Online team's lists."""
+    return {int(r["key"].split(":")[1])
+            for r in q("SELECT key FROM settings WHERE key LIKE 'case_pick:%' AND value LIKE 'skip:%'")}
+
+
+def awaiting_pm(r) -> bool:
+    """A new SH case the PM hasn't answered yet (I'll help / Not needed)."""
+    return (not r["closed"] and not r["on_closed"] and not r["handed_back"]
+            and r["origin"] != "on" and online_covers(r["channel"])
+            and pm_pick(r["id"]) is None)
+
+
+def pm_will_help(case_id: int, user_id: int) -> None:
+    set_setting(f"case_pick:{case_id}", f"help:{user_id}")
+    log_case(case_id, user_id, "on", "will help")
+
+
+def pm_not_needed(case_id: int, user_id: int) -> None:
+    """Counts as Online's close. SH isn't told; SH's close finishes it. The
+    caller moves it out of the store chat (move_to_tc_online)."""
+    set_setting(f"case_pick:{case_id}", f"skip:{user_id}")
+    close_case(case_id, user_id, "on", action="not needed")
+
+
+def clear_pick(case_id: int) -> None:
+    run("DELETE FROM settings WHERE key=?", (f"case_pick:{case_id}",))
+
+
 def log_case(case_id: int, user_id: int | None, side: str, action: str,
              note: str = "") -> None:
     run("INSERT INTO case_log (case_id, user_id, side, action, note, created_at)"
@@ -2281,7 +2325,7 @@ def insert_case(agent_id: int, d: dict, the_date: date, origin: str = "sh") -> i
     return cur.lastrowid
 
 
-def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
+def close_case(case_id: int, user_id: int, side: str = "sh", action: str = "closed") -> None:
     """Tick one side closed. Fully closed once both sides are, or once SH is
     if the Online team doesn't cover that channel."""
     if side not in ("sh", "on"):
@@ -2292,7 +2336,7 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
         f"{side}_closed_at=?, handed_back=0 WHERE id=?",
         (user_id, ts, case_id),
     )
-    log_case(case_id, user_id, side, "closed")
+    log_case(case_id, user_id, side, action)
     row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if row and row["sh_closed"] and (
         row["on_closed"] or not online_covers(row["channel"])
@@ -2325,6 +2369,7 @@ def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
 
 def reopen_case(case_id: int, user_id: int | None = None) -> None:
     """Back to open on both sides."""
+    clear_pick(case_id)
     run(
         "UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL, "
         "sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL, "
@@ -2342,6 +2387,8 @@ def reopen_side(case_id: int, user_id: int, side: str) -> None:
         raise ValueError(side)
     run(f"UPDATE ho_cases SET {side}_closed=0, {side}_closed_by=NULL, {side}_closed_at=NULL, "
         "closed=0, closed_by=NULL, closed_at=NULL WHERE id=?", (case_id,))
+    if side == "on":
+        clear_pick(case_id)
     log_case(case_id, user_id, side, "reopened")
 
 
@@ -2423,6 +2470,9 @@ def case_status_line(r) -> str:
     if r["on_closed"]:
         return "☑️ Online closed · ⬜ waiting on SH"
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
+    helper = helper_of(r["id"])
+    if helper:
+        return f"🙋 {display_name_of(helper, 'Online')} is helping · due {due.strftime('%a %-d %b')}"
     return f"🔸 Open · due {due.strftime('%a %-d %b')}"
 
 
@@ -2455,21 +2505,26 @@ def render_channel_post(post_id: int) -> str:
 
 
 def channel_post_keyboard(post_id: int, bot_username: str | None):
-    """One button per case that flips: ✅ Close while nobody has closed it,
-    ↩️ Reopen once someone has (to undo a misclick), plus 📝 Note while it's
-    not fully closed. Close and Reopen work in place; Note opens a private
-    chat with the bot, so nothing is typed in the group."""
+    """Two buttons per case. A new case waits on its PM: 🙋 I'll help /
+    Not needed. Then ✅ Close while nobody has closed it, ↩️ Reopen once
+    someone has (to undo a misclick), plus 📝 Note while it's not fully
+    closed. Note opens a private chat with the bot, so nothing is typed in the
+    group. The name only goes on the buttons when a message has several cases."""
     rows = []
-    for r in q("SELECT id, username, closed, sh_closed, on_closed FROM ho_cases WHERE post_id=? "
-               "ORDER BY id", (post_id,))[:45]:
-        who = (r["username"] or "case")[:20]
+    cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))[:45]
+    for r in cases:
+        who = "" if len(cases) == 1 else f" · {(r['username'] or 'case')[:20]}"
+        if awaiting_pm(r):
+            rows.append([InlineKeyboardButton(f"🙋 I'll help{who}", callback_data=f"sc:h:{r['id']}"),
+                         InlineKeyboardButton(f"Not needed{who}", callback_data=f"sc:n:{r['id']}")])
+            continue
         if r["sh_closed"] or r["on_closed"] or r["closed"]:
-            row = [InlineKeyboardButton(f"↩️ Reopen · {who}", callback_data=f"sc:o:{r['id']}")]
+            row = [InlineKeyboardButton(f"↩️ Reopen{who}", callback_data=f"sc:o:{r['id']}")]
         else:
-            row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
+            row = [InlineKeyboardButton(f"✅ Close{who}", callback_data=f"sc:x:{r['id']}")]
         if bot_username and not r["closed"]:
             row.append(InlineKeyboardButton(
-                f"📝 Note · {who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
+                f"📝 Note{who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -2662,6 +2717,42 @@ async def refresh_case_post(bot, case_id: int) -> None:
             log.warning("Couldn't update the %s chat: %s", p["channel"], e)
     except Exception as e:
         log.warning("Couldn't update the %s chat: %s", p["channel"], e)
+
+
+async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
+    """A PM said Not needed: take the case out of its store chat (delete the
+    message, or just its part of a shared one) and post it to TC Online."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return
+    p = q1("SELECT * FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
+    run("UPDATE ho_cases SET post_id=NULL WHERE id=?", (case_id,))
+    if p and p["message_id"]:
+        rest = q1("SELECT COUNT(*) AS n FROM ho_cases WHERE post_id=?", (p["id"],))["n"]
+        try:
+            if rest:
+                await bot.edit_message_text(
+                    render_channel_post(p["id"]), chat_id=p["chat_id"], message_id=p["message_id"],
+                    reply_markup=channel_post_keyboard(p["id"], bot.username))
+            else:
+                await bot.delete_message(p["chat_id"], p["message_id"])
+        except Exception as e:
+            log.info("Couldn't take case %s out of the %s chat: %s", case_id, p["channel"], e)
+            if not rest:    # Telegram only lets bots delete for 48 hours: shrink it instead
+                try:
+                    await bot.edit_message_text(
+                        f"➖ {r['username']} · not needed · moved to TC Online",
+                        chat_id=p["chat_id"], message_id=p["message_id"])
+                except Exception:
+                    pass
+    who = display_name_of(r["agent_id"], "")
+    day = date.fromisoformat(r["the_date"]).strftime("%a %-d %b")
+    await post_ops(
+        bot, f"ℹ️ For your info · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
+             f"{day}" + (f" · from {who}" if who else "")
+             + f" · {display_name_of(pm_id, 'Online')}: not needed\n\n"
+             + render_case(case_row_to_dict(r))
+             + "\n\nNothing needed from Online. SH will close it.")
 
 
 # Sort cases from before channels existed into one, by their store.
@@ -3991,6 +4082,7 @@ function caseCard(c, closed) {
   h += `<div class="meta">${bits.join(' · ')}</div>`;
   if (c.request && !c.shClosed && !c.handedBack) h += `<div class="st">From ${esc(c.request)} (Online)</div>`;
   else if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  else if (c.helper && !closed) h += `<div class="st">🙋 ${esc(c.helper)} is helping</div>`;
   h += '</div></div>';
   if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
   if (HO_SHOWN[c.id]) {
@@ -4283,8 +4375,14 @@ function onlineCard(c, mine) {
     + `${esc(c.due)}</span>`);
   h += `<div class="meta">${bits.join(' · ')}</div>`;
   if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  else if (c.helper) h += `<div class="st" style="color:var(--green)">🙋 ${esc(c.helper)} is helping</div>`;
   h += '</div></div>';
   if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
+  // A new SH case: the PM says whether it needs them, right on the card.
+  if (c.canPick && mine) {
+    h += `<div class="acts"><button data-pick="${c.id}" data-help="1">I’ll help</button>`
+       + `<button class="soft" data-pick="${c.id}" data-help="0">Not needed</button></div>`;
+  }
   if (HO_SHOWN[c.id]) {
     h += `<div class="body">${esc(c.body)}</div>`;
     if (c.history && c.history.length) {
@@ -4382,7 +4480,7 @@ function renderOnline(d) {
 
   const shown = open
     .filter(c => c.group === ON_GROUP && (!ON_REGION || c.region === ON_REGION))
-    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (a.id - b.id));
+    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (b.canPick - a.canPick) || (a.id - b.id));
   if (!shown.length) h += '<div class="note">Nothing open here 🎉</div>';
   for (const c of shown) h += onlineCard(c, mine.has(c.channel));
 
@@ -4401,6 +4499,16 @@ function renderOnline(d) {
   });
   document.querySelectorAll('[data-or]').forEach(el => {
     el.onclick = () => { ON_REGION = el.dataset.or; renderOnline(d); };
+  });
+  document.querySelectorAll('[data-pick]').forEach(el => {
+    el.onclick = async () => {
+      el.disabled = true;
+      const help = el.dataset.help === '1';
+      const out = await post('/api/case/pick', { id: Number(el.dataset.pick), help });
+      if (!out.ok) { el.disabled = false; toast(out.error || 'Could not save that.'); return; }
+      toast(help ? 'On your list' : 'Off your list · moved to TC Online');
+      await loadHandover();
+    };
   });
   document.querySelectorAll('[data-onclose]').forEach(el => {
     el.onclick = async () => {

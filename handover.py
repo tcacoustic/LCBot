@@ -766,7 +766,8 @@ CASES_PER_PAGE = 15
 
 def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     mine = set(online_channels(user_id))
-    rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    skipped = skipped_ids()
+    rows = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id") if r["id"] not in skipped]
     own = [r for r in rows if r["channel"] in mine]
     rest = [r for r in rows if r["channel"] not in mine]
     new_btn = ([[InlineKeyboardButton("➕ New Online request", callback_data="cs:new")]]
@@ -1126,6 +1127,33 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await refresh_case_post(context.bot, case_id)
     await notify_reply(context.bot, case_id, uid, closed=True)
     await query.answer(f"Closed on the {'Online' if side == 'on' else 'SH'} side ✓")
+
+
+async def on_store_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:h:<id> I'll help · sc:n:<id> Not needed — a PM's answer to a new SH
+    case in a store chat. Not needed counts as Online's close; SH isn't told."""
+    query = update.callback_query
+    uid = query.from_user.id
+    if not online_view(uid):
+        await query.answer("This is for the platform managers.", show_alert=True)
+        return
+    _, action, cid = query.data.split(":")
+    case_id = int(cid)
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r or not awaiting_pm(r):
+        await query.answer("Someone already answered this one.")
+        await refresh_case_post(context.bot, case_id)
+        return
+    async with write_lock:
+        if action == "h":
+            pm_will_help(case_id, uid)
+        else:
+            pm_not_needed(case_id, uid)
+    if action == "h":
+        await refresh_case_post(context.bot, case_id)
+    else:
+        await move_to_tc_online(context.bot, case_id, uid)
+    await query.answer("On your list ✓" if action == "h" else "Off your list · moved to TC Online ✓")
 
 
 async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
