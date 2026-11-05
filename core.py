@@ -2505,26 +2505,26 @@ def render_channel_post(post_id: int) -> str:
 
 
 def channel_post_keyboard(post_id: int, bot_username: str | None):
-    """One button per case that flips: ✅ Close while nobody has closed it,
-    ↩️ Reopen once someone has (to undo a misclick), plus 📝 Note while it's
-    not fully closed. Close and Reopen work in place; Note opens a private
-    chat with the bot, so nothing is typed in the group."""
+    """Two buttons per case. A new case waits on its PM: 🙋 I'll help /
+    Not needed. Then ✅ Close while nobody has closed it, ↩️ Reopen once
+    someone has (to undo a misclick), plus 📝 Note while it's not fully
+    closed. Note opens a private chat with the bot, so nothing is typed in the
+    group. The name only goes on the buttons when a message has several cases."""
     rows = []
     cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))[:45]
-    room = 100 - 2 * len(cases)          # Telegram allows 100 buttons a message
     for r in cases:
-        who = (r["username"] or "case")[:20]
-        if room >= 2 and awaiting_pm(r):     # the PM's answer, until they give it
-            room -= 2
-            rows.append([InlineKeyboardButton(f"I'll help · {who}", callback_data=f"sc:h:{r['id']}"),
-                         InlineKeyboardButton(f"Not needed · {who}", callback_data=f"sc:n:{r['id']}")])
+        who = "" if len(cases) == 1 else f" · {(r['username'] or 'case')[:20]}"
+        if awaiting_pm(r):
+            rows.append([InlineKeyboardButton(f"🙋 I'll help{who}", callback_data=f"sc:h:{r['id']}"),
+                         InlineKeyboardButton(f"Not needed{who}", callback_data=f"sc:n:{r['id']}")])
+            continue
         if r["sh_closed"] or r["on_closed"] or r["closed"]:
-            row = [InlineKeyboardButton(f"↩️ Reopen · {who}", callback_data=f"sc:o:{r['id']}")]
+            row = [InlineKeyboardButton(f"↩️ Reopen{who}", callback_data=f"sc:o:{r['id']}")]
         else:
-            row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
+            row = [InlineKeyboardButton(f"✅ Close{who}", callback_data=f"sc:x:{r['id']}")]
         if bot_username and not r["closed"]:
             row.append(InlineKeyboardButton(
-                f"📝 Note · {who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
+                f"📝 Note{who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows) if rows else None
 
