@@ -747,7 +747,15 @@ def may_edit_cases(user_id: int) -> bool:
 
 def case_button_label(r) -> str:
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
-    label = f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '?')}"
+    # The order number tells cases apart better than the platform name; the
+    # flag keeps the country. No order: the platform name, as before.
+    order = (r["order_no"] or "").strip()
+    if order and order.lower() not in ("none", "-", "na", "n/a"):
+        flag = next((f for k, f, _ in CHANNELS if k == r["channel"]), "")
+        where = f"{flag} {order}".strip()
+    else:
+        where = CHANNEL_NAMES.get(r["channel"] or "", "?")
+    label = f"{r['prio']} {r['username']} · {where}"
     if r["handed_back"]:
         label = "↩️ " + label
     elif r["origin"] == "on" and not r["sh_closed"]:
