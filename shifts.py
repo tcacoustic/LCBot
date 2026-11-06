@@ -674,6 +674,9 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if req["status"] != "pending":
         await query.answer(f"Already {req['status']}.", show_alert=True)
         return
+    if req["kind"] == "exchange":
+        await decide_exchange(query, context, req, action == "a")
+        return
 
     slot = q1(
         """SELECT s.id, s.label, d.id AS day_id, d.name AS day_name, d.week_id
@@ -815,6 +818,10 @@ async def cmd_dropreqs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{r['id']}"),
             InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{r['id']}"),
         ]])
+        if r["kind"] == "exchange":
+            await reply_long(update.message, exchange_text(r), reply_markup=kb,
+                             parse_mode=constants.ParseMode.HTML)
+            continue
         icon = ("🔄 swap" if r["kind"] == "swap"
                 else "🙌 wants" if r["kind"] == "pickup" else "🙋 can't work")
         await reply_long(update.message, 
@@ -1424,3 +1431,372 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "For the week already up, send /applyfixed.</i>",
         parse_mode=constants.ParseMode.HTML,
     )
+
+
+# --------------------------------------------------------------------------
+# /changeshift — one place to drop, give or exchange one of your shifts.
+# /dropshift and /swap open it too. Callbacks: cg:p pick · cg:w what ·
+# cg:u who · cg:t their shift · cg:back · cg:x cancel; xa:y|n the other
+# person agreeing to an exchange.
+# --------------------------------------------------------------------------
+
+CG_PICK, CG_WHAT, CG_WHO, CG_THEIRS, CG_REASON = 290, 291, 292, 293, 294
+
+
+def shift_name(slot_id: int) -> str:
+    s = q1("""SELECT s.label, d.the_date FROM slots s JOIN days d ON d.id = s.day_id
+              WHERE s.id=?""", (slot_id,))
+    if not s:
+        return "that shift"
+    return f"{date.fromisoformat(s['the_date']):%a %-d %b} {s['label']}"
+
+
+def upcoming_shifts(user_id: int) -> list:
+    """Someone's shifts from today on, in the open (or latest) week, with no
+    request already waiting on them."""
+    w = open_week() or latest_week()
+    if not w:
+        return []
+    busy = {r["slot_id"] for r in q(
+        "SELECT slot_id FROM drop_requests WHERE agent_id=? AND status IN ('pending','awaiting')",
+        (user_id,))}
+    rows = q("""SELECT s.id, s.label, s.start_min, d.id AS day_id, d.the_date FROM signups su
+                JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
+                WHERE d.week_id=? AND su.user_id=? AND d.the_date >= ?
+                ORDER BY d.idx, s.idx""", (w["id"], user_id, now().date().isoformat()))
+    return [r for r in rows if r["id"] not in busy]
+
+
+def clashes(slot, mine: list) -> bool:
+    """Whether this shift overlaps one of mine (same day, times cross)."""
+    a1 = slot["start_min"]
+    a2 = a1 + slot_minutes(slot["label"])
+    for m in mine:
+        if m["day_id"] != slot["day_id"]:
+            continue
+        b1 = m["start_min"]
+        b2 = b1 + slot_minutes(m["label"])
+        if a1 < b2 and b1 < a2:
+            return True
+    return False
+
+
+def slot_row(slot_id: int):
+    return q1("""SELECT s.id, s.label, s.start_min, d.id AS day_id FROM slots s
+                 JOIN days d ON d.id = s.day_id WHERE s.id=?""", (slot_id,))
+
+
+def exchange_options(me: int, my_slot: int, them: int) -> list:
+    """Their shifts I could take for mine, with nobody left on two shifts at
+    once: theirs mustn't clash with my other shifts, and mine mustn't clash
+    with their other shifts."""
+    mine = upcoming_shifts(me)
+    keep = [m for m in mine if m["id"] != my_slot]
+    given = slot_row(my_slot)
+    out = []
+    their_all = upcoming_shifts(them)
+    for s in their_all:
+        if s["id"] in {m["id"] for m in mine} or clashes(s, keep):
+            continue
+        if given and clashes(given, [t for t in their_all if t["id"] != s["id"]]):
+            continue
+        out.append(s)
+    return out
+
+
+def cg_back_row() -> list:
+    return [InlineKeyboardButton("‹ Back", callback_data="cg:back"),
+            InlineKeyboardButton("Cancel", callback_data="cg:x")]
+
+
+async def cg_show(update: Update, context: ContextTypes.DEFAULT_TYPE, step: int) -> int:
+    """Draw one step of /changeshift (in place after a button)."""
+    d = context.user_data.setdefault("cg", {})
+    d["step"] = step
+    uid = update.effective_user.id
+    if step == CG_PICK:
+        mine = upcoming_shifts(uid)
+        if not mine:
+            text, kb = ("You have no upcoming shifts to change, or you've already asked about all of them.", None)
+        else:
+            rows = [[InlineKeyboardButton(shift_name(m["id"]), callback_data=f"cg:p:{m['id']}")] for m in mine]
+            rows.append([InlineKeyboardButton("Cancel", callback_data="cg:x")])
+            text, kb = ("<b>Which shift do you want to change?</b>", InlineKeyboardMarkup(rows))
+    elif step == CG_WHAT:
+        text = (f"<b>{esc(shift_name(d['slot']))}</b>\n\nWhat do you want to do?\n\n"
+                "<i>Your manager approves it. You stay on the shift until then.</i>")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🙋 Drop it (back on the board)", callback_data="cg:w:drop")],
+            [InlineKeyboardButton("➡️ Give it to someone", callback_data="cg:w:give")],
+            [InlineKeyboardButton("🔁 Exchange it for one of theirs", callback_data="cg:w:ex")],
+            cg_back_row()])
+    elif step == CG_WHO:
+        holders = {h["user_id"] for h in slot_holders(d["slot"])}
+        people = [a for a in q("SELECT * FROM agents WHERE status='active' AND user_id IN "
+                               "(SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name")
+                  if a["user_id"] != uid and a["user_id"] not in holders]
+        if d["mode"] == "ex":
+            people = [a for a in people if exchange_options(uid, d["slot"], a["user_id"])]
+        else:   # give: only people free at that time
+            mine_slot = slot_row(d["slot"])
+            people = [a for a in people if not clashes(mine_slot, upcoming_shifts(a["user_id"]))]
+        btns = [InlineKeyboardButton((a["display_name"] or a["name"])[:20], callback_data=f"cg:u:{a['user_id']}")
+                for a in people]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)] + [cg_back_row()]
+        verb = "exchange with" if d["mode"] == "ex" else "give it to"
+        text = (f"<b>{esc(shift_name(d['slot']))}</b>\n\nWho do you want to {verb}?"
+                if people else "There's nobody to " + verb + " for this shift.")
+        kb = InlineKeyboardMarkup(rows)
+    elif step == CG_THEIRS:
+        theirs = exchange_options(uid, d["slot"], d["to"])
+        rows = [[InlineKeyboardButton(shift_name(s["id"]), callback_data=f"cg:t:{s['id']}")] for s in theirs]
+        rows.append(cg_back_row())
+        text = (f"<b>Which of {esc(display_name_of(d['to'], 'their'))}'s shifts are you taking?</b>\n"
+                "<i>Only shifts that don't clash with yours.</i>")
+        kb = InlineKeyboardMarkup(rows)
+    else:  # CG_REASON
+        lines = [f"<b>{esc(shift_name(d['slot']))}</b>"]
+        if d["mode"] == "give":
+            lines.append(f"Giving it to <b>{esc(display_name_of(d['to'], 'them'))}</b>.")
+        elif d["mode"] == "ex":
+            lines.append(f"Exchanging with <b>{esc(display_name_of(d['to'], 'them'))}</b> for "
+                         f"<b>{esc(shift_name(d['theirs']))}</b>.")
+        lines += ["", "Why? A short reason is fine. Your manager sees this."]
+        text, kb = "\n".join(lines), InlineKeyboardMarkup([cg_back_row()])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+    if step == CG_PICK and kb is None:
+        return ConversationHandler.END
+    return step
+
+
+async def cmd_changeshift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        await update.message.reply_text("Message me directly for that 🙂")
+        return ConversationHandler.END
+    if not await gate(update):
+        return ConversationHandler.END
+    if not (open_week() or latest_week()):
+        await update.message.reply_text("No week has been posted yet.")
+        return ConversationHandler.END
+    context.user_data["cg"] = {}
+    return await cg_show(update, context, CG_PICK)
+
+
+CG_BACK = {CG_WHAT: CG_PICK, CG_WHO: CG_WHAT, CG_THEIRS: CG_WHO}
+
+
+async def on_cg_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    d = context.user_data.get("cg")
+    parts = query.data.split(":")
+    if parts[1] == "x" or d is None:
+        context.user_data.pop("cg", None)
+        await query.edit_message_text("No problem. Nothing changed.")
+        return ConversationHandler.END
+    if parts[1] == "back":
+        step = d.get("step")
+        if step == CG_REASON:
+            back = {"drop": CG_WHAT, "give": CG_WHO, "ex": CG_THEIRS}[d["mode"]]
+        else:
+            back = CG_BACK.get(step, CG_PICK)
+        return await cg_show(update, context, back)
+    kind, val = parts[1], parts[2]
+    if kind == "p":
+        d["slot"] = int(val)
+        return await cg_show(update, context, CG_WHAT)
+    if kind == "w":
+        d["mode"] = val
+        return await cg_show(update, context, CG_REASON if val == "drop" else CG_WHO)
+    if kind == "u":
+        d["to"] = int(val)
+        return await cg_show(update, context, CG_THEIRS if d["mode"] == "ex" else CG_REASON)
+    if kind == "t":
+        d["theirs"] = int(val)
+        return await cg_show(update, context, CG_REASON)
+    return d.get("step", CG_PICK)
+
+
+async def got_cg_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    d = context.user_data.get("cg") or {}
+    if "slot" not in d or "mode" not in d:
+        await update.message.reply_text("That expired. Send /changeshift again.")
+        return ConversationHandler.END
+    reason = " ".join((update.message.text or "").split()).strip()
+    if len(reason) < 3:
+        await update.message.reply_text("A little more detail, or /cancel.")
+        return CG_REASON
+    user = update.effective_user
+    me = display_name_of(user.id, user.full_name)
+    mine = shift_name(d["slot"])
+    mode = d["mode"]
+    kind = {"drop": "drop", "give": "swap", "ex": "exchange"}[mode]
+    async with write_lock:
+        req_id = run(
+            "INSERT INTO drop_requests (kind, agent_id, slot_id, target_id, reason, requested_at, status)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (kind, user.id, d["slot"], d.get("to"), reason, now().isoformat(),
+             "awaiting" if mode == "ex" else "pending")).lastrowid
+        if mode == "ex":
+            set_setting(f"exchange_back:{req_id}", str(d["theirs"]))
+    context.user_data.pop("cg", None)
+
+    if mode == "ex":
+        theirs = shift_name(d["theirs"])
+        to_nm = display_name_of(d["to"], "them")
+        await update.message.reply_text(
+            f"✅ Asked <b>{esc(to_nm)}</b> first.\n\n<b>You give:</b> {esc(mine)}\n<b>You take:</b> {esc(theirs)}\n\n"
+            "Once they agree, it goes to your manager. You both stay on your own shifts until it's approved.",
+            parse_mode=constants.ParseMode.HTML)
+        try:
+            await context.bot.send_message(
+                d["to"],
+                f"🔁 <b>{esc(me)} asks to exchange shifts with you</b>\n\n"
+                f"<b>You take:</b> {esc(mine)}\n<b>You give:</b> {esc(theirs)}\n<i>{esc(reason)}</i>\n\n"
+                "If you agree, it goes to a manager to approve.",
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Agree", callback_data=f"xa:y:{req_id}"),
+                    InlineKeyboardButton("❌ No", callback_data=f"xa:n:{req_id}")]]))
+        except Exception:
+            await update.message.reply_text(
+                f"I couldn't message {to_nm}. Ask them to open the bot, then try again.")
+            run("UPDATE drop_requests SET status='declined' WHERE id=?", (req_id,))
+        return ConversationHandler.END
+
+    if mode == "give":
+        to_nm = display_name_of(d["to"], "them")
+        await update.message.reply_text(
+            f"✅ Sent to your manager.\n\n<b>{esc(mine)}</b> → {esc(to_nm)}\n\nYou're still on it until they approve.",
+            parse_mode=constants.ParseMode.HTML)
+        try:
+            await context.bot.send_message(
+                d["to"], f"➡️ {me} has asked to give you {mine}.\nReason: {reason}\n\nWaiting on a manager to approve it.")
+        except Exception:
+            pass
+        text = f"🔄 <b>Shift swap request</b>\n\n<b>{esc(me)}</b> → <b>{esc(to_nm)}</b>\n{esc(mine)}\n<i>{esc(reason)}</i>"
+    else:
+        await update.message.reply_text(
+            f"✅ Sent to your manager.\n\n<b>{esc(mine)}</b>\n<i>{esc(reason)}</i>\n\n"
+            "You're still on the shift until they approve it.", parse_mode=constants.ParseMode.HTML)
+        text = f"🙋 <b>Shift drop request</b>\n\n<b>{esc(me)}</b> can't work <b>{esc(mine)}</b>\n<i>{esc(reason)}</i>"
+    await send_for_approval(context.bot, req_id, text)
+    return ConversationHandler.END
+
+
+async def send_for_approval(bot, req_id: int, text: str) -> None:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{req_id}"),
+        InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}")]])
+    sent = await notify_admins(bot, text, kb)
+    run("UPDATE drop_requests SET notified=? WHERE id=?", (json.dumps(sent), req_id))
+
+
+def exchange_text(req) -> str:
+    a = display_name_of(req["agent_id"], "them")
+    b = display_name_of(req["target_id"], "them")
+    back = int(setting(f"exchange_back:{req['id']}", "0") or 0)
+    return (f"🔁 <b>Shift exchange request</b>\n\n<b>{esc(a)}</b> ⇄ <b>{esc(b)}</b>\n"
+            f"{esc(a)} gives <b>{esc(shift_name(req['slot_id']))}</b>\n"
+            f"{esc(a)} takes <b>{esc(shift_name(back))}</b>\n"
+            + (f"<i>{esc(req['reason'])}</i>" if req["reason"] else ""))
+
+
+async def on_exchange_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """xa:y|n:<id> — the other person agrees to (or turns down) an exchange."""
+    query = update.callback_query
+    _, ans, raw = query.data.split(":")
+    req = q1("SELECT * FROM drop_requests WHERE id=?", (int(raw),))
+    if not req or req["target_id"] != query.from_user.id:
+        await query.answer("This isn't yours to answer.", show_alert=True)
+        return
+    if req["status"] != "awaiting":
+        await query.answer("Already answered.")
+        return
+    await query.answer()
+    who = display_name_of(query.from_user.id, "They")
+    if ans == "n":
+        run("UPDATE drop_requests SET status='declined', decided_by=?, decided_at=? WHERE id=?",
+            (query.from_user.id, now().isoformat(), req["id"]))
+        await query.edit_message_text(query.message.text_html + "\n\n❌ You said no.",
+                                      parse_mode=constants.ParseMode.HTML)
+        try:
+            await context.bot.send_message(req["agent_id"],
+                                           f"❌ {who} said no to exchanging {shift_name(req['slot_id'])}. "
+                                           "You're still on it.")
+        except Exception:
+            pass
+        return
+    run("UPDATE drop_requests SET status='pending' WHERE id=?", (req["id"],))
+    await query.edit_message_text(query.message.text_html + "\n\n✅ You agreed. Waiting on a manager.",
+                                  parse_mode=constants.ParseMode.HTML)
+    try:
+        await context.bot.send_message(req["agent_id"], f"✅ {who} agreed. It's with your manager now.")
+    except Exception:
+        pass
+    await send_for_approval(context.bot, req["id"], exchange_text(req))
+
+
+async def decide_exchange(query, context, req, approve: bool) -> None:
+    """A manager's answer to an exchange: both shifts move together, or nothing does."""
+    back = int(setting(f"exchange_back:{req['id']}", "0") or 0)
+    a, b = req["agent_id"], req["target_id"]
+    a_nm, b_nm = display_name_of(a, "them"), display_name_of(b, "them")
+    give, take = shift_name(req["slot_id"]), shift_name(back)
+    moved = False
+    async with write_lock:
+        still = (q1("SELECT 1 FROM signups WHERE slot_id=? AND user_id=?", (req["slot_id"], a))
+                 and q1("SELECT 1 FROM signups WHERE slot_id=? AND user_id=?", (back, b)))
+        if approve and not still:
+            run("UPDATE drop_requests SET status='declined', decided_by=?, decided_at=? WHERE id=?",
+                (query.from_user.id, now().isoformat(), req["id"]))
+        else:
+            run("UPDATE drop_requests SET status=?, decided_by=?, decided_at=? WHERE id=?",
+                ("approved" if approve else "declined", query.from_user.id, now().isoformat(), req["id"]))
+        if approve and still:
+            ts = now().isoformat()
+            run("DELETE FROM signups WHERE slot_id=? AND user_id=?", (req["slot_id"], a))
+            run("DELETE FROM signups WHERE slot_id=? AND user_id=?", (back, b))
+            run("INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
+                (req["slot_id"], b, b_nm, ts))
+            run("INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
+                (back, a, a_nm, ts))
+            moved = True
+    if approve and not moved:
+        await query.answer("One of those shifts has changed, so nothing moved.", show_alert=True)
+        verdict = "not done: one of the shifts changed since it was asked"
+    else:
+        await query.answer("Approved ✅" if approve else "Declined 🚫")
+        verdict = "approved ✅" if approve else "declined 🚫"
+    settled = (f"🔁 <b>Shift exchange request</b>\n<b>{esc(a_nm)}</b> ⇄ <b>{esc(b_nm)}</b>\n"
+               f"{esc(give)} ⇄ {esc(take)}\n\n{verdict} by {esc(display_name_of(query.from_user.id, 'admin'))}")
+    try:
+        sent = json.loads(req["notified"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        sent = []
+    if sent:
+        await settle_admin_messages(context.bot, sent, settled)
+    else:
+        try:
+            await query.edit_message_text(settled, parse_mode=constants.ParseMode.HTML)
+        except BadRequest:
+            pass
+    try:
+        if moved:
+            await context.bot.send_message(a, f"✅ Exchange approved.\nYou're now on {take} and off {give}.\n\nCheck /myshifts.")
+            await context.bot.send_message(b, f"✅ Exchange approved.\nYou're now on {give} and off {take}.\n\nCheck /myshifts.")
+        else:
+            why = "one of the shifts changed" if approve else "your manager declined it"
+            for who in (a, b):
+                await context.bot.send_message(who, f"The exchange of {give} and {take} didn't go ahead: {why}. "
+                                                    "You both keep your own shifts.")
+    except Exception:
+        pass
+    if moved:
+        for sid in (req["slot_id"], back):
+            s = q1("SELECT d.id AS day_id, d.week_id FROM slots s JOIN days d ON d.id = s.day_id WHERE s.id=?", (sid,))
+            if s:
+                await refresh_group(context, s["week_id"], s["day_id"])
