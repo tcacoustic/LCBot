@@ -1047,29 +1047,9 @@ ADMIN_POSTS = {"/api/admin/approve", "/api/admin/decline", "/api/admin/person", 
 # --------------------------------------------------------------------------
 UPDATE_KINDS = {"NEW": "New", "PROCESS": "Process", "GOOD": "Good news"}
 UPDATE_TEAMS = ["ALL"] + [k for k, _ in DEPARTMENTS]
-STARTER_UPDATES = [
-    ("GOOD", "🇲🇾 🇭🇰 🇹🇭 MY, HK and TH are on SH Bot",
-     "Cases and special requests for every country now run through the bot. Welcome!", ["ALL"]),
-    ("PROCESS", "Special requests ask set questions",
-     "Each request type now asks a few questions, so Ops get what they need first time. "
-     "\"Anything else?\" is optional.", ["LIVECHAT", "SH", "ON", "FS"]),
-    ("NEW", "10am check-in for open cases",
-     "Every working morning at 10am, your store chat lists cases from earlier days that aren't "
-     "closed yet. Tap a name to jump to the case.", ["ON"]),
-    ("NEW", "One command for shift changes",
-     "Send /changeshift to drop a shift, give it to someone, or exchange it for one of theirs. "
-     "For an exchange, they agree first, then your manager approves once.", ["LIVECHAT"]),
-]
-
-
 def all_updates() -> list:
-    if setting("updates_seeded", "") != "1":
-        items = []
-        for i, (kind, title, body, teams) in enumerate(STARTER_UPDATES, start=1):
-            items.append({"id": i, "kind": kind, "title": title, "body": body, "teams": teams,
-                          "at": now().isoformat(), "by": 0})
-        set_setting("updates", json.dumps(items))
-        set_setting("updates_seeded", "1")
+    """Every update, as posted in 🛡 Admin. Starts empty: nothing shows until
+    the owner (or a full admin) posts it."""
     try:
         return json.loads(setting("updates", "[]") or "[]")
     except (TypeError, ValueError):
