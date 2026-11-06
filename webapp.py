@@ -1054,6 +1054,7 @@ def person_dict(r) -> dict:
     return {
         "id": uid, "name": r["display_name"] or r["name"] or "", "username": r["username"] or "",
         "teams": teams, "admin": bool(is_owner(uid) or r["role"] == "admin"), "owner": is_owner(uid),
+        "fullAdmin": r["role"] == "admin" and is_full_admin(uid),
         "channels": online_channels(uid) if "ON" in teams else [],
         "country": (r["country"] or "") if "ONSITE" in teams else "",
         "store": store_of(uid) if "FS" in teams else "",
@@ -1217,10 +1218,22 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         if is_owner(uid):
             return {"ok": False, "error": "The owner is set in the bot's settings, not here."}
         run("UPDATE agents SET role=? WHERE user_id=?", ("admin" if value else "agent", uid))
+        if not value:
+            set_setting(f"full_admin:{uid}", "")     # no longer an admin: not a full one either
         menus = True
         if value:
             on_bot_loop(bot_ref().send_message(
                 uid, "You've been given admin rights. Send /help to see what's new."))
+    elif field == "fulladmin":
+        if not is_owner(admin_id):
+            return {"ok": False, "error": "Only the owner gives admin tools for every team."}
+        if row["role"] != "admin":
+            return {"ok": False, "error": "Make them an admin first."}
+        set_setting(f"full_admin:{uid}", "1" if value else "")
+        menus = True
+        if value:
+            on_bot_loop(bot_ref().send_message(
+                uid, "You now have admin tools for every team. Send /help to see what's new."))
     elif field == "name":
         nm = " ".join(str(value or "").split())
         if not 2 <= len(nm) <= 40:
