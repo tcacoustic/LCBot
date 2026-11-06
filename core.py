@@ -3126,9 +3126,8 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 # can't do yet. Commands the App covers (clock in/out, handover, cases, visits
 # booking, special requests) still work when typed; they just aren't listed.
 AGENT_COMMANDS = [
-    ("dropshift", "Ask to drop a shift"),
+    ("changeshift", "Drop, give or exchange a shift"),
     ("pickup", "Ask to take an open shift"),
-    ("swap", "Hand a shift to someone"),
     ("support", "Who I list as support"),
 ]
 GROUP_COMMANDS = [
