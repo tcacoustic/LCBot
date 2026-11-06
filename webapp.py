@@ -1858,3 +1858,49 @@ def start_web_server(app=None) -> None:
         return
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log.info("Mini App server listening on port %s", WEB_PORT)
+
+
+# /postupdate — post a What's new update with one message (owner, full admins):
+#   /postupdate NEW | LIVECHAT | Title | Text
+# Type: NEW, PROCESS or GOOD. Teams: ALL, or several joined by commas
+# (LIVECHAT, SH, ON, FS, ONSITE, OPS). The text may run over several lines.
+TEAM_ALIASES = {"EVERYONE": "ALL", "ON-SITE": "ONSITE", "LC": "LIVECHAT"}
+
+
+def parse_update_message(text: str) -> tuple:
+    """(fields, '') or (None, what's wrong)."""
+    parts = [p.strip() for p in text.split("|", 3)]
+    if len(parts) != 4:
+        return None, "Use: /postupdate TYPE | TEAMS | Title | Text"
+    kind, teams_raw, title, body = parts
+    kind = kind.upper()
+    teams = [TEAM_ALIASES.get(t.strip().upper(), t.strip().upper()) for t in teams_raw.replace("+", ",").split(",")]
+    teams = [t for t in teams if t]
+    bad = [t for t in teams if t not in UPDATE_TEAMS]
+    if kind not in UPDATE_KINDS:
+        return None, "Type must be NEW, PROCESS or GOOD."
+    if not teams or bad:
+        return None, ("I don't know " + ", ".join(bad) + ". " if bad else "") + \
+            "Teams: ALL, or LIVECHAT, SH, ON, FS, ONSITE, OPS joined by commas."
+    return {"kind": kind, "teams": teams, "title": title, "body": body}, ""
+
+
+async def cmd_postupdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if not may_post_updates(uid):
+        return
+    raw = (update.message.text or "").split(None, 1)
+    fields, err = parse_update_message(raw[1] if len(raw) > 1 else "")
+    if not fields:
+        await update.message.reply_text(err)
+        return
+    out = web_admin_update(uid, fields)
+    if not out.get("ok"):
+        await update.message.reply_text(out.get("error") or "Couldn't post that.")
+        return
+    teams = team_label([t for t in fields["teams"]] if "ALL" not in fields["teams"] else ["ALL"])
+    await update.message.reply_text(
+        f"✅ Posted to What's new · {esc(teams)}\n\n<b>{esc(fields['title'])}</b>\n{esc(fields['body'])}\n\n"
+        "<i>Edit or remove it in 🛡 Admin → Updates.</i>", parse_mode=constants.ParseMode.HTML)
