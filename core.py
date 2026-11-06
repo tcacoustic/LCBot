@@ -3772,7 +3772,7 @@ function caseTags(c, extra) {
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
               ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'],
-              people: [ICONS.shield, 'People'], pay: [ICONS.hours, 'Pay'] };
+              people: [ICONS.shield, 'People'], pay: [ICONS.hours, 'Pay'], updates: [ICONS.news, 'Updates'] };
 let TAB_NAMES = {};
 function navBar() {
   const tabs = ADMIN_MODE ? ADMIN_TABS

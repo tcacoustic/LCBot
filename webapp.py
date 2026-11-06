@@ -1155,7 +1155,8 @@ def web_admin_update(user_id: int, body: dict) -> dict:
 def admin_tabs(user_id: int) -> list:
     if not is_admin(user_id):
         return []
-    return ["people"] + (["team"] if admin_for(user_id, "LIVECHAT", "ONSITE") else [])
+    return (["people"] + (["team"] if admin_for(user_id, "LIVECHAT", "ONSITE") else [])
+            + (["updates"] if may_post_updates(user_id) else []))
 
 
 def teams_of(user_id: int) -> list:
@@ -1424,7 +1425,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                                                      "/api/visits", "/api/cases/search",
                                                      "/api/requests", "/api/admin",
                                                      "/api/admin/people", "/api/pay",
-                                                     "/api/team/onsite"):
+                                                     "/api/team/onsite", "/api/updates"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
@@ -1625,6 +1626,24 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(team_payload(first, mode)).encode())
             except Exception as e:
                 log.warning("Team view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
+        if path == "/api/updates":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                self._send(200, json.dumps(updates_payload(uid)).encode())
+            except Exception as e:
+                log.warning("Updates failed: %s", e)
                 try:
                     self._send(500, b'{"error":"server"}')
                 except Exception:
