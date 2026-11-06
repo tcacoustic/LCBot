@@ -837,6 +837,16 @@ async def post_bumps(bot, when=None) -> int:
     return sent
 
 
+async def cmd_bumpnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/bumpnow (owner, hidden) — post today's bump now, to try it out."""
+    if not is_owner(update.effective_user.id):
+        return
+    n = await post_bumps(context.bot)
+    await update.message.reply_text(f"Posted the bump in {n} store chat{'' if n == 1 else 's'}."
+                                     if n else "Nothing to bump: no store has cases open from earlier days, "
+                                     "or today isn't a working day.")
+
+
 async def job_case_bump(context: ContextTypes.DEFAULT_TYPE) -> None:
     day = now().date().isoformat()
     if setting("case_bump_done", "") == day:      # once a day, even after a restart
