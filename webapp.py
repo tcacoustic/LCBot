@@ -1038,7 +1038,118 @@ def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
 # admins set channels, On-Site admins set the country, only an owner makes admins.
 # --------------------------------------------------------------------------
 
-ADMIN_POSTS = {"/api/admin/approve", "/api/admin/decline", "/api/admin/person"}
+ADMIN_POSTS = {"/api/admin/approve", "/api/admin/decline", "/api/admin/person", "/api/admin/update"}
+
+# --------------------------------------------------------------------------
+# What's new: short updates for everyone or chosen teams, shown on Home.
+# Kept in settings (no DB change): "updates" = JSON list, and
+# "updates_seen:<uid>" = the newest id that person has opened.
+# --------------------------------------------------------------------------
+UPDATE_KINDS = {"NEW": "New", "PROCESS": "Process", "GOOD": "Good news"}
+UPDATE_TEAMS = ["ALL"] + [k for k, _ in DEPARTMENTS]
+STARTER_UPDATES = [
+    ("GOOD", "🇲🇾 🇭🇰 🇹🇭 MY, HK and TH are on SH Bot",
+     "Cases and special requests for every country now run through the bot. Welcome!", ["ALL"]),
+    ("PROCESS", "Special requests ask set questions",
+     "Each request type now asks a few questions, so Ops get what they need first time. "
+     "\"Anything else?\" is optional.", ["LIVECHAT", "SH", "ON", "FS"]),
+    ("NEW", "10am check-in for open cases",
+     "Every working morning at 10am, your store chat lists cases from earlier days that aren't "
+     "closed yet. Tap a name to jump to the case.", ["ON"]),
+    ("NEW", "One command for shift changes",
+     "Send /changeshift to drop a shift, give it to someone, or exchange it for one of theirs. "
+     "For an exchange, they agree first, then your manager approves once.", ["LIVECHAT"]),
+]
+
+
+def all_updates() -> list:
+    if setting("updates_seeded", "") != "1":
+        items = []
+        for i, (kind, title, body, teams) in enumerate(STARTER_UPDATES, start=1):
+            items.append({"id": i, "kind": kind, "title": title, "body": body, "teams": teams,
+                          "at": now().isoformat(), "by": 0})
+        set_setting("updates", json.dumps(items))
+        set_setting("updates_seeded", "1")
+    try:
+        return json.loads(setting("updates", "[]") or "[]")
+    except (TypeError, ValueError):
+        return []
+
+
+def may_post_updates(user_id: int) -> bool:
+    return is_owner(user_id) or (is_admin(user_id) and is_full_admin(user_id))
+
+
+def updates_for(user_id: int) -> list:
+    """Newest first: everyone's, plus their teams'. Posters see them all."""
+    mine = depts_of(user_id)
+    every = may_post_updates(user_id)
+    out = [u for u in all_updates() if every or "ALL" in u["teams"] or mine & set(u["teams"])]
+    return sorted(out, key=lambda u: -u["id"])
+
+
+def team_label(teams: list) -> str:
+    return "Everyone" if "ALL" in teams else " + ".join(DEPT_NAMES.get(t, t) for t in teams)
+
+
+def updates_payload(user_id: int) -> dict:
+    seen = int(setting(f"updates_seen:{user_id}", "0") or 0)
+    items = [{"id": u["id"], "kind": u["kind"], "kindName": UPDATE_KINDS.get(u["kind"], ""),
+              "title": u["title"], "body": u["body"], "teams": u["teams"], "for": team_label(u["teams"]),
+              "date": datetime.fromisoformat(u["at"]).strftime("%a %-d %b"), "unread": u["id"] > seen}
+             for u in updates_for(user_id)]
+    return {"items": items, "unread": sum(1 for i in items if i["unread"]),
+            "canPost": may_post_updates(user_id),
+            "teams": [{"key": t, "name": "Everyone" if t == "ALL" else DEPT_NAMES.get(t, t)} for t in UPDATE_TEAMS],
+            "kinds": [{"key": k, "name": n} for k, n in UPDATE_KINDS.items()]}
+
+
+def web_updates_seen(user_id: int) -> dict:
+    newest = max((u["id"] for u in updates_for(user_id)), default=0)
+    set_setting(f"updates_seen:{user_id}", str(newest))
+    return {"ok": True}
+
+
+def web_admin_update(user_id: int, body: dict) -> dict:
+    """Post, edit or remove an update (owner and full admins)."""
+    if not may_post_updates(user_id):
+        return {"ok": False, "error": "Only the owner and full admins post updates."}
+    items = all_updates()
+    try:
+        uid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if body.get("remove"):
+        items = [u for u in items if u["id"] != uid]
+        set_setting("updates", json.dumps(items))
+        return {"ok": True}
+    title = " ".join(str(body.get("title") or "").split())[:80]
+    text = str(body.get("body") or "").strip()[:600]
+    kind = str(body.get("kind") or "")
+    teams = [t for t in (body.get("teams") or []) if t in UPDATE_TEAMS]
+    if "ALL" in teams:
+        teams = ["ALL"]
+    if kind not in UPDATE_KINDS:
+        return {"ok": False, "error": "Pick a type."}
+    if len(title) < 3:
+        return {"ok": False, "error": "Give it a title."}
+    if len(text) < 5:
+        return {"ok": False, "error": "Say a little more."}
+    if not teams:
+        return {"ok": False, "error": "Pick who sees it."}
+    if uid:
+        for u in items:
+            if u["id"] == uid:
+                u.update(kind=kind, title=title, body=text, teams=teams)
+                break
+        else:
+            return {"ok": False, "error": "That update has gone."}
+    else:
+        items.append({"id": max((u["id"] for u in items), default=0) + 1, "kind": kind, "title": title,
+                      "body": text, "teams": teams, "at": now().isoformat(), "by": user_id})
+    set_setting("updates", json.dumps(items))
+    log.info("%s %s an update: %s", user_id, "edited" if uid else "posted", title)
+    return {"ok": True}
 
 
 def admin_tabs(user_id: int) -> list:
@@ -1631,7 +1742,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if path in ADMIN_POSTS and not is_admin(uid):
             self._send(403, b'{"error":"admins only"}')
             return
-        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | ADMIN_POSTS | {"/api/feedback"} \
+        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | ADMIN_POSTS | {"/api/feedback", "/api/updates/seen"} \
                 and not (path == "/api/handover/post" and may_post_handover(uid)):
             self._send(403, b'{"error":"online team: handover only"}')
             return
@@ -1669,6 +1780,10 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = web_admin_decline(uid, body if isinstance(body, dict) else {})
         elif path == "/api/admin/person":
             out = web_admin_person(uid, body if isinstance(body, dict) else {})
+        elif path == "/api/admin/update":
+            out = web_admin_update(uid, body if isinstance(body, dict) else {})
+        elif path == "/api/updates/seen":
+            out = web_updates_seen(uid)
         elif path == "/api/case":
             out = web_case_add(uid, body if isinstance(body, dict) else {})
         elif path == "/api/case/toggle":

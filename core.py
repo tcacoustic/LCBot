@@ -3470,6 +3470,22 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:4px; background:var(--ink); }
   .tag.red { background:var(--red); } .tag.amber { background:var(--amber); }
   .tag.green { background:var(--green); } .tag.blue { background:var(--blue); }
+  /* What's new: the card on Home and the list behind it. */
+  .newscard { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; cursor:pointer;
+    background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; margin-bottom:14px; }
+  .newscard .ic { font-size:22px; }
+  .newscard b { display:block; }
+  .newscard .t { margin:0; }
+  .newscount { background:var(--accent); color:#fff; font-size:12px; font-weight:800; border-radius:999px; padding:2px 8px; white-space:nowrap; }
+  .upd { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; margin-bottom:10px; }
+  .upd.read { border-color:var(--line); }
+  .upd .meta { display:flex; gap:6px; align-items:center; flex-wrap:wrap; font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .upd .unread { width:8px; height:8px; border-radius:50%; background:var(--accent); display:inline-block; }
+  .upd h3 { margin:0 0 4px; font-size:16px; font-weight:800; }
+  .upd p { margin:0; font-size:14px; white-space:pre-line; }
+  .upd .acts { display:flex; gap:6px; margin-top:10px; }
+  .upd .acts button { flex:1; min-height:40px; border:2px solid var(--ink); background:var(--card); color:var(--ink);
+    border-radius:8px; font-weight:700; cursor:pointer; }
 
   .cards { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:16px; }
   .card { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; }
@@ -3733,7 +3749,8 @@ const ICONS = {
   cases: 'M9 3h6v3H9zM7 4.5H5V21h14V4.5h-2M8 11h8M8 15h5',
   visits: 'M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zM12 8a2 2 0 1 0 0 4a2 2 0 1 0 0-4',
   team: 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6',
-  shield: 'M12 3l7 3v5c0 4.5-3 8.3-7 10c-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4'
+  shield: 'M12 3l7 3v5c0 4.5-3 8.3-7 10c-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4',
+  news: 'M3 10v4h3l6 4V6L6 10zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12'
 };
 function icon(path) {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
@@ -5511,6 +5528,98 @@ function personScreen() {
   };
 }
 
+// What's new: a card on Home (newest title + how many unread), the list, and
+// in 🛡 Admin a form to post them. Nothing is sent as a message.
+const UPD_TAG = { NEW: ['NEW', 'blue'], PROCESS: ['PROCESS', 'amber'], GOOD: ['GOOD NEWS', 'green'] };
+let UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL'] } };
+async function addNewsCard() {
+  let d;
+  try { d = await getJSON('/api/updates'); } catch (e) { return; }
+  if (VIEW !== 'home' || !d.items.length || document.getElementById('newsCard')) return;
+  const sub = document.querySelector('#app .sub');
+  if (!sub) return;
+  const el = document.createElement('div');
+  el.className = 'newscard'; el.id = 'newsCard';
+  el.innerHTML = '<div class="ic">📣</div><div><b>What’s new</b><div class="t">' + esc(d.items[0].title) + '</div></div>'
+    + (d.unread ? '<div class="newscount">' + d.unread + ' new</div>' : '<div class="t">›</div>');
+  el.onclick = () => { VIEW = 'news'; render(); };
+  sub.insertAdjacentElement('afterend', el);
+}
+function updateCard(u, admin) {
+  const tag = UPD_TAG[u.kind] || ['', ''];
+  return '<div class="upd' + (u.unread && !admin ? '' : ' read') + '"><div class="meta">'
+    + (u.unread && !admin ? '<span class="unread"></span>' : '')
+    + '<span class="tag ' + tag[1] + '">' + tag[0] + '</span>' + esc(u.date) + ' · ' + esc(u.for) + '</div>'
+    + '<h3>' + esc(u.title) + '</h3><p>' + esc(u.body) + '</p>'
+    + (admin ? '<div class="acts"><button class="soft" data-uedit="' + u.id + '">Edit</button>'
+      + '<button class="soft" data-udel="' + u.id + '">Remove</button></div>' : '')
+    + '</div>';
+}
+async function loadNews() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/updates');
+  let h = '<div class="back" id="nBack">‹ Home</div><h1>What’s new</h1><div class="sub">Updates for your team</div>';
+  h += d.items.length ? d.items.map(u => updateCard(u, false)).join('') : '<div class="empty">Nothing yet.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  document.getElementById('nBack').onclick = () => { VIEW = 'home'; render(); };
+  if (d.unread) post('/api/updates/seen', {});
+}
+async function loadUpdatesAdmin() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/updates');
+  const f = UPD.form;
+  const pick = (attr, items, on) => '<div class="pick">' + items.map(it =>
+    '<button data-' + attr + '="' + it.key + '" class="' + (on(it.key) ? 'on' : '') + '">' + esc(it.name) + '</button>').join('') + '</div>';
+  let h = adminHead() + '<h1>' + (UPD.edit ? 'Edit update' : 'Post an update') + '</h1>'
+    + '<div class="sub">Shows in the App · no message is sent</div>';
+  h += '<div class="fld"><label>Type</label>' + pick('uk', d.kinds, k => f.kind === k) + '</div>';
+  h += '<div class="fld"><label>Title</label><input id="uTitle" maxlength="80" value="' + attr(f.title) + '"></div>';
+  h += '<div class="fld"><label>What to say</label><textarea id="uBody" rows="4" maxlength="600">' + esc(f.body) + '</textarea>'
+     + '<div class="note" style="margin-top:6px">No customer details.</div></div>';
+  h += '<div class="fld"><label>Who sees it</label>' + pick('ut', d.teams, k => f.teams.includes(k)) + '</div>';
+  h += '<button class="big" id="uSend">' + (UPD.edit ? 'Save changes' : 'Post update') + '</button>';
+  if (UPD.edit) h += '<button class="big ghost" id="uCancel">Cancel editing</button>';
+  h += '<h2>Posted</h2>' + (d.items.length ? d.items.map(u => updateCard(u, true)).join('') : '<div class="empty">Nothing posted yet.</div>');
+  app.innerHTML = h + navBar();
+  wire();
+  const keep = () => { f.title = document.getElementById('uTitle').value; f.body = document.getElementById('uBody').value; };
+  document.querySelectorAll('[data-uk]').forEach(el => el.onclick = () => { keep(); f.kind = el.dataset.uk; loadUpdatesAdmin(); });
+  document.querySelectorAll('[data-ut]').forEach(el => el.onclick = () => {
+    keep();
+    const k = el.dataset.ut;
+    if (k === 'ALL') f.teams = ['ALL'];
+    else {
+      f.teams = f.teams.filter(t => t !== 'ALL');
+      f.teams = f.teams.includes(k) ? f.teams.filter(t => t !== k) : f.teams.concat(k);
+    }
+    loadUpdatesAdmin();
+  });
+  document.getElementById('uSend').onclick = async (ev) => {
+    keep(); ev.target.disabled = true;
+    const out = await post('/api/admin/update', { id: UPD.edit || 0, kind: f.kind, title: f.title, body: f.body, teams: f.teams });
+    ev.target.disabled = false;
+    if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
+    toast(UPD.edit ? 'Saved' : 'Posted');
+    UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL'] } };
+    loadUpdatesAdmin();
+  };
+  const cancel = document.getElementById('uCancel');
+  if (cancel) cancel.onclick = () => { UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL'] } }; loadUpdatesAdmin(); };
+  document.querySelectorAll('[data-uedit]').forEach(el => el.onclick = () => {
+    const u = d.items.find(x => x.id === Number(el.dataset.uedit));
+    if (!u) return;
+    UPD = { edit: u.id, form: { kind: u.kind, title: u.title, body: u.body, teams: u.teams.slice() } };
+    loadUpdatesAdmin(); window.scrollTo(0, 0);
+  });
+  document.querySelectorAll('[data-udel]').forEach(el => el.onclick = async () => {
+    if (!await askSure('Remove this update? Nobody will see it any more.')) return;
+    const out = await post('/api/admin/update', { id: Number(el.dataset.udel), remove: true });
+    if (!out.ok) { toast(out.error || 'Could not remove it.'); return; }
+    toast('Removed'); loadUpdatesAdmin();
+  });
+}
+
 async function render() {
   feedbackButton();
   await adminButton();
@@ -5519,7 +5628,18 @@ async function render() {
   if (VIEW === 'fb') { loadFeedback(); return; }
   if (VIEW === 'home') {
     try { await loadHome(); }
-    catch (e) { showFatal('Home would not load', e.message || e); }
+    catch (e) { showFatal('Home would not load', e.message || e); return; }
+    if (VIEW === 'home') addNewsCard();
+    return;
+  }
+  if (VIEW === 'news') {
+    try { await loadNews(); }
+    catch (e) { showFatal('What\u2019s new would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'updates') {
+    try { await loadUpdatesAdmin(); }
+    catch (e) { showFatal('Updates would not load', e.message || e); }
     return;
   }
   if (VIEW === 'week') {
