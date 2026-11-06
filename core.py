@@ -1191,13 +1191,19 @@ def is_online(user_id: int) -> bool:
     return "ON" in depts_of(user_id)
 
 
+def is_full_admin(user_id: int) -> bool:
+    """An admin with every team's admin tools, without joining those teams
+    (so they aren't treated as a PM, Ops, etc.). Set by the owner in the App."""
+    return setting(f"full_admin:{user_id}", "") == "1"
+
+
 def admin_for(user_id: int, *depts: str) -> bool:
-    """Admin powers for these teams. The owner has them for every team; other
-    admins only for the teams they're in (an SH + Livechat admin gets no ON or
-    Ops tools)."""
+    """Admin powers for these teams. The owner and full admins have them for
+    every team; other admins only for the teams they're in (an SH + Livechat
+    admin gets no ON or Ops tools)."""
     if not is_admin(user_id):
         return False
-    if is_owner(user_id) or not ADMIN_IDS:
+    if is_owner(user_id) or not ADMIN_IDS or is_full_admin(user_id):
         return True
     return bool(depts_of(user_id) & set(depts))
 
@@ -5467,6 +5473,8 @@ function personScreen() {
   if (d.canRole && !p.owner) {
     h += '<h2>Settings</h2><div class="row"><div class="lbl">Admin<small>Admin tools for their teams</small></div>'
       + `<div class="sw${p.admin ? ' on' : ''}" id="pAdmin"><i></i></div></div>`;
+    if (p.admin) h += '<div class="row"><div class="lbl">Admin for all teams<small>Admin tools for every team, without joining them</small></div>'
+      + `<div class="sw${p.fullAdmin ? ' on' : ''}" id="pFull"><i></i></div></div>`;
   }
   h += '<h2>Name in the bot</h2><div class="nameedit">'
     + `<input id="pName" value="${attr(p.name)}"><button id="pSaveName">Save</button></div>`;
@@ -5491,6 +5499,8 @@ function personScreen() {
   document.querySelectorAll('[data-cy]').forEach(el => el.onclick = () => save('country', el.dataset.cy, 'Country saved'));
   const adm = document.getElementById('pAdmin');
   if (adm) adm.onclick = () => save('admin', !p.admin, p.admin ? 'Admin removed' : 'Now an admin');
+  const full = document.getElementById('pFull');
+  if (full) full.onclick = () => save('fulladmin', !p.fullAdmin, p.fullAdmin ? 'Back to their own teams' : 'Admin for all teams');
   document.getElementById('pSaveName').onclick = () => save('name', document.getElementById('pName').value, 'Name saved');
   const rm = document.getElementById('pRemove');
   if (rm) rm.onclick = async () => {
