@@ -771,6 +771,89 @@ def case_button_label(r) -> str:
 
 CASES_PER_PAGE = 15
 
+FLAG_COUNTRY = {"🇸🇬": "SG", "🇲🇾": "MY", "🇭🇰": "HK", "🇹🇭": "TH"}
+CHANNEL_COUNTRY = {key: FLAG_COUNTRY.get(flag, "") for key, flag, _ in CHANNELS}
+BUMP_TIME = os.environ.get("CASE_BUMP_TIME", "").strip() or "10:00"
+
+
+def still_open_for_online(channel: str, before) -> list:
+    """Cases from before today that Online hasn't closed: not answered yet, or
+    "I'll help" but not closed. Not needed, handed back and Online's own
+    requests are left out."""
+    if not online_covers(channel):
+        return []
+    return q("SELECT * FROM ho_cases WHERE channel=? AND closed=0 AND on_closed=0"
+             " AND handed_back=0 AND COALESCE(origin,'')!='on' AND created_at<?"
+             " ORDER BY created_at, id", (channel, before.isoformat()))
+
+
+def bump_text(channel: str, rows: list) -> str:
+    waiting = sum(1 for r in rows if pm_pick(r["id"]) is None)
+    lines = [f"⏳ <b>Still open · {len(rows)} case{'' if len(rows) == 1 else 's'}</b>"
+             f" · {esc(CHANNEL_NAMES.get(channel, ''))}"]
+    sub = (f"{waiting} with no answer yet. " if waiting else "") + "Tap a name to jump to that case."
+    lines += [f"<i>{sub}</i>", ""]
+    for r in rows:
+        name = esc(r["username"] or "case")
+        p = q1("SELECT chat_id, message_id FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
+        chat = str(p["chat_id"]) if p else ""
+        if chat.startswith("-100") and p["message_id"]:
+            name = f'<a href="https://t.me/c/{chat[4:]}/{p["message_id"]}">{name}</a>'
+        order = (r["order_no"] or "").strip()
+        bits = [f"{r['prio']} {name}"]
+        if order and order.lower() not in ("none", "-", "na", "n/a"):
+            bits.append(esc(order))
+        bits.append(date.fromisoformat(r["the_date"]).strftime("%a %-d %b"))
+        helper = helper_of(r["id"])
+        bits.append(f"🙋 {esc(display_name_of(helper, 'Online'))}" if helper else "<b>no answer</b>")
+        lines.append(" · ".join(bits))
+    return "\n".join(lines)
+
+
+async def post_bumps(bot, when=None) -> int:
+    """Working mornings: each store chat gets one short list of its cases from
+    earlier days that Online hasn't closed. Nothing open: nothing posted."""
+    from ops import is_working_day
+    when = when or now()
+    start = when.replace(hour=0, minute=0, second=0, microsecond=0)
+    sent = 0
+    for key, _, _ in CHANNELS:
+        where = channel_chat(key)
+        if not where or not is_working_day(CHANNEL_COUNTRY.get(key, ""), when.date()):
+            continue
+        rows = still_open_for_online(key, start)
+        if not rows:
+            continue
+        kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
+        kb = (InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📋 Open all in SH Bot", url=f"https://t.me/{bot.username}?start=cases")]])
+            if bot.username else None)
+        try:
+            await bot.send_message(where["chat"], bump_text(key, rows), parse_mode=constants.ParseMode.HTML,
+                                   reply_markup=kb, disable_web_page_preview=True, **kw)
+            sent += 1
+        except Exception as e:
+            log.warning("Couldn't post the %s bump: %s", key, e)
+    return sent
+
+
+async def cmd_bumpnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/bumpnow (owner, hidden) — post today's bump now, to try it out."""
+    if not is_owner(update.effective_user.id):
+        return
+    n = await post_bumps(context.bot)
+    await update.message.reply_text(f"Posted the bump in {n} store chat{'' if n == 1 else 's'}."
+                                     if n else "Nothing to bump: no store has cases open from earlier days, "
+                                     "or today isn't a working day.")
+
+
+async def job_case_bump(context: ContextTypes.DEFAULT_TYPE) -> None:
+    day = now().date().isoformat()
+    if setting("case_bump_done", "") == day:      # once a day, even after a restart
+        return
+    set_setting("case_bump_done", day)
+    await post_bumps(context.bot)
+
 
 def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     mine = set(online_channels(user_id))
