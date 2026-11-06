@@ -479,6 +479,10 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(
         job_ops_rounds, interval=timedelta(minutes=30), first=first, name="ops-rounds",
     )
+    kmins = parse_time_token(BUMP_TIME)
+    app.job_queue.run_daily(
+        job_case_bump, time(kmins // 60, kmins % 60, tzinfo=TZ), name="case-bump",
+    )
     rmins = parse_time_token(os.environ.get("REPORT_TIME", "").strip() or "09:00")
     app.job_queue.run_daily(
         job_case_report, time(rmins // 60, rmins % 60, tzinfo=TZ),
