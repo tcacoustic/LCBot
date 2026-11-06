@@ -2745,14 +2745,16 @@ async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
                         chat_id=p["chat_id"], message_id=p["message_id"])
                 except Exception:
                     pass
-    who = display_name_of(r["agent_id"], "")
+    # One line: the case is already in the handover, only the PM's answer is new.
     day = date.fromisoformat(r["the_date"]).strftime("%a %-d %b")
+    order = (r["order_no"] or "").strip()
+    bits = [CHANNEL_NAMES.get(r["channel"] or "", ""), r["username"] or "case"]
+    if order and order.lower() not in ("none", "-", "na", "n/a"):
+        bits.append(order)
+    bits.append(day)
     await post_ops(
-        bot, f"ℹ️ For your info · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
-             f"{day}" + (f" · from {who}" if who else "")
-             + f" · {display_name_of(pm_id, 'Online')}: not needed\n\n"
-             + render_case(case_row_to_dict(r))
-             + "\n\nNothing needed from Online. SH will close it.")
+        bot, "ℹ️ " + " · ".join(b for b in bits if b)
+             + f": {display_name_of(pm_id, 'Online')} said not needed. SH, please close it.")
 
 
 # Sort cases from before channels existed into one, by their store.

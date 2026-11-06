@@ -483,6 +483,10 @@ async def post_init(app: Application) -> None:
         job_visit_reminders, interval=timedelta(minutes=5), first=timedelta(minutes=1),
         name="visit-reminders",
     )
+    kmins = parse_time_token(BUMP_TIME)
+    app.job_queue.run_daily(
+        job_case_bump, time(kmins // 60, kmins % 60, tzinfo=TZ), name="case-bump",
+    )
     rmins = parse_time_token(os.environ.get("REPORT_TIME", "").strip() or "09:00")
     app.job_queue.run_daily(
         job_case_report, time(rmins // 60, rmins % 60, tzinfo=TZ),
@@ -782,7 +786,8 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
-    app.add_handler(CommandHandler(["onchat", "linkchat"], cmd_linkchat))   # /linkchat: the old name
+    app.add_handler(CommandHandler(["onchat", "linkchat"], cmd_linkchat))
+    app.add_handler(CommandHandler("bumpnow", cmd_bumpnow))   # /linkchat: the old name
     app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
     app.add_handler(CallbackQueryHandler(on_store_reopen, pattern=r"^sc:o:\d+$"))
     app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^sc:[hn]:\d+$"))
