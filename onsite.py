@@ -46,6 +46,12 @@ PRICING = {"SG": (10000, 8000, "SGD")}
 GRACE_MIN = 10
 
 
+# What a specialist is paid per visit, by their country: (cents, currency).
+# A visit counts once they tap 🏁 Leave, whatever the outcome; cancelled ones
+# don't. Countries not here: the visits are counted, with no amount yet.
+VISIT_PAY = {"SG": (5000, "SGD")}
+
+
 def visit_charge(country: str, minutes: int):
     """(cents, currency) the bot suggests for a resolved visit, or None."""
     if country not in PRICING or minutes <= 0:
@@ -1065,3 +1071,82 @@ async def cmd_visitchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     async with write_lock:
         set_setting("visit_report_chat", json.dumps({"chat": chat.id, "thread": thread}))
     await update.message.reply_text("✅ On-Site visit reports will be posted here too.")
+
+
+# --------------------------------------------------------------------------
+# Pay: specialists are paid per visit (the Pay tab, and Admin → Team → On-Site)
+# --------------------------------------------------------------------------
+
+def month_bounds(month: str) -> tuple:
+    """'2026-10' (or '' for this month) → (first day, label, prev, next, is_current)."""
+    today = now().date()
+    try:
+        first = date.fromisoformat(month + "-01")
+    except ValueError:
+        first = today.replace(day=1)
+    if first > today:
+        first = today.replace(day=1)
+    prev = (first - timedelta(days=1)).replace(day=1)
+    nxt = (first + timedelta(days=32)).replace(day=1)
+    return first, first.strftime("%B %Y"), prev.strftime("%Y-%m"), nxt.strftime("%Y-%m"), nxt > today
+
+
+def pay_rate(user_id: int):
+    row = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+    return VISIT_PAY.get(row["country"] if row else "")
+
+
+def paid_visits(user_id: int, first: date) -> list:
+    """Visits that count for pay in this month: finished (🏁 Leave tapped)."""
+    month = first.strftime("%Y-%m")
+    return q("SELECT * FROM appointments WHERE specialist_id=? AND status='COMPLETED'"
+             " AND substr(left_at,1,7)=? ORDER BY left_at DESC", (user_id, month))
+
+
+def pay_summary(user_id: int, first: date) -> dict:
+    rows, rate = paid_visits(user_id, first), pay_rate(user_id)
+    return {"count": len(rows),
+            "total": money_text(rate[0] * len(rows), rate[1]).replace(".00", "") if rate else "",
+            "rate": money_text(rate[0], rate[1]).replace(".00", "") if rate else "", "rows": rows}
+
+
+def pay_payload(user_id: int, month: str = "") -> dict:
+    first, label, prev, nxt, current = month_bounds(month)
+    s = pay_summary(user_id, first)
+    counted = [{**pay_visit(v), "outcome": OUTCOME_NAMES.get(v["outcome"], "Completed")}
+               for v in s["rows"]]
+    cancelled = q("SELECT * FROM appointments WHERE specialist_id=? AND status='CANCELLED'"
+                  " AND substr(starts_at,1,7)=? ORDER BY starts_at DESC",
+                  (user_id, first.strftime("%Y-%m")))
+    return {
+        "label": label, "prev": prev, "next": nxt, "hasNext": not current,
+        "count": s["count"], "total": s["total"],
+        "resolved": sum(1 for v in s["rows"] if v["outcome"] == "RESOLVED"),
+        "followup": sum(1 for v in s["rows"] if v["outcome"] in ("RETURN", "REPLACE")),
+        "counted": counted,
+        "notCounted": [{**pay_visit(v), "outcome": "Cancelled"} for v in cancelled],
+    }
+
+
+def pay_visit(v) -> dict:
+    """A visit on the Pay tab: when, what, who and where (no amount per visit)."""
+    start = span_of(v)[0]
+    return {"day": start.strftime("%a %-d %b"), "time": start.strftime("%H:%M"),
+            "type": VISIT_NAMES[v["visit_type"]], "customer": v["customer_name"],
+            "address": v["address"], "product": v["product"] or ""}
+
+
+def onsite_team_payload(month: str = "") -> dict:
+    """Admin → Team → On-Site: each specialist's visits and pay for the month."""
+    first, label, prev, nxt, current = month_bounds(month)
+    flags = {c: flag for c, flag, _, _ in COUNTRIES}
+    people, done = [], 0
+    for r in q("SELECT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
+               "WHERE m.dept='ONSITE' AND a.status='active' ORDER BY a.country, lower(a.name)"):
+        s = pay_summary(r["user_id"], first)
+        done += s["count"]
+        people.append({"name": display_name_of(r["user_id"], r["name"]), "flag": flags.get(r["country"] or "", ""),
+                       "count": s["count"], "pay": s["total"] or "rate not set"})
+    return {"label": label, "prev": prev, "next": nxt, "hasNext": not current,
+            "done": done, "people": people}
+

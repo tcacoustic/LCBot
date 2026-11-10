@@ -3684,6 +3684,11 @@ MINIAPP_HTML = """<!DOCTYPE html>
   body.admin-mode #app > :first-child { border-top:6px solid var(--accent); }
   #app > .back + .eyebrow { padding-top:4px; }
   .p.wait { border-color:var(--accent); }
+  .paycard { background:var(--ink); border-color:var(--ink); color:#fff; margin-top:12px; }
+  .paycard .k { font-size:12px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--headmuted); }
+  .paycard .v { font-size:26px; font-weight:800; margin-top:2px; }
+  .paycard .t { color:var(--headmuted); }
+  #teamKind { margin-bottom:8px; }
   .duo { display:flex; gap:8px; margin-top:10px; }
   .duo button { flex:1; min-height:44px; border-radius:6px; font-size:14px; font-weight:800; cursor:pointer; }
   .duo .ok { background:var(--green); color:#fff; border:2px solid var(--green); }
@@ -3762,7 +3767,8 @@ function caseTags(c, extra) {
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
               ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'],
-              people: [ICONS.shield, 'People'], updates: [ICONS.news, 'Updates'] };
+              people: [ICONS.shield, 'People'], pay: [ICONS.hours, 'Pay'],
+              updates: [ICONS.news, 'Updates'] };
 let TAB_NAMES = {};
 function navBar() {
   const tabs = ADMIN_MODE ? ADMIN_TABS
@@ -3943,6 +3949,10 @@ function renderTeamHome(d) {
     h += d.next ? hero('Next visit · ' + d.next.day + ' ' + d.next.start, d.next.customer,
                        [d.next.type, d.next.address].filter(Boolean).join(' · '), true)
                 : hero('Next visit', 'Nothing booked', '');
+    if (d.pay) h += '<div class="p tappable paycard" data-gopay="1"><div class="ptop"><div>'
+       + `<div class="k">${esc(d.pay.label)}</div><div class="v">${esc(d.pay.total || plural(d.pay.count, 'visit'))}</div></div>`
+       + '<div class="t">›</div></div>'
+       + `<div class="t">${esc(plural(d.pay.count, 'visit'))} · see Pay</div></div>`;
     h += cards([[d.todayVisits.length, 'Visits today'], [d.weekVisits, 'This week']]);
     if (d.todayVisits.length) h += '<h2>Today</h2>' + d.todayVisits.map(v => visitRow({ ...v, specialist: '' })).join('');
     h += '<div class="note">At the visit, send /visits to the bot to tap 🚗 Arrived and 🏁 Leave.</div>';
@@ -3983,6 +3993,7 @@ function renderTeamHome(d) {
   wire();
   wireRequestButton();
   document.querySelectorAll('[data-gotovis]').forEach(el => { el.onclick = () => { VIEW = 'vis'; render(); }; });
+  document.querySelectorAll('[data-gopay]').forEach(el => { el.onclick = () => { VIEW = 'pay'; PAY_MONTH = ''; render(); }; });
   document.querySelectorAll('[data-hcase]').forEach(el => {
     el.onclick = () => {
       if (d.teamHome === 'ON') { ON_GROUP = CH_GROUP[el.dataset.hch] || ON_GROUP; ON_REGION = ''; }
@@ -5020,7 +5031,7 @@ async function loadTeam() {
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
 
-  let h = adminHead() + '<h1>Team</h1><div class="seg">'
+  let h = adminHead() + '<h1>Team</h1>' + teamKindSeg() + '<div class="seg">'
     + `<div data-p="week" class="${MODE === 'week' ? 'on' : ''}">Week</div>`
     + `<div data-p="month" class="${MODE === 'month' ? 'on' : ''}">Month</div>`
     + '</div>';
@@ -5067,6 +5078,7 @@ async function loadTeam() {
   }
   app.innerHTML = h + navBar();
   wire();
+  wireTeamKind();
 }
 
 // Special request to Ops: the same steps as /request in the bot, on one screen.
@@ -5244,6 +5256,69 @@ function loadFeedback() {
   };
 }
 
+// On-Site specialists are paid per visit: the Pay tab, and Admin → Team → On-Site.
+let PAY_MONTH = '', TEAM_KIND = '', TEAM_KINDS = [];
+function monthNav(d) {
+  return '<div class="nav">'
+    + `<button id="mPrev" data-m="${d.prev}">‹</button><div class="m">${esc(d.label)}</div>`
+    + `<button id="mNext" data-m="${d.next}" ${d.hasNext ? '' : 'disabled'}>›</button></div>`;
+}
+function wireMonthNav(go) {
+  const p = document.getElementById('mPrev'), n = document.getElementById('mNext');
+  if (p) p.onclick = () => go(p.dataset.m);
+  if (n) n.onclick = () => go(n.dataset.m);
+}
+async function loadPay() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/pay' + (PAY_MONTH ? '?month=' + PAY_MONTH : ''));
+  const row = (v, counts) => `<div class="p${counts ? '' : ' quiet'}"><div class="ptop"><div class="pn">${esc(v.day)} · ${esc(v.time)}</div>`
+    + `<div class="t">${esc(v.type)}</div></div>`
+    + `<div class="t">${esc(v.customer)} · ${esc(v.address)}</div>`
+    + (v.product ? `<div class="t">${esc(v.product)}</div>` : '')
+    + `<div class="t"><b>${esc(v.outcome)}</b></div></div>`;
+  let h = '<h1>Pay</h1><div class="sub">Paid per visit</div>' + monthNav(d);
+  h += '<div class="cards">'
+    + `<div class="card pay wide"><div class="n">${esc(d.total || (d.count + ' visit' + (d.count === 1 ? '' : 's')))}</div>`
+    + `<div class="l">${d.total ? 'Total pay' : 'Pay not set yet: ask an admin'}</div></div>`
+    + `<div class="card"><div class="n">${d.count}</div><div class="l">Visits</div></div>`
+    + `<div class="card"><div class="n">${d.resolved}</div><div class="l">Resolved</div></div></div>`;
+  h += d.counted.length ? '<h2>Your visits</h2>' + d.counted.map(v => row(v, true)).join('')
+                        : '<div class="empty">No finished visits this month yet.</div>';
+  if (d.notCounted.length) h += '<h2>Not counted</h2>' + d.notCounted.map(v => row(v, false)).join('');
+  h += '<div class="note">A visit counts once you tap 🏁 Leave. Wrong? Tap 🔧 and tell us which visit.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  wireMonthNav(m => { PAY_MONTH = m; loadPay(); });
+}
+async function loadTeamOnsite() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/team/onsite' + (PAY_MONTH ? '?month=' + PAY_MONTH : ''));
+  let h = adminHead() + '<h1>Team</h1>' + teamKindSeg() + monthNav(d);
+  h += '<div class="cards">'
+    + `<div class="card"><div class="n">${d.done}</div><div class="l">Visits done</div></div>`
+    + `<div class="card"><div class="n">${d.people.length}</div><div class="l">Specialists</div></div></div>`;
+  h += d.people.length ? '<h2>By specialist</h2>' + d.people.map(p =>
+      `<div class="p"><div class="ptop"><div class="pn">${esc(p.flag)} ${esc(p.name)}</div><div class="pp">${esc(p.pay)}</div></div>`
+      + `<div class="t">${p.count} visit${p.count === 1 ? '' : 's'}</div></div>`).join('')
+    : '<div class="empty">No On-Site specialists yet.</div>';
+  h += '<div class="note">Each country is paid in its own currency, so there’s no single total.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  wireTeamKind();
+  wireMonthNav(m => { PAY_MONTH = m; loadTeamOnsite(); });
+}
+function teamKindSeg() {
+  if (TEAM_KINDS.length < 2) return '';
+  return '<div class="seg" id="teamKind">'
+    + `<div data-tk="lc" class="${TEAM_KIND === 'lc' ? 'on' : ''}">Livechat</div>`
+    + `<div data-tk="onsite" class="${TEAM_KIND === 'onsite' ? 'on' : ''}">On-Site</div></div>`;
+}
+function wireTeamKind() {
+  document.querySelectorAll('[data-tk]').forEach(el => el.onclick = () => {
+    TEAM_KIND = el.dataset.tk; START = ''; PAY_MONTH = ''; AGENT = null; render();
+  });
+}
+
 // 🛡 Admin: admins flip between their own App and the admin side (People, Team).
 let ADMIN_TABS = null, ADMIN_MODE = false;
 let PEOPLE = null, PERSON = null, APPROVE = null, P_TEAM = 'ALL', P_FIND = '';
@@ -5251,7 +5326,10 @@ let AP = { teams: [], channels: [], country: '' };
 async function adminButton() {
   if (ADMIN_TABS === null) {
     ADMIN_TABS = [];
-    try { ADMIN_TABS = (await getJSON('/api/admin')).tabs || []; } catch (e) {}
+    try {
+      const a = await getJSON('/api/admin');
+      ADMIN_TABS = a.tabs || []; TEAM_KINDS = a.teamKinds || []; TEAM_KIND = TEAM_KINDS[0] || '';
+    } catch (e) {}
   }
   let b = document.getElementById('admBtn');
   if (!ADMIN_TABS.length) { if (b) b.remove(); document.body.classList.remove('has-adm'); return; }
@@ -5587,8 +5665,13 @@ async function render() {
     return;
   }
   if (VIEW === 'team') {
-    try { AGENT ? await loadAgent() : await loadTeam(); }
+    try { TEAM_KIND === 'onsite' ? await loadTeamOnsite() : AGENT ? await loadAgent() : await loadTeam(); }
     catch (e) { showFatal('The team view would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'pay') {
+    try { await loadPay(); }
+    catch (e) { showFatal('Pay would not load', e.message || e); }
     return;
   }
   if (VIEW === 'people') {
