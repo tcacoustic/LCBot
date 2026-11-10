@@ -2727,7 +2727,7 @@ async def refresh_case_post(bot, case_id: int) -> None:
 
 async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
     """A PM said Not needed: take the case out of its store chat (delete the
-    message, or just its part of a shared one) and post it to TC Online."""
+    message, or just its part of a shared one). Quietly: no post to TC Online."""
     r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if not r:
         return
@@ -2747,20 +2747,11 @@ async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
             if not rest:    # Telegram only lets bots delete for 48 hours: shrink it instead
                 try:
                     await bot.edit_message_text(
-                        f"➖ {r['username']} · not needed · moved to TC Online",
+                        f"➖ {r['username']} · not needed",
                         chat_id=p["chat_id"], message_id=p["message_id"])
                 except Exception:
                     pass
-    # One line: the case is already in the handover, only the PM's answer is new.
-    day = date.fromisoformat(r["the_date"]).strftime("%a %-d %b")
-    order = (r["order_no"] or "").strip()
-    bits = [CHANNEL_NAMES.get(r["channel"] or "", ""), r["username"] or "case"]
-    if order and order.lower() not in ("none", "-", "na", "n/a"):
-        bits.append(order)
-    bits.append(day)
-    await post_ops(
-        bot, "ℹ️ " + " · ".join(b for b in bits if b)
-             + f": {display_name_of(pm_id, 'Online')} said not needed. SH, please close it.")
+    # Nothing is posted anywhere: SH see Online's tick on the case and close it.
 
 
 # Sort cases from before channels existed into one, by their store.
@@ -4530,7 +4521,7 @@ function renderOnline(d) {
       const help = el.dataset.help === '1';
       const out = await post('/api/case/pick', { id: Number(el.dataset.pick), help });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not save that.'); return; }
-      toast(help ? 'On your list' : 'Off your list · moved to TC Online');
+      toast(help ? 'On your list' : 'Off your list');
       await loadHandover();
     };
   });

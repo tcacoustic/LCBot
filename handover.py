@@ -1244,7 +1244,7 @@ async def on_store_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await refresh_case_post(context.bot, case_id)
     else:
         await move_to_tc_online(context.bot, case_id, uid)
-    await query.answer("On your list ✓" if action == "h" else "Off your list · moved to TC Online ✓")
+    await query.answer("On your list ✓" if action == "h" else "Off your list ✓")
 
 
 async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
