@@ -1197,15 +1197,24 @@ def is_full_admin(user_id: int) -> bool:
     return setting(f"full_admin:{user_id}", "") == "1"
 
 
+def admin_teams(user_id: int) -> set:
+    """The teams an admin looks after: the ones the owner picked in the App,
+    else the teams they're in."""
+    raw = setting(f"admin_teams:{user_id}", "")
+    if raw:
+        return {t for t in raw.split(",") if t in DEPT_NAMES}
+    return depts_of(user_id)
+
+
 def admin_for(user_id: int, *depts: str) -> bool:
     """Admin powers for these teams. The owner and full admins have them for
-    every team; other admins only for the teams they're in (an SH + Livechat
-    admin gets no ON or Ops tools)."""
+    every team; other admins for the teams they look after (admin_teams: the
+    owner's pick, else the teams they're in)."""
     if not is_admin(user_id):
         return False
     if is_owner(user_id) or not ADMIN_IDS or is_full_admin(user_id):
         return True
-    return bool(depts_of(user_id) & set(depts))
+    return bool(admin_teams(user_id) & set(depts))
 
 
 def is_livechat(user_id: int) -> bool:
@@ -5605,8 +5614,9 @@ function personScreen() {
   if (d.canRole && !p.owner) {
     h += '<h2>Settings</h2><div class="row"><div class="lbl">Admin<small>Admin tools for their teams</small></div>'
       + `<div class="sw${p.admin ? ' on' : ''}" id="pAdmin"><i></i></div></div>`;
-    if (p.admin) h += '<div class="row"><div class="lbl">Admin for all teams<small>Admin tools for every team, without joining them</small></div>'
-      + `<div class="sw${p.fullAdmin ? ' on' : ''}" id="pFull"><i></i></div></div>`;
+    if (p.admin) h += '<div class="fld"><label>Admin for</label>'
+      + pickRow('at', [['ALL', 'All teams']].concat(d.teams), p.fullAdmin ? ['ALL'] : p.adminTeams)
+      + '<div class="note" style="margin-top:6px">Their admin tools cover these teams. They don’t join them.</div></div>';
   }
   h += '<h2>Name in the bot</h2><div class="nameedit">'
     + `<input id="pName" value="${attr(p.name)}"><button id="pSaveName">Save</button></div>`;
@@ -5631,8 +5641,12 @@ function personScreen() {
   document.querySelectorAll('[data-cy]').forEach(el => el.onclick = () => save('country', el.dataset.cy, 'Country saved'));
   const adm = document.getElementById('pAdmin');
   if (adm) adm.onclick = () => save('admin', !p.admin, p.admin ? 'Admin removed' : 'Now an admin');
-  const full = document.getElementById('pFull');
-  if (full) full.onclick = () => save('fulladmin', !p.fullAdmin, p.fullAdmin ? 'Back to their own teams' : 'Admin for all teams');
+  document.querySelectorAll('[data-at]').forEach(el => el.onclick = () => {
+    const k = el.dataset.at;
+    if (k === 'ALL') return save('fulladmin', !p.fullAdmin, p.fullAdmin ? 'Back to the teams ticked' : 'Admin for all teams');
+    // From All teams, a tap starts the list with just that team.
+    return save('adminteams', p.fullAdmin ? [k] : flip(p.adminTeams, k), 'Admin teams saved');
+  });
   document.getElementById('pSaveName').onclick = () => save('name', document.getElementById('pName').value, 'Name saved');
   const rm = document.getElementById('pRemove');
   if (rm) rm.onclick = async () => {

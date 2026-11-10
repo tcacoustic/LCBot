@@ -1167,6 +1167,7 @@ def person_dict(r) -> dict:
         "id": uid, "name": r["display_name"] or r["name"] or "", "username": r["username"] or "",
         "teams": teams, "admin": bool(is_owner(uid) or r["role"] == "admin"), "owner": is_owner(uid),
         "fullAdmin": r["role"] == "admin" and is_full_admin(uid),
+        "adminTeams": [k for k, _ in DEPARTMENTS if k in admin_teams(uid)] if r["role"] == "admin" else [],
         "channels": online_channels(uid) if "ON" in teams else [],
         "country": (r["country"] or "") if "ONSITE" in teams else "",
         "store": store_of(uid) if "FS" in teams else "",
@@ -1332,6 +1333,7 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         run("UPDATE agents SET role=? WHERE user_id=?", ("admin" if value else "agent", uid))
         if not value:
             set_setting(f"full_admin:{uid}", "")     # no longer an admin: not a full one either
+            set_setting(f"admin_teams:{uid}", "")
         menus = True
         if value:
             on_bot_loop(bot_ref().send_message(
@@ -1346,6 +1348,18 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         if value:
             on_bot_loop(bot_ref().send_message(
                 uid, "You now have admin tools for every team. Send /help to see what's new."))
+    elif field == "adminteams":
+        if not is_owner(admin_id):
+            return {"ok": False, "error": "Only the owner picks which teams an admin looks after."}
+        if row["role"] != "admin":
+            return {"ok": False, "error": "Make them an admin first."}
+        teams = clean_list(value, [k for k, _ in DEPARTMENTS])
+        if not teams:
+            return {"ok": False, "error": "Keep at least one team, or turn Admin off."}
+        set_setting(f"full_admin:{uid}", "")
+        # The same as their own teams: store nothing, so it follows their teams.
+        set_setting(f"admin_teams:{uid}", "" if set(teams) == set(teams_of(uid)) else ",".join(teams))
+        menus = True
     elif field == "name":
         nm = " ".join(str(value or "").split())
         if not 2 <= len(nm) <= 40:
