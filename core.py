@@ -3336,7 +3336,7 @@ def team_help(user_id: int, extra: bool = False) -> str:
                      "deliveries asked for after the 2pm cut-off are marked ⏰ and come back "
                      "at 10am the next working day; same-day ones are 🔴 URGENT.\n/requests — the ones still open")
     if "ONSITE" in depts:
-        parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
+        parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 🚗 Arrived "
                      "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "
                      "the 📎: your week, and mark the half-days you're not free.")
     if extra:
@@ -3945,7 +3945,7 @@ function renderTeamHome(d) {
                 : hero('Next visit', 'Nothing booked', '');
     h += cards([[d.todayVisits.length, 'Visits today'], [d.weekVisits, 'This week']]);
     if (d.todayVisits.length) h += '<h2>Today</h2>' + d.todayVisits.map(v => visitRow({ ...v, specialist: '' })).join('');
-    h += '<div class="note">At the visit, send /visits to the bot to tap 📍 Arrived and 🏁 Leave.</div>';
+    h += '<div class="note">At the visit, send /visits to the bot to tap 🚗 Arrived and 🏁 Leave.</div>';
     h += '<h2>Not free this week</h2><div class="p tappable" data-gotovis="1"><div class="pn">'
        + esc(d.notFree.length ? d.notFree.join(' · ') : 'Free all week') + '</div><div class="t">Change it in My visits</div></div>';
   } else if (d.teamHome === 'ON') {
