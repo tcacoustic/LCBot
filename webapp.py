@@ -1061,9 +1061,10 @@ def may_post_updates(user_id: int) -> bool:
 
 
 def updates_for(user_id: int) -> list:
-    """Newest first: everyone's, plus their teams'. Posters see them all."""
+    """Newest first: everyone's, plus their teams'. Posters see them all,
+    except the owner viewing as a team, who sees just what that team sees."""
     mine = depts_of(user_id)
-    every = may_post_updates(user_id)
+    every = may_post_updates(user_id) and not viewing_as(user_id)
     out = [u for u in all_updates() if every or "ALL" in u["teams"] or mine & set(u["teams"])]
     return sorted(out, key=lambda u: -u["id"])
 
