@@ -3345,7 +3345,7 @@ def team_help(user_id: int, extra: bool = False) -> str:
                      "deliveries asked for after the 2pm cut-off are marked ⏰ and come back "
                      "at 10am the next working day; same-day ones are 🔴 URGENT.\n/requests — the ones still open")
     if "ONSITE" in depts:
-        parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 📍 Arrived "
+        parts.append("👋 <b>On-Site</b>\n\n/visits — your visits. Tap one, then 🚗 Arrived "
                      "when you get there and 🏁 Leave when you're done.\nIn the <b>App</b> by "
                      "the 📎: your week, and mark the half-days you're not free.")
     if extra:

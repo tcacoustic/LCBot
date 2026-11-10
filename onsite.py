@@ -386,6 +386,56 @@ async def tell(bot, user_id: int | None, text: str, kb=None) -> None:
         log.info("Couldn't message %s about a visit: %s", user_id, e)
 
 
+# Reminders for the specialist, as they work: confirm the date with the customer
+# a couple of days before, and tell them you're on the way about an hour before.
+CONFIRM_DAYS, CONFIRM_HOUR, ETA_MIN = 2, 10, 60
+
+
+def reminder_due(v, at: datetime) -> tuple:
+    """(kind, when it's due) for each reminder this visit gets: none for one
+    booked after that reminder's time."""
+    start = span_of(v)[0]
+    confirm = datetime.combine(start.date() - timedelta(days=CONFIRM_DAYS),
+                               time(CONFIRM_HOUR), tzinfo=start.tzinfo)
+    # When it got its time: a handover is created first and booked later.
+    row = q1("SELECT created_at FROM appointment_log WHERE appt_id=? AND action='booked' "
+             "ORDER BY id DESC LIMIT 1", (v["id"],))
+    booked = datetime.fromisoformat(row["created_at"] if row else v["created_at"])
+    out = []
+    if booked < confirm <= at < start - timedelta(hours=12):
+        out.append(("confirm", confirm))
+    eta = start - timedelta(minutes=ETA_MIN)
+    if booked < eta <= at < start:
+        out.append(("eta", eta))
+    return out
+
+
+def reminder_text(v, kind: str) -> str:
+    start = span_of(v)[0]
+    if kind == "confirm":
+        head = (f"📞 Visit on {start.strftime('%a %-d %b, %H:%M')}: please confirm the date "
+                "and time with the customer.")
+    else:
+        head = (f"🚗 Visit at {start.strftime('%H:%M')}, in about an hour: let the customer "
+                "know you're on the way.")
+    return visit_text(v, head)
+
+
+async def job_visit_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every few minutes: send the reminders that are due. Each is sent once
+    per visit time, so a visit that moves gets them again for its new time."""
+    at = now()
+    for v in q("SELECT * FROM appointments WHERE status='SCHEDULED' AND specialist_id IS NOT NULL"):
+        for kind, _ in reminder_due(v, at):
+            key = f"visit_reminded:{v['id']}:{kind}"
+            if setting(key, "") == v["starts_at"]:
+                continue
+            async with write_lock:
+                set_setting(key, v["starts_at"])
+            await tell(context.bot, v["specialist_id"], reminder_text(v, kind),
+                       visit_buttons(v, v["specialist_id"]))
+
+
 async def notify_booked(bot, appt_id: int) -> None:
     v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
     await tell(bot, v["specialist_id"],
@@ -1131,7 +1181,7 @@ def visit_buttons(v, user_id: int) -> InlineKeyboardMarkup:
     rows = []
     mine = v["specialist_id"] == user_id
     if mine and v["status"] == "SCHEDULED":
-        rows.append([InlineKeyboardButton("📍 Arrived", callback_data=f"vz:ar:{v['id']}")])
+        rows.append([InlineKeyboardButton("🚗 Arrived", callback_data=f"vz:ar:{v['id']}")])
     if mine and v["status"] == "ONSITE":
         rows.append([InlineKeyboardButton("📝 Open the visit form", url=VISIT_FORM_URL)])
         rows.append([InlineKeyboardButton("🏁 Leave", callback_data=f"vz:lv:{v['id']}")])

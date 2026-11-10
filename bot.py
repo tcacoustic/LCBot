@@ -479,6 +479,10 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(
         job_ops_rounds, interval=timedelta(minutes=30), first=first, name="ops-rounds",
     )
+    app.job_queue.run_repeating(
+        job_visit_reminders, interval=timedelta(minutes=5), first=timedelta(minutes=1),
+        name="visit-reminders",
+    )
     kmins = parse_time_token(BUMP_TIME)
     app.job_queue.run_daily(
         job_case_bump, time(kmins // 60, kmins % 60, tzinfo=TZ), name="case-bump",
