@@ -747,7 +747,15 @@ def may_edit_cases(user_id: int) -> bool:
 
 def case_button_label(r) -> str:
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
-    label = f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '?')}"
+    # The order number tells cases apart better than the platform name; the
+    # flag keeps the country. No order: the platform name, as before.
+    order = (r["order_no"] or "").strip()
+    if order and order.lower() not in ("none", "-", "na", "n/a"):
+        flag = next((f for k, f, _ in CHANNELS if k == r["channel"]), "")
+        where = f"{flag} {order}".strip()
+    else:
+        where = CHANNEL_NAMES.get(r["channel"] or "", "?")
+    label = f"{r['prio']} {r['username']} · {where}"
     if r["handed_back"]:
         label = "↩️ " + label
     elif r["origin"] == "on" and not r["sh_closed"]:
@@ -763,10 +771,94 @@ def case_button_label(r) -> str:
 
 CASES_PER_PAGE = 15
 
+FLAG_COUNTRY = {"🇸🇬": "SG", "🇲🇾": "MY", "🇭🇰": "HK", "🇹🇭": "TH"}
+CHANNEL_COUNTRY = {key: FLAG_COUNTRY.get(flag, "") for key, flag, _ in CHANNELS}
+BUMP_TIME = os.environ.get("CASE_BUMP_TIME", "").strip() or "10:00"
+
+
+def still_open_for_online(channel: str, before) -> list:
+    """Cases from before today that Online hasn't closed: not answered yet, or
+    "I'll help" but not closed. Not needed, handed back and Online's own
+    requests are left out."""
+    if not online_covers(channel):
+        return []
+    return q("SELECT * FROM ho_cases WHERE channel=? AND closed=0 AND on_closed=0"
+             " AND handed_back=0 AND COALESCE(origin,'')!='on' AND created_at<?"
+             " ORDER BY created_at, id", (channel, before.isoformat()))
+
+
+def bump_text(channel: str, rows: list) -> str:
+    waiting = sum(1 for r in rows if pm_pick(r["id"]) is None)
+    lines = [f"⏳ <b>Still open · {len(rows)} case{'' if len(rows) == 1 else 's'}</b>"
+             f" · {esc(CHANNEL_NAMES.get(channel, ''))}"]
+    sub = (f"{waiting} with no answer yet. " if waiting else "") + "Tap a name to jump to that case."
+    lines += [f"<i>{sub}</i>", ""]
+    for r in rows:
+        name = esc(r["username"] or "case")
+        p = q1("SELECT chat_id, message_id FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
+        chat = str(p["chat_id"]) if p else ""
+        if chat.startswith("-100") and p["message_id"]:
+            name = f'<a href="https://t.me/c/{chat[4:]}/{p["message_id"]}">{name}</a>'
+        order = (r["order_no"] or "").strip()
+        bits = [f"{r['prio']} {name}"]
+        if order and order.lower() not in ("none", "-", "na", "n/a"):
+            bits.append(esc(order))
+        bits.append(date.fromisoformat(r["the_date"]).strftime("%a %-d %b"))
+        helper = helper_of(r["id"])
+        bits.append(f"🙋 {esc(display_name_of(helper, 'Online'))}" if helper else "<b>no answer</b>")
+        lines.append(" · ".join(bits))
+    return "\n".join(lines)
+
+
+async def post_bumps(bot, when=None) -> int:
+    """Working mornings: each store chat gets one short list of its cases from
+    earlier days that Online hasn't closed. Nothing open: nothing posted."""
+    from ops import is_working_day
+    when = when or now()
+    start = when.replace(hour=0, minute=0, second=0, microsecond=0)
+    sent = 0
+    for key, _, _ in CHANNELS:
+        where = channel_chat(key)
+        if not where or not is_working_day(CHANNEL_COUNTRY.get(key, ""), when.date()):
+            continue
+        rows = still_open_for_online(key, start)
+        if not rows:
+            continue
+        kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
+        kb = (InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📋 Open all in SH Bot", url=f"https://t.me/{bot.username}?start=cases")]])
+            if bot.username else None)
+        try:
+            await bot.send_message(where["chat"], bump_text(key, rows), parse_mode=constants.ParseMode.HTML,
+                                   reply_markup=kb, disable_web_page_preview=True, **kw)
+            sent += 1
+        except Exception as e:
+            log.warning("Couldn't post the %s bump: %s", key, e)
+    return sent
+
+
+async def cmd_bumpnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/bumpnow (owner, hidden) — post today's bump now, to try it out."""
+    if not is_owner(update.effective_user.id):
+        return
+    n = await post_bumps(context.bot)
+    await update.message.reply_text(f"Posted the bump in {n} store chat{'' if n == 1 else 's'}."
+                                     if n else "Nothing to bump: no store has cases open from earlier days, "
+                                     "or today isn't a working day.")
+
+
+async def job_case_bump(context: ContextTypes.DEFAULT_TYPE) -> None:
+    day = now().date().isoformat()
+    if setting("case_bump_done", "") == day:      # once a day, even after a restart
+        return
+    set_setting("case_bump_done", day)
+    await post_bumps(context.bot)
+
 
 def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     mine = set(online_channels(user_id))
-    rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    skipped = skipped_ids()
+    rows = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id") if r["id"] not in skipped]
     own = [r for r in rows if r["channel"] in mine]
     rest = [r for r in rows if r["channel"] not in mine]
     new_btn = ([[InlineKeyboardButton("➕ New Online request", callback_data="cs:new")]]
@@ -790,10 +882,10 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     here = f"cs:l:{page}"
     buttons, heading = [], None
     for r, is_own in ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]:
-        if mine and is_own != heading:
-            heading = is_own
-            title = "— Your channels —" if is_own else "— Other channels —"
-            buttons.append([InlineKeyboardButton(title, callback_data=here)])
+        if mine and not is_own and heading is not False:
+            # Own channels come first with no heading; one divider where the rest start.
+            heading = False
+            buttons.append([InlineKeyboardButton("— Other channels —", callback_data=here)])
         buttons.append([InlineKeyboardButton(case_button_label(r),
                                              callback_data=f"cs:v:{r['id']}")])
     if pages > 1:
@@ -886,7 +978,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             close_case(case_id, uid, side="on")
         await refresh_case_post(context.bot, case_id)
         await query.answer("Closed on the Online side ✓")
-    elif action == "s" and not is_online(uid):
+    elif action == "s" and not online_view(uid):
         async with write_lock:
             close_case(case_id, uid, side="sh")
         await refresh_case_post(context.bot, case_id)
@@ -1009,7 +1101,7 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["case_note"] = (action, case_id)
         await update.message.reply_text("Type a few words, or /cancel.")
         return CASE_NOTE
-    side = "on" if is_online(uid) else "sh"
+    side = "on" if online_view(uid) else "sh"
     async with write_lock:
         if action == "h":
             hand_back_case(case_id, uid, note)
@@ -1115,7 +1207,7 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer("That case is already closed.")
         await refresh_case_post(context.bot, case_id)
         return
-    side = "on" if is_online(uid) else "sh"
+    side = "on" if online_view(uid) else "sh"
     if r[f"{side}_closed"]:
         other = "SH" if side == "on" else "Online"
         await query.answer(f"Already closed on your side — waiting on {other}.",
@@ -1126,6 +1218,33 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await refresh_case_post(context.bot, case_id)
     await notify_reply(context.bot, case_id, uid, closed=True)
     await query.answer(f"Closed on the {'Online' if side == 'on' else 'SH'} side ✓")
+
+
+async def on_store_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:h:<id> I'll help · sc:n:<id> Not needed — a PM's answer to a new SH
+    case in a store chat. Not needed counts as Online's close; SH isn't told."""
+    query = update.callback_query
+    uid = query.from_user.id
+    if not online_view(uid):
+        await query.answer("This is for the platform managers.", show_alert=True)
+        return
+    _, action, cid = query.data.split(":")
+    case_id = int(cid)
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r or not awaiting_pm(r):
+        await query.answer("Someone already answered this one.")
+        await refresh_case_post(context.bot, case_id)
+        return
+    async with write_lock:
+        if action == "h":
+            pm_will_help(case_id, uid)
+        else:
+            pm_not_needed(case_id, uid)
+    if action == "h":
+        await refresh_case_post(context.bot, case_id)
+    else:
+        await move_to_tc_online(context.bot, case_id, uid)
+    await query.answer("On your list ✓" if action == "h" else "Off your list ✓")
 
 
 async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1141,7 +1260,7 @@ async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not r:
         await query.answer("That case is gone.")
         return
-    side = "on" if is_online(uid) else "sh"
+    side = "on" if online_view(uid) else "sh"
     if not r[f"{side}_closed"]:
         other = "SH" if side == "on" else "Online"
         where = "Cases → Close (Online)" if side == "on" else "Handover (untick it)"

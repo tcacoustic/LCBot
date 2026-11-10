@@ -479,6 +479,10 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(
         job_ops_rounds, interval=timedelta(minutes=30), first=first, name="ops-rounds",
     )
+    kmins = parse_time_token(BUMP_TIME)
+    app.job_queue.run_daily(
+        job_case_bump, time(kmins // 60, kmins % 60, tzinfo=TZ), name="case-bump",
+    )
     rmins = parse_time_token(os.environ.get("REPORT_TIME", "").strip() or "09:00")
     app.job_queue.run_daily(
         job_case_report, time(rmins // 60, rmins % 60, tzinfo=TZ),
@@ -581,20 +585,24 @@ def main() -> None:
     app.add_handler(CommandHandler("roster", cmd_roster))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("clockin", cmd_clockin))
+    # /changeshift: drop, give or exchange. /dropshift and /swap open it too.
     app.add_handler(
         ConversationHandler(
-            entry_points=[CommandHandler("dropshift", cmd_dropshift)],
+            entry_points=[CommandHandler(["changeshift", "dropshift", "swap"], cmd_changeshift)],
             states={
-                DROP_PICK: [CallbackQueryHandler(on_drop_pick, pattern=r"^ds:")],
-                DROP_REASON: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_drop_reason)
-                ],
+                CG_PICK: [CallbackQueryHandler(on_cg_button, pattern=r"^cg:")],
+                CG_WHAT: [CallbackQueryHandler(on_cg_button, pattern=r"^cg:")],
+                CG_WHO: [CallbackQueryHandler(on_cg_button, pattern=r"^cg:")],
+                CG_THEIRS: [CallbackQueryHandler(on_cg_button, pattern=r"^cg:")],
+                CG_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_cg_reason),
+                            CallbackQueryHandler(on_cg_button, pattern=r"^cg:")],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
             allow_reentry=True,
             conversation_timeout=1800,
         )
     )
+    app.add_handler(CallbackQueryHandler(on_exchange_answer, pattern=r"^xa:[yn]:\d+$"))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("pickup", cmd_pickup)],
@@ -602,21 +610,6 @@ def main() -> None:
                 PICKUP_PICK: [CallbackQueryHandler(on_pickup_pick, pattern=r"^pu:")],
                 PICKUP_REASON: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, got_pickup_reason)
-                ],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-            allow_reentry=True,
-            conversation_timeout=1800,
-        )
-    )
-    app.add_handler(
-        ConversationHandler(
-            entry_points=[CommandHandler("swap", cmd_swap)],
-            states={
-                SWAP_PICK: [CallbackQueryHandler(on_swap_pick, pattern=r"^sw:")],
-                SWAP_WHO: [CallbackQueryHandler(on_swap_who, pattern=r"^sq:")],
-                SWAP_REASON: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_swap_reason)
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
@@ -714,7 +707,8 @@ def main() -> None:
                 R_ORDER: [MessageHandler(text_in, on_request_order)],
                 R_COUNTRY: [CallbackQueryHandler(on_request_country, pattern=r"^sr:y:[A-Z]{2}$")],
                 R_CAT: [CallbackQueryHandler(on_request_category, pattern=r"^sr:c:[A-Z]+$")],
-                R_DETAILS: [MessageHandler(text_in, on_request_details)],
+                R_DETAILS: [MessageHandler(text_in, on_request_details),
+                            CallbackQueryHandler(on_request_option, pattern=r"^sr:q:(\d|none)$")],
                 R_DATE: [CallbackQueryHandler(on_request_date, pattern=r"^sr:d:")],
                 R_DATE_TYPED: [MessageHandler(text_in, on_request_date_typed)],
                 R_TIME: [CallbackQueryHandler(on_request_time, pattern=r"^sr:t:[A-Z]+$")],
@@ -777,9 +771,12 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
-    app.add_handler(CommandHandler(["onchat", "linkchat"], cmd_linkchat))   # /linkchat: the old name
+    app.add_handler(CommandHandler(["onchat", "linkchat"], cmd_linkchat))
+    app.add_handler(CommandHandler("bumpnow", cmd_bumpnow))
+    app.add_handler(CommandHandler("postupdate", cmd_postupdate))   # /linkchat: the old name
     app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
     app.add_handler(CallbackQueryHandler(on_store_reopen, pattern=r"^sc:o:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^sc:[hn]:\d+$"))
     app.add_handler(CommandHandler("cases", cmd_cases))
     app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
     app.add_handler(CommandHandler("report", cmd_report))

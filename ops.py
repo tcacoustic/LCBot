@@ -165,6 +165,15 @@ def stamp(iso: str | None) -> str:
     return datetime.fromisoformat(iso).strftime("%a %-d %b, %-I:%M%p") if iso else ""
 
 
+def details_html(text: str) -> str:
+    """The details for Ops: each answer's label in bold, so it scans at a glance."""
+    out = []
+    for line in (text or "").split("\n"):
+        label, sep, rest = line.partition(": ")
+        out.append(f"<b>{esc(label)}:</b> {esc(rest)}" if sep and label in OPS_LABEL_SET else esc(line))
+    return "\n".join(out)
+
+
 def request_text(r, head: str = "") -> str:
     """The request as Ops see it in their chat (HTML)."""
     d = date.fromisoformat(r["delivery_date"])
@@ -179,7 +188,7 @@ def request_text(r, head: str = "") -> str:
         f"Order: <code>{esc(r['order_no'])}</code>",
         f"Delivery: {date_label(d)} · {esc(timeframe_text(r))}",
         "",
-        esc(r["details"]),
+        details_html(r["details"]),
         "",
         f"<i>From {esc(sender_name(r))}"
         f"{' (' + esc(team_of(r['created_by'])) + ')' if r['created_by'] and team_of(r['created_by']) else ''}"
@@ -233,10 +242,18 @@ def is_flagged(rid: int) -> bool:
     return setting(f"red_flag:{rid}", "") == "yes"
 
 
+def on_sg_sheet(country: str) -> bool:
+    """Only SG has a Special Req sheet linked. MY, HK and TH requests stay out
+    of it (no country column there) and go to the Ops chat instead."""
+    return (country or "SG") == "SG"
+
+
 def in_ops_chat(r) -> bool:
-    """Which requests Ops see in Telegram: after the cut-off, same-day or 🚩.
-    The rest (on time) go only to the Special Req sheet; Ops work them there."""
-    return bool(r["after_cutoff"] or r["urgent"] or is_flagged(r["id"]))
+    """Which requests Ops see in Telegram: after the cut-off, same-day or 🚩,
+    and every MY/HK/TH one (no sheet for them yet). The rest (SG on time) go
+    only to the Special Req sheet; Ops work them there."""
+    return bool(r["after_cutoff"] or r["urgent"] or is_flagged(r["id"])
+                or not on_sg_sheet(r["country"]))
 
 
 def flagged_first(rows: list) -> list:
@@ -325,6 +342,12 @@ async def sync_to_sheet(rid: int) -> None:
     Left marked for the retry job if the sheet can't be reached."""
     if not (REQUEST_SHEET_URL and REQUEST_SHEET_SECRET):
         return
+    r = get_request(rid)
+    if r and r["source"] != "paperform" and not on_sg_sheet(r["country"]):
+        # Not for the SG sheet: nothing to send, so don't leave it to retry.
+        async with write_lock:
+            run("UPDATE special_requests SET sheet_dirty=0 WHERE id=?", (rid,))
+        return
     async with sheet_turn():
         await _sync_to_sheet(rid)
 
@@ -378,6 +401,47 @@ CATEGORY_HINTS = {
     "STOP": "Why it should be stopped, and what happens next (refund, cancel).",
     "OTHER": "What Ops need to do.",
 }
+# Each request type's questions, asked one by one in /request and as
+# required fields in the App. (key, question, buttons or None for typed, hint)
+REQUEST_QUESTIONS = {
+    "DATE": [("reason", "Reason", None, "e.g. Customer is away on the original date."),
+             ("agreed", "Customer agreed to the new date?", ["Yes", "No"], "")],
+    "ADDRESS": [("address", "New address", None, "Full address, with unit no. and postal code."),
+                ("reason", "Reason", None, "e.g. Customer moved office.")],
+    "PRODUCT": [("current", "Current item", None, "Model and colour, e.g. Era 100, Black."),
+                ("change_to", "Change to", None, "Model and colour, e.g. Era 100, White."),
+                ("price", "Price difference?", ["Yes", "No", "Not sure"], "")],
+    "STOP": [("reason", "Reason", None, "e.g. Customer ordered twice by mistake."),
+             ("next", "What happens next?", ["Refund", "Cancel", "Redeliver later"], "")],
+    "OTHER": [("todo", "What Ops need to do", None, "e.g. Call the customer 30 min before arriving."),
+              ("reason", "Reason", None, "")],
+}
+
+
+# How each answer is labelled for Ops (the question, said as a heading).
+OPS_LABELS = {"agreed": "Customer agreed", "price": "Price difference", "next": "Next step"}
+OPS_LABEL_SET = {"Reason", "New address", "Current item", "Change to", "What Ops need to do",
+                 "Other", *OPS_LABELS.values()}
+
+
+def compose_details(category: str, answers: dict, extra: str = "") -> str:
+    """The answers as labelled lines: what Ops see and the sheet's Description."""
+    lines = [f"{OPS_LABELS.get(key, label)}: {answers.get(key, '').strip()}"
+             for key, label, _, _ in REQUEST_QUESTIONS[category]]
+    if extra.strip():
+        lines.append(f"Other: {extra.strip()}")
+    return "\n".join(lines)[:2000]
+
+
+def missing_answer(category: str, answers: dict) -> str:
+    """The first question left blank (or with a made-up choice), or ''."""
+    for key, label, options, _ in REQUEST_QUESTIONS.get(category, []):
+        value = str(answers.get(key) or "").strip()
+        if not value or (options and value not in options):
+            return label
+    return ""
+
+
 # Where ‹ Back goes from each step.
 PREVIOUS = {R_COUNTRY: R_ORDER, R_CAT: R_COUNTRY, R_DETAILS: R_CAT, R_DATE: R_DETAILS,
             R_DATE_TYPED: R_DATE, R_TIME: R_DATE, R_TIME_TYPED: R_TIME, R_CONFIRM: R_TIME}
@@ -451,7 +515,7 @@ def draft_text(d: dict) -> str:
              f"Order: <code>{esc(d['order_no'])}</code> · {esc(REQUEST_COUNTRY_NAMES[d['country']])}",
              f"Request: <b>{esc(CATEGORY_NAMES[d['category']])}</b>",
              f"Delivery: {date_label(date.fromisoformat(d['delivery_date']))} · {esc(tf)}",
-             "", esc(d["details"])]
+             "", details_html(d["details"])]
     if d.get("red_flag"):
         lines += ["", "🚩 <b>Escalation</b>: Ops see it straight away, at the top."]
     warn = cutoff_warning(d)
@@ -476,9 +540,25 @@ def step_prompt(step: int, d: dict) -> tuple:
                 rows_with_back([[InlineKeyboardButton(name, callback_data=f"sr:c:{key}")]
                                 for key, name in REQUEST_CATEGORIES]))
     if step == R_DETAILS:
-        return (f"<b>{esc(CATEGORY_NAMES[d['category']])}</b>\n\nNow the <b>details</b>, as fully as you can.\n"
-                f"<i>{esc(CATEGORY_HINTS[d['category']])}</i>\n\nPlease don't include phone or ID numbers.",
-                rows_with_back([]))
+        qs = REQUEST_QUESTIONS[d["category"]]
+        i = d.get("qi", 0)
+        head = f"<b>{esc(CATEGORY_NAMES[d['category']])}</b>\n\n"
+        if i >= len(qs):
+            return (head + "<b>Anything else Ops should know?</b>\nType it, or tap Nothing else.\n"
+                    "<i>Please don't include phone or ID numbers.</i>",
+                    rows_with_back([[InlineKeyboardButton("Nothing else", callback_data="sr:q:none")]]))
+        key, label, options, hint = qs[i]
+        so_far = d.get("answers", {}).get(key)
+        text = head + f"<b>{i + 1} of {len(qs)} · {esc(label)}{'' if label.endswith('?') else '?'}</b>"
+        if hint:
+            text += f"\n<i>{esc(hint)}</i>"
+        if so_far and not options:
+            text += f"\n\nSo far: {esc(so_far)}. Send it again or a new one."
+        if options:
+            return text, rows_with_back([[InlineKeyboardButton(("✓ " if so_far == o else "") + o,
+                                                               callback_data=f"sr:q:{n}")
+                                          for n, o in enumerate(options)]])
+        return text, rows_with_back([])
     if step == R_DATE:
         # The next few delivery days: public holidays are left out (no courier).
         days, day = [], now().date()
@@ -518,7 +598,14 @@ async def on_request_back(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.callback_query.answer()
     if "sr" not in context.user_data:
         return ConversationHandler.END
-    step = PREVIOUS.get(context.user_data.get("sr_step"), R_ORDER)
+    d = context.user_data["sr"]
+    here = context.user_data.get("sr_step")
+    if here == R_DETAILS and d.get("qi", 0) > 0:      # the question before
+        d["qi"] -= 1
+        return await show_step(update, context, R_DETAILS)
+    step = PREVIOUS.get(here, R_ORDER)
+    if step == R_DETAILS:                               # back to "Anything else?"
+        d["qi"] = len(REQUEST_QUESTIONS[d["category"]])
     return await show_step(update, context, step)
 
 
@@ -563,17 +650,62 @@ async def on_request_category(update: Update, context: ContextTypes.DEFAULT_TYPE
     key = picked(update, context, CATEGORY_NAMES)
     if not key:
         return ConversationHandler.END
-    context.user_data["sr"]["category"] = key
+    d = context.user_data["sr"]
+    if d.get("category") != key:
+        d["answers"], d["extra"] = {}, ""
+    d["category"], d["qi"] = key, 0
+    return await show_step(update, context, R_DETAILS)
+
+
+async def next_question(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    d = context.user_data["sr"]
+    d["qi"] = d.get("qi", 0) + 1
+    if d["qi"] > len(REQUEST_QUESTIONS[d["category"]]):
+        d["details"] = compose_details(d["category"], d["answers"], d.get("extra", ""))
+        return await show_step(update, context, R_DATE)
     return await show_step(update, context, R_DETAILS)
 
 
 async def on_request_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A typed answer: to the question on screen, or to "Anything else?"."""
+    d = context.user_data.get("sr")
+    if not d or "category" not in d:
+        return ConversationHandler.END
     text = (update.message.text or "").strip()
-    if len(text) < 5:
-        await update.message.reply_text("A bit more detail please, so Ops can act on it.")
+    qs = REQUEST_QUESTIONS[d["category"]]
+    i = d.get("qi", 0)
+    if i >= len(qs):
+        d["extra"] = text[:1000]
+        return await next_question(update, context)
+    key, label, options, _ = qs[i]
+    if options:
+        await update.message.reply_text("Tap one of the buttons above.")
         return R_DETAILS
-    context.user_data["sr"]["details"] = text[:2000]
-    return await show_step(update, context, R_DATE)
+    if len(text) < 2:
+        await update.message.reply_text("A bit more please, so Ops can act on it.")
+        return R_DETAILS
+    d.setdefault("answers", {})[key] = text[:500]
+    return await next_question(update, context)
+
+
+async def on_request_option(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """sr:q:<n> a button answer · sr:q:none Nothing else."""
+    await update.callback_query.answer()
+    d = context.user_data.get("sr")
+    if not d or "category" not in d:
+        return ConversationHandler.END
+    value = update.callback_query.data.split(":", 2)[2]
+    qs = REQUEST_QUESTIONS[d["category"]]
+    i = d.get("qi", 0)
+    if value == "none":
+        if i < len(qs):
+            return R_DETAILS
+        d["extra"] = ""
+        return await next_question(update, context)
+    if i >= len(qs) or not qs[i][2] or not value.isdigit() or int(value) >= len(qs[i][2]):
+        return R_DETAILS
+    d.setdefault("answers", {})[qs[i][0]] = qs[i][2][int(value)]
+    return await next_question(update, context)
 
 
 async def on_request_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -716,18 +848,19 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
             (d["order_no"], d.get("country") or "", d["category"], d["details"], d["delivery_date"],
              d["timeframe"], d.get("timeframe_other"), created_by, created.isoformat(),
              1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0,
-             0 if source == "paperform" else 1, source, submitted_name or None)).lastrowid
+             1 if source != "paperform" and on_sg_sheet(d.get("country") or "") else 0,
+             source, submitted_name or None)).lastrowid
         if d.get("red_flag"):
             set_setting(f"red_flag:{rid}", "yes")
     # Saved: the sender is answered now, and the Ops chat and the sheet are done
     # just after. On a busy day either can take a while, and a slow answer made
     # people press Send again.
-    sheet = source != "paperform"
-    if not kind and not d.get("red_flag"):
-        # On time: the sheet only, the Ops chat is for after the cut-off.
+    country = d.get("country") or ""
+    sheet = source != "paperform" and on_sg_sheet(country)
+    if not kind and not d.get("red_flag") and on_sg_sheet(country):
+        # SG on time: the sheet only, the Ops chat is for after the cut-off.
         in_background(deliver_request(bot, rid, post=False, sheet=sheet))
         return rid, "SHEET", kind
-    country = d.get("country") or ""
     due = next_round(country, created)
     if due and kind != "URGENT" and not d.get("red_flag") and ops_target(country):
         in_background(deliver_request(bot, rid, post=False, sheet=sheet))
@@ -1212,7 +1345,10 @@ def request_form_payload(user_id: int, country: str = "") -> dict:
     return {
         "country": country,
         "countries": [{"key": k, "name": n} for k, n in REQUEST_COUNTRIES],
-        "categories": [{"key": k, "name": n, "hint": CATEGORY_HINTS[k]} for k, n in REQUEST_CATEGORIES],
+        "categories": [{"key": k, "name": n, "hint": CATEGORY_HINTS[k],
+                        "questions": [{"key": qk, "label": ql, "options": qo, "hint": qh}
+                                      for qk, ql, qo, qh in REQUEST_QUESTIONS[k]]}
+                       for k, n in REQUEST_CATEGORIES],
         "timeframes": [{"key": k, "name": n} for k, n in TIMEFRAMES],
         "days": days,
         "cutoff": cutoff_text(),
@@ -1280,8 +1416,12 @@ def web_request_add(user_id: int, body: dict) -> dict:
         return {"ok": False, "error": "Pick the country."}
     if d["category"] not in CATEGORY_NAMES:
         return {"ok": False, "error": "Pick what the request is."}
-    if len(d["details"]) < 5:
-        return {"ok": False, "error": "A bit more detail please, so Ops can act on it."}
+    answers = body.get("answers") if isinstance(body.get("answers"), dict) else {}
+    answers = {k: str(v or "").strip()[:500] for k, v in answers.items()}
+    gap = missing_answer(d["category"], answers)
+    if gap:
+        return {"ok": False, "error": f"Answer “{gap}” so Ops can act on it."}
+    d["details"] = compose_details(d["category"], answers, get("details")[:1000])
     try:
         day = date.fromisoformat(d["delivery_date"])
     except ValueError:

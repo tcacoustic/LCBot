@@ -1191,13 +1191,19 @@ def is_online(user_id: int) -> bool:
     return "ON" in depts_of(user_id)
 
 
+def is_full_admin(user_id: int) -> bool:
+    """An admin with every team's admin tools, without joining those teams
+    (so they aren't treated as a PM, Ops, etc.). Set by the owner in the App."""
+    return setting(f"full_admin:{user_id}", "") == "1"
+
+
 def admin_for(user_id: int, *depts: str) -> bool:
-    """Admin powers for these teams. The owner has them for every team; other
-    admins only for the teams they're in (an SH + Livechat admin gets no ON or
-    Ops tools)."""
+    """Admin powers for these teams. The owner and full admins have them for
+    every team; other admins only for the teams they're in (an SH + Livechat
+    admin gets no ON or Ops tools)."""
     if not is_admin(user_id):
         return False
-    if is_owner(user_id) or not ADMIN_IDS:
+    if is_owner(user_id) or not ADMIN_IDS or is_full_admin(user_id):
         return True
     return bool(depts_of(user_id) & set(depts))
 
@@ -2233,6 +2239,50 @@ def online_covers(channel: str | None) -> bool:
     return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
 
 
+def pm_pick(case_id: int) -> tuple[str, int] | None:
+    """A PM's answer to a new SH case: ('help', who) or ('skip', who).
+    Kept in settings, not a new column."""
+    v = setting(f"case_pick:{case_id}")
+    if not v:
+        return None
+    kind, who = v.split(":")
+    return kind, int(who)
+
+
+def helper_of(case_id: int) -> int | None:
+    p = pm_pick(case_id)
+    return p[1] if p and p[0] == "help" else None
+
+
+def skipped_ids() -> set:
+    """Cases a PM said Not needed: off the Online team's lists."""
+    return {int(r["key"].split(":")[1])
+            for r in q("SELECT key FROM settings WHERE key LIKE 'case_pick:%' AND value LIKE 'skip:%'")}
+
+
+def awaiting_pm(r) -> bool:
+    """A new SH case the PM hasn't answered yet (I'll help / Not needed)."""
+    return (not r["closed"] and not r["on_closed"] and not r["handed_back"]
+            and r["origin"] != "on" and online_covers(r["channel"])
+            and pm_pick(r["id"]) is None)
+
+
+def pm_will_help(case_id: int, user_id: int) -> None:
+    set_setting(f"case_pick:{case_id}", f"help:{user_id}")
+    log_case(case_id, user_id, "on", "will help")
+
+
+def pm_not_needed(case_id: int, user_id: int) -> None:
+    """Counts as Online's close. SH isn't told; SH's close finishes it. The
+    caller moves it out of the store chat (move_to_tc_online)."""
+    set_setting(f"case_pick:{case_id}", f"skip:{user_id}")
+    close_case(case_id, user_id, "on", action="not needed")
+
+
+def clear_pick(case_id: int) -> None:
+    run("DELETE FROM settings WHERE key=?", (f"case_pick:{case_id}",))
+
+
 def log_case(case_id: int, user_id: int | None, side: str, action: str,
              note: str = "") -> None:
     run("INSERT INTO case_log (case_id, user_id, side, action, note, created_at)"
@@ -2281,7 +2331,7 @@ def insert_case(agent_id: int, d: dict, the_date: date, origin: str = "sh") -> i
     return cur.lastrowid
 
 
-def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
+def close_case(case_id: int, user_id: int, side: str = "sh", action: str = "closed") -> None:
     """Tick one side closed. Fully closed once both sides are, or once SH is
     if the Online team doesn't cover that channel."""
     if side not in ("sh", "on"):
@@ -2292,7 +2342,7 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
         f"{side}_closed_at=?, handed_back=0 WHERE id=?",
         (user_id, ts, case_id),
     )
-    log_case(case_id, user_id, side, "closed")
+    log_case(case_id, user_id, side, action)
     row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if row and row["sh_closed"] and (
         row["on_closed"] or not online_covers(row["channel"])
@@ -2318,20 +2368,21 @@ def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
         d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
         run("UPDATE ho_cases SET body=? WHERE id=?",
             (compose_body(d, r["origin"]), case_id))
-    side = "on" if is_online(user_id) else "sh"
+    side = "on" if online_view(user_id) else "sh"
     log_case(case_id, user_id, side, "edited",
              f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
 
 
 def reopen_case(case_id: int, user_id: int | None = None) -> None:
     """Back to open on both sides."""
+    clear_pick(case_id)
     run(
         "UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL, "
         "sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL, "
         "on_closed=0, on_closed_by=NULL, on_closed_at=NULL WHERE id=?",
         (case_id,),
     )
-    log_case(case_id, user_id, "on" if user_id and is_online(user_id)
+    log_case(case_id, user_id, "on" if user_id and online_view(user_id)
              else "sh", "reopened")
 
 
@@ -2342,6 +2393,8 @@ def reopen_side(case_id: int, user_id: int, side: str) -> None:
         raise ValueError(side)
     run(f"UPDATE ho_cases SET {side}_closed=0, {side}_closed_by=NULL, {side}_closed_at=NULL, "
         "closed=0, closed_by=NULL, closed_at=NULL WHERE id=?", (case_id,))
+    if side == "on":
+        clear_pick(case_id)
     log_case(case_id, user_id, side, "reopened")
 
 
@@ -2423,6 +2476,9 @@ def case_status_line(r) -> str:
     if r["on_closed"]:
         return "☑️ Online closed · ⬜ waiting on SH"
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
+    helper = helper_of(r["id"])
+    if helper:
+        return f"🙋 {display_name_of(helper, 'Online')} is helping · due {due.strftime('%a %-d %b')}"
     return f"🔸 Open · due {due.strftime('%a %-d %b')}"
 
 
@@ -2455,21 +2511,26 @@ def render_channel_post(post_id: int) -> str:
 
 
 def channel_post_keyboard(post_id: int, bot_username: str | None):
-    """One button per case that flips: ✅ Close while nobody has closed it,
-    ↩️ Reopen once someone has (to undo a misclick), plus 📝 Note while it's
-    not fully closed. Close and Reopen work in place; Note opens a private
-    chat with the bot, so nothing is typed in the group."""
+    """Two buttons per case. A new case waits on its PM: 🙋 I'll help /
+    Not needed. Then ✅ Close while nobody has closed it, ↩️ Reopen once
+    someone has (to undo a misclick), plus 📝 Note while it's not fully
+    closed. Note opens a private chat with the bot, so nothing is typed in the
+    group. The name only goes on the buttons when a message has several cases."""
     rows = []
-    for r in q("SELECT id, username, closed, sh_closed, on_closed FROM ho_cases WHERE post_id=? "
-               "ORDER BY id", (post_id,))[:45]:
-        who = (r["username"] or "case")[:20]
+    cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))[:45]
+    for r in cases:
+        who = "" if len(cases) == 1 else f" · {(r['username'] or 'case')[:20]}"
+        if awaiting_pm(r):
+            rows.append([InlineKeyboardButton(f"🙋 I'll help{who}", callback_data=f"sc:h:{r['id']}"),
+                         InlineKeyboardButton(f"Not needed{who}", callback_data=f"sc:n:{r['id']}")])
+            continue
         if r["sh_closed"] or r["on_closed"] or r["closed"]:
-            row = [InlineKeyboardButton(f"↩️ Reopen · {who}", callback_data=f"sc:o:{r['id']}")]
+            row = [InlineKeyboardButton(f"↩️ Reopen{who}", callback_data=f"sc:o:{r['id']}")]
         else:
-            row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
+            row = [InlineKeyboardButton(f"✅ Close{who}", callback_data=f"sc:x:{r['id']}")]
         if bot_username and not r["closed"]:
             row.append(InlineKeyboardButton(
-                f"📝 Note · {who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
+                f"📝 Note{who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -2570,7 +2631,7 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
     A note goes to every PM who looks after that channel, and to the PM waiting
     on it (who raised the Online request, or handed it back). A close only goes
     to the waiting PM. Online's own notes and closes don't ping anyone."""
-    if is_online(author_id):
+    if online_view(author_id):
         return
     r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if not r:
@@ -2662,6 +2723,35 @@ async def refresh_case_post(bot, case_id: int) -> None:
             log.warning("Couldn't update the %s chat: %s", p["channel"], e)
     except Exception as e:
         log.warning("Couldn't update the %s chat: %s", p["channel"], e)
+
+
+async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
+    """A PM said Not needed: take the case out of its store chat (delete the
+    message, or just its part of a shared one). Quietly: no post to TC Online."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return
+    p = q1("SELECT * FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
+    run("UPDATE ho_cases SET post_id=NULL WHERE id=?", (case_id,))
+    if p and p["message_id"]:
+        rest = q1("SELECT COUNT(*) AS n FROM ho_cases WHERE post_id=?", (p["id"],))["n"]
+        try:
+            if rest:
+                await bot.edit_message_text(
+                    render_channel_post(p["id"]), chat_id=p["chat_id"], message_id=p["message_id"],
+                    reply_markup=channel_post_keyboard(p["id"], bot.username))
+            else:
+                await bot.delete_message(p["chat_id"], p["message_id"])
+        except Exception as e:
+            log.info("Couldn't take case %s out of the %s chat: %s", case_id, p["channel"], e)
+            if not rest:    # Telegram only lets bots delete for 48 hours: shrink it instead
+                try:
+                    await bot.edit_message_text(
+                        f"➖ {r['username']} · not needed",
+                        chat_id=p["chat_id"], message_id=p["message_id"])
+                except Exception:
+                    pass
+    # Nothing is posted anywhere: SH see Online's tick on the case and close it.
 
 
 # Sort cases from before channels existed into one, by their store.
@@ -3027,9 +3117,8 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 # can't do yet. Commands the App covers (clock in/out, handover, cases, visits
 # booking, special requests) still work when typed; they just aren't listed.
 AGENT_COMMANDS = [
-    ("dropshift", "Ask to drop a shift"),
+    ("changeshift", "Drop, give or exchange a shift"),
     ("pickup", "Ask to take an open shift"),
-    ("swap", "Hand a shift to someone"),
     ("support", "Who I list as support"),
 ]
 GROUP_COMMANDS = [
@@ -3372,6 +3461,26 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:4px; background:var(--ink); }
   .tag.red { background:var(--red); } .tag.amber { background:var(--amber); }
   .tag.green { background:var(--green); } .tag.blue { background:var(--blue); }
+  .tag.orange { background:var(--accent); }
+  /* Online has finished with it: SH can close it. */
+  .ondone { border-color:var(--accent) !important; }
+  .ondone-why { font-size:13px; font-weight:700; color:var(--accent); margin-top:4px; }
+  /* What's new: the card on Home and the list behind it. */
+  .newscard { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; cursor:pointer;
+    background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; margin-bottom:14px; }
+  .newscard .ic { font-size:22px; }
+  .newscard b { display:block; }
+  .newscard .t { margin:0; }
+  .newscount { background:var(--accent); color:#fff; font-size:12px; font-weight:800; border-radius:999px; padding:2px 8px; white-space:nowrap; }
+  .upd { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; margin-bottom:10px; }
+  .upd.read { border-color:var(--line); }
+  .upd .meta { display:flex; gap:6px; align-items:center; flex-wrap:wrap; font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .upd .unread { width:8px; height:8px; border-radius:50%; background:var(--accent); display:inline-block; }
+  .upd h3 { margin:0 0 4px; font-size:16px; font-weight:800; }
+  .upd p { margin:0; font-size:14px; white-space:pre-line; }
+  .upd .acts { display:flex; gap:6px; margin-top:10px; }
+  .upd .acts button { flex:1; min-height:40px; border:2px solid var(--ink); background:var(--card); color:var(--ink);
+    border-radius:8px; font-weight:700; cursor:pointer; }
 
   .cards { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:16px; }
   .card { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; }
@@ -3635,7 +3744,8 @@ const ICONS = {
   cases: 'M9 3h6v3H9zM7 4.5H5V21h14V4.5h-2M8 11h8M8 15h5',
   visits: 'M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zM12 8a2 2 0 1 0 0 4a2 2 0 1 0 0-4',
   team: 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6',
-  shield: 'M12 3l7 3v5c0 4.5-3 8.3-7 10c-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4'
+  shield: 'M12 3l7 3v5c0 4.5-3 8.3-7 10c-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4',
+  news: 'M3 10v4h3l6 4V6L6 10zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12'
 };
 function icon(path) {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
@@ -3657,7 +3767,8 @@ function caseTags(c, extra) {
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
               ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'],
-              people: [ICONS.shield, 'People'], pay: [ICONS.hours, 'Pay'] };
+              people: [ICONS.shield, 'People'], pay: [ICONS.hours, 'Pay'],
+              updates: [ICONS.news, 'Updates'] };
 let TAB_NAMES = {};
 function navBar() {
   const tabs = ADMIN_MODE ? ADMIN_TABS
@@ -3757,11 +3868,14 @@ async function loadHome() {
       if (c.store) bits.push(esc(c.flag) + esc(c.store));
       if (c.from) bits.push('from ' + esc(c.from));
       if (c.age) bits.push(c.age + 'd' + (c.age >= 3 ? ' ⏳' : ''));
-      h += `<div class="p tappable" data-case="${c.id}">` + caseTags(c);
+      h += `<div class="p tappable${c.onlineDone ? ' ondone' : ''}" data-case="${c.id}">`
+         + caseTags(c, c.onlineDone ? [['ONLINE DONE · CLOSE IT', 'orange']] : []);
       h += '<div class="ptop">';
       h += `<div class="pn">${esc(c.username)}</div>`;
       h += '<div class="t">›</div></div>';
-      h += `<div class="t">${bits.join(' · ')}</div></div>`;
+      h += `<div class="t">${bits.join(' · ')}</div>`;
+      if (c.onlineDone) h += `<div class="ondone-why">${esc(c.onlineDone)}</div>`;
+      h += '</div>';
     }
     h += `<div class="note">Tap a case to read it. ${d.openCases} will carry `
        + 'into your handover.</div>';
@@ -3980,12 +4094,14 @@ let AGENT = null;   // whose detail we're looking at
 function caseCard(c, closed) {
   // SH's tick: done once SH has closed it, even while Online still has to.
   const ticked = closed || c.shClosed;
-  let h = `<div class="case${closed ? ' gone' : ''}">`;
+  const done = !closed && c.onlineDone;
+  let h = `<div class="case${closed ? ' gone' : ''}${done ? ' ondone' : ''}">`;
   h += '<div class="top">';
   h += `<div class="tick${ticked ? '' : ' on'}" data-id="${c.id}" `
      + `data-close="${ticked ? '0' : '1'}">${ticked ? '' : '✓'}</div>`;
   h += '<div style="flex:1">';
-  h += caseTags(c, c.handedBack ? [['HANDED BACK', '']] : (c.request && !c.shClosed) ? [['ONLINE REQUEST', 'blue']] : []);
+  h += caseTags(c, done ? [['ONLINE DONE · CLOSE IT', 'orange']]
+    : c.handedBack ? [['HANDED BACK', '']] : (c.request && !c.shClosed) ? [['ONLINE REQUEST', 'blue']] : []);
   h += `<div class="nm">${esc(c.username)}</div>`;
   const bits = [];
   if (c.channelName) bits.push(esc(c.channelName));
@@ -4000,7 +4116,9 @@ function caseCard(c, closed) {
   if (c.section === 'follow') bits.push('follow up');
   h += `<div class="meta">${bits.join(' · ')}</div>`;
   if (c.request && !c.shClosed && !c.handedBack) h += `<div class="st">From ${esc(c.request)} (Online)</div>`;
+  if (done) h += `<div class="ondone-why">${esc(c.onlineDone)}</div>`;
   else if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  else if (c.helper && !closed) h += `<div class="st">🙋 ${esc(c.helper)} is helping</div>`;
   h += '</div></div>';
   if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
   if (HO_SHOWN[c.id]) {
@@ -4037,20 +4155,32 @@ function caseForm(d) {
     + d.priorities.map(p =>
         `<button data-f="prio" data-v="${p.emoji}" class="${f.prio === p.emoji ? 'on' : ''}">${p.emoji} ${esc(p.name)}</button>`
       ).join('') + '</div></div>';
-  h += '<div class="fld"><label>Where from</label><div class="pick">'
-    + d.platforms.map(p =>
-        `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">${esc(p)}</button>`
-      ).join('') + '</div></div>';
-  const storeList = f.platform === 'LIVECHAT' ? d.webstores : d.stores;
-  if (f.platform) {
+  // SH and Livechat say where the chat came from (Duoke or Livechat). The Online
+  // team don't use those tools: they pick from their own channels' stores.
+  let storeList;
+  if (req) {
+    const all = d.stores.map(s => ({ ...s, platform: 'DUOKE' }))
+      .concat(d.webstores.map(s => ({ ...s, platform: 'LIVECHAT' })));
+    const mine = d.myChannels || [];
+    storeList = mine.length ? all.filter(s => mine.includes(s.key)) : all;
+    if (storeList.length === 1 && !f.store) f.store = storeList[0].store;
+  } else {
+    h += '<div class="fld"><label>Where from</label><div class="pick">'
+      + d.platforms.map(p =>
+          `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">${esc(p)}</button>`
+        ).join('') + '</div></div>';
+    storeList = f.platform === 'LIVECHAT' ? d.webstores : d.stores;
+  }
+  if (req || f.platform) {
     h += '<div class="fld"><label>Store</label><select id="store">'
       + '<option value="">Pick one…</option>'
       + storeList.map(s =>
-          `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)}${esc(s.store)} · ${esc(s.channel)}</option>`
+          `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)} ${esc(req ? s.channel.replace(/^\S+\s/, '') + ' · ' + s.store : s.store + ' · ' + s.channel)}</option>`
         ).join('') + '</select></div>';
   }
   const long = { happened: 1, done: 1, need: 1 };
   const picked = storeList.find(s => s.store === f.store);
+  if (req && picked) f.platform = picked.platform;   // the server files it by Duoke/Livechat
   for (const fd of d.fields) {
     const v = esc(f[fd.key] || '');
     let eg = (req && fd.key in d.request.examples) ? d.request.examples[fd.key] : fd.example;
@@ -4132,7 +4262,7 @@ async function loadHandover() {
     h += '<div class="note" style="margin-top:0">Untick a case to close it. '
        + 'Cases waiting on Online stay here until they close it too.</div>';
     // Anything Online handed back goes first: someone is waiting on SH.
-    const first = c => (c.handedBack || (c.request && !c.shClosed)) ? 1 : 0;
+    const first = c => c.onlineDone ? 2 : (c.handedBack || (c.request && !c.shClosed)) ? 1 : 0;
     const order = [...d.openCases].sort((a, b) => (first(b) - first(a)) || (a.id - b.id));
     for (const c of order) h += caseCard(c, false);
   }
@@ -4281,8 +4411,14 @@ function onlineCard(c, mine) {
     + `${esc(c.due)}</span>`);
   h += `<div class="meta">${bits.join(' · ')}</div>`;
   if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  else if (c.helper) h += `<div class="st" style="color:var(--green)">🙋 ${esc(c.helper)} is helping</div>`;
   h += '</div></div>';
   if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
+  // A new SH case: the PM says whether it needs them, right on the card.
+  if (c.canPick && mine) {
+    h += `<div class="acts"><button data-pick="${c.id}" data-help="1">I’ll help</button>`
+       + `<button class="soft" data-pick="${c.id}" data-help="0">Not needed</button></div>`;
+  }
   if (HO_SHOWN[c.id]) {
     h += `<div class="body">${esc(c.body)}</div>`;
     if (c.history && c.history.length) {
@@ -4380,7 +4516,7 @@ function renderOnline(d) {
 
   const shown = open
     .filter(c => c.group === ON_GROUP && (!ON_REGION || c.region === ON_REGION))
-    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (a.id - b.id));
+    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (b.canPick - a.canPick) || (a.id - b.id));
   if (!shown.length) h += '<div class="note">Nothing open here 🎉</div>';
   for (const c of shown) h += onlineCard(c, mine.has(c.channel));
 
@@ -4399,6 +4535,16 @@ function renderOnline(d) {
   });
   document.querySelectorAll('[data-or]').forEach(el => {
     el.onclick = () => { ON_REGION = el.dataset.or; renderOnline(d); };
+  });
+  document.querySelectorAll('[data-pick]').forEach(el => {
+    el.onclick = async () => {
+      el.disabled = true;
+      const help = el.dataset.help === '1';
+      const out = await post('/api/case/pick', { id: Number(el.dataset.pick), help });
+      if (!out.ok) { el.disabled = false; toast(out.error || 'Could not save that.'); return; }
+      toast(help ? 'On your list' : 'Off your list');
+      await loadHandover();
+    };
   });
   document.querySelectorAll('[data-onclose]').forEach(el => {
     el.onclick = async () => {
@@ -4965,6 +5111,13 @@ function keepRequest() {
     const el = document.getElementById('rq_' + k);
     if (el) RQ.form[k] = el.value;
   }
+  RQ.form.answers = RQ.form.answers || {};
+  document.querySelectorAll('[data-rqa]').forEach(el => { RQ.form.answers[el.dataset.rqa] = el.value; });
+}
+// Send stays greyed out until every question for this type has an answer.
+function requestReady(cats) {
+  const f = RQ.form, cat = cats.find(c => c.key === f.category);
+  return !!cat && cat.questions.every(qn => ((f.answers || {})[qn.key] || '').trim());
 }
 async function loadRequest() {
   const app = document.getElementById('app');
@@ -4979,9 +5132,26 @@ async function loadRequest() {
   h += '<div class="fld"><label>Country</label>' + pick('rqc', d.countries.map(c => ({ key: c.key, name: (REGION_FLAGS[c.key] || '') + ' ' + c.key })), f.country) + '</div>';
   h += '<div class="fld"><label>What is the request?</label>' + pick('rqcat', d.categories, f.category) + '</div>';
   const cat = d.categories.find(c => c.key === f.category);
-  h += '<div class="fld"><label>Details</label>'
-     + '<div class="note" style="margin:0 0 6px">' + esc(cat ? cat.hint : 'As fully as you can.') + ' No phone or ID numbers.</div>'
-     + '<textarea id="rq_details" rows="3">' + esc(f.details || '') + '</textarea></div>';
+  f.answers = f.answers || {};
+  if (cat) {
+    // This type's questions: every one must be answered before Send works.
+    for (const qn of cat.questions) {
+      h += '<div class="fld"><label>' + esc(qn.label) + ' <span style="color:var(--red)">*</span></label>';
+      if (qn.options) {
+        h += '<div class="pick">' + qn.options.map(o => '<button data-rqq="' + qn.key + '" data-rqv="' + esc(o) + '" class="'
+           + (f.answers[qn.key] === o ? 'on' : '') + '">' + esc(o) + '</button>').join('') + '</div>';
+      } else {
+        const tag = qn.key === 'address' || qn.key === 'todo' ? 'textarea rows="2"' : 'input';
+        h += (qn.hint ? '<div class="note" style="margin:0 0 6px">' + esc(qn.hint) + '</div>' : '')
+           + '<' + tag + ' data-rqa="' + qn.key + '"' + (tag === 'input' ? ' value="' + esc(f.answers[qn.key] || '') + '">'
+             : '>' + esc(f.answers[qn.key] || '') + '</textarea>');
+      }
+      h += '</div>';
+    }
+    h += '<div class="fld"><label>Anything else? (optional)</label>'
+       + '<div class="note" style="margin:0 0 6px">No phone or ID numbers.</div>'
+       + '<textarea id="rq_details" rows="2">' + esc(f.details || '') + '</textarea></div>';
+  }
   h += '<div class="fld"><label>' + (f.category === 'DATE' ? 'New delivery date' : 'Delivery date') + '</label><div class="pick">'
      + d.days.map(x => '<button data-rqd="' + x.iso + '" class="' + (f.delivery_date === x.iso ? 'on' : '') + '">'
        + esc(x.label) + (x.kind === 'URGENT' ? ' · URGENT' : x.kind === 'LATE' ? ' · late' : '') + '</button>').join('')
@@ -5010,7 +5180,8 @@ async function loadRequest() {
   wire();
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => { keepRequest(); fn(el); }; });
   on('[data-rqc]', el => { f.country = el.dataset.rqc; f.delivery_date = ''; loadRequest(); });
-  on('[data-rqcat]', el => { f.category = el.dataset.rqcat; loadRequest(); });
+  on('[data-rqcat]', el => { if (f.category !== el.dataset.rqcat) f.answers = {}; f.category = el.dataset.rqcat; loadRequest(); });
+  on('[data-rqq]', el => { f.answers[el.dataset.rqq] = el.dataset.rqv; loadRequest(); });
   on('[data-rqd]', el => { f.delivery_date = el.dataset.rqd; f.otherDate = false; loadRequest(); });
   on('[data-rqother]', () => { f.otherDate = true; f.delivery_date = ''; loadRequest(); });
   const od = document.getElementById('rq_other_date');
@@ -5019,8 +5190,17 @@ async function loadRequest() {
   on('[data-rqt]', el => { f.timeframe = el.dataset.rqt; loadRequest(); });
   document.getElementById('rqBack').onclick = () => { keepRequest(); VIEW = RQ.back || 'home'; render(); };
   const send = document.getElementById('rqSend');
+  const ready = () => { keepRequest(); send.style.opacity = requestReady(d.categories) ? '' : '.45'; };
+  document.querySelectorAll('[data-rqa]').forEach(el => { el.oninput = ready; });
+  ready();
   send.onclick = async () => {
     keepRequest();
+    if (!requestReady(d.categories)) {
+      const cat = d.categories.find(c => c.key === f.category);
+      const gap = cat && cat.questions.find(qn => !((f.answers || {})[qn.key] || '').trim());
+      toast(gap ? 'Answer “' + gap.label + '” first.' : 'Pick what the request is.');
+      return;
+    }
     send.disabled = true; send.textContent = 'Sending…';
     const out = await post('/api/request', f);
     send.disabled = false; send.textContent = 'Send to Ops';
@@ -5311,6 +5491,8 @@ function personScreen() {
   if (d.canRole && !p.owner) {
     h += '<h2>Settings</h2><div class="row"><div class="lbl">Admin<small>Admin tools for their teams</small></div>'
       + `<div class="sw${p.admin ? ' on' : ''}" id="pAdmin"><i></i></div></div>`;
+    if (p.admin) h += '<div class="row"><div class="lbl">Admin for all teams<small>Admin tools for every team, without joining them</small></div>'
+      + `<div class="sw${p.fullAdmin ? ' on' : ''}" id="pFull"><i></i></div></div>`;
   }
   h += '<h2>Name in the bot</h2><div class="nameedit">'
     + `<input id="pName" value="${attr(p.name)}"><button id="pSaveName">Save</button></div>`;
@@ -5335,6 +5517,8 @@ function personScreen() {
   document.querySelectorAll('[data-cy]').forEach(el => el.onclick = () => save('country', el.dataset.cy, 'Country saved'));
   const adm = document.getElementById('pAdmin');
   if (adm) adm.onclick = () => save('admin', !p.admin, p.admin ? 'Admin removed' : 'Now an admin');
+  const full = document.getElementById('pFull');
+  if (full) full.onclick = () => save('fulladmin', !p.fullAdmin, p.fullAdmin ? 'Back to their own teams' : 'Admin for all teams');
   document.getElementById('pSaveName').onclick = () => save('name', document.getElementById('pName').value, 'Name saved');
   const rm = document.getElementById('pRemove');
   if (rm) rm.onclick = async () => {
@@ -5346,6 +5530,98 @@ function personScreen() {
   };
 }
 
+// What's new: a card on Home (newest title + how many unread), the list, and
+// in 🛡 Admin a form to post them. Nothing is sent as a message.
+const UPD_TAG = { NEW: ['NEW', 'blue'], PROCESS: ['PROCESS', 'amber'], GOOD: ['GOOD NEWS', 'green'] };
+let UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL'] } };
+async function addNewsCard() {
+  let d;
+  try { d = await getJSON('/api/updates'); } catch (e) { return; }
+  if (VIEW !== 'home' || !d.items.length || document.getElementById('newsCard')) return;
+  const sub = document.querySelector('#app .sub');
+  if (!sub) return;
+  const el = document.createElement('div');
+  el.className = 'newscard'; el.id = 'newsCard';
+  el.innerHTML = '<div class="ic">📣</div><div><b>What’s new</b><div class="t">' + esc(d.items[0].title) + '</div></div>'
+    + (d.unread ? '<div class="newscount">' + d.unread + ' new</div>' : '<div class="t">›</div>');
+  el.onclick = () => { VIEW = 'news'; render(); };
+  sub.insertAdjacentElement('afterend', el);
+}
+function updateCard(u, admin) {
+  const tag = UPD_TAG[u.kind] || ['', ''];
+  return '<div class="upd' + (u.unread && !admin ? '' : ' read') + '"><div class="meta">'
+    + (u.unread && !admin ? '<span class="unread"></span>' : '')
+    + '<span class="tag ' + tag[1] + '">' + tag[0] + '</span>' + esc(u.date) + ' · ' + esc(u.for) + '</div>'
+    + '<h3>' + esc(u.title) + '</h3><p>' + esc(u.body) + '</p>'
+    + (admin ? '<div class="acts"><button class="soft" data-uedit="' + u.id + '">Edit</button>'
+      + '<button class="soft" data-udel="' + u.id + '">Remove</button></div>' : '')
+    + '</div>';
+}
+async function loadNews() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/updates');
+  let h = '<div class="back" id="nBack">‹ Home</div><h1>What’s new</h1><div class="sub">Updates for your team</div>';
+  h += d.items.length ? d.items.map(u => updateCard(u, false)).join('') : '<div class="empty">Nothing yet.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  document.getElementById('nBack').onclick = () => { VIEW = 'home'; render(); };
+  if (d.unread) post('/api/updates/seen', {});
+}
+async function loadUpdatesAdmin() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/updates');
+  const f = UPD.form;
+  const pick = (attr, items, on) => '<div class="pick">' + items.map(it =>
+    '<button data-' + attr + '="' + it.key + '" class="' + (on(it.key) ? 'on' : '') + '">' + esc(it.name) + '</button>').join('') + '</div>';
+  let h = adminHead() + '<h1>' + (UPD.edit ? 'Edit update' : 'Post an update') + '</h1>'
+    + '<div class="sub">Shows in the App · no message is sent</div>';
+  h += '<div class="fld"><label>Type</label>' + pick('uk', d.kinds, k => f.kind === k) + '</div>';
+  h += '<div class="fld"><label>Title</label><input id="uTitle" maxlength="80" value="' + attr(f.title) + '"></div>';
+  h += '<div class="fld"><label>What to say</label><textarea id="uBody" rows="4" maxlength="600">' + esc(f.body) + '</textarea>'
+     + '<div class="note" style="margin-top:6px">No customer details.</div></div>';
+  h += '<div class="fld"><label>Who sees it</label>' + pick('ut', d.teams, k => f.teams.includes(k)) + '</div>';
+  h += '<button class="big" id="uSend">' + (UPD.edit ? 'Save changes' : 'Post update') + '</button>';
+  if (UPD.edit) h += '<button class="big ghost" id="uCancel">Cancel editing</button>';
+  h += '<h2>Posted</h2>' + (d.items.length ? d.items.map(u => updateCard(u, true)).join('') : '<div class="empty">Nothing posted yet.</div>');
+  app.innerHTML = h + navBar();
+  wire();
+  const keep = () => { f.title = document.getElementById('uTitle').value; f.body = document.getElementById('uBody').value; };
+  document.querySelectorAll('[data-uk]').forEach(el => el.onclick = () => { keep(); f.kind = el.dataset.uk; loadUpdatesAdmin(); });
+  document.querySelectorAll('[data-ut]').forEach(el => el.onclick = () => {
+    keep();
+    const k = el.dataset.ut;
+    if (k === 'ALL') f.teams = ['ALL'];
+    else {
+      f.teams = f.teams.filter(t => t !== 'ALL');
+      f.teams = f.teams.includes(k) ? f.teams.filter(t => t !== k) : f.teams.concat(k);
+    }
+    loadUpdatesAdmin();
+  });
+  document.getElementById('uSend').onclick = async (ev) => {
+    keep(); ev.target.disabled = true;
+    const out = await post('/api/admin/update', { id: UPD.edit || 0, kind: f.kind, title: f.title, body: f.body, teams: f.teams });
+    ev.target.disabled = false;
+    if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
+    toast(UPD.edit ? 'Saved' : 'Posted');
+    UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL'] } };
+    loadUpdatesAdmin();
+  };
+  const cancel = document.getElementById('uCancel');
+  if (cancel) cancel.onclick = () => { UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL'] } }; loadUpdatesAdmin(); };
+  document.querySelectorAll('[data-uedit]').forEach(el => el.onclick = () => {
+    const u = d.items.find(x => x.id === Number(el.dataset.uedit));
+    if (!u) return;
+    UPD = { edit: u.id, form: { kind: u.kind, title: u.title, body: u.body, teams: u.teams.slice() } };
+    loadUpdatesAdmin(); window.scrollTo(0, 0);
+  });
+  document.querySelectorAll('[data-udel]').forEach(el => el.onclick = async () => {
+    if (!await askSure('Remove this update? Nobody will see it any more.')) return;
+    const out = await post('/api/admin/update', { id: Number(el.dataset.udel), remove: true });
+    if (!out.ok) { toast(out.error || 'Could not remove it.'); return; }
+    toast('Removed'); loadUpdatesAdmin();
+  });
+}
+
 async function render() {
   feedbackButton();
   await adminButton();
@@ -5354,7 +5630,18 @@ async function render() {
   if (VIEW === 'fb') { loadFeedback(); return; }
   if (VIEW === 'home') {
     try { await loadHome(); }
-    catch (e) { showFatal('Home would not load', e.message || e); }
+    catch (e) { showFatal('Home would not load', e.message || e); return; }
+    if (VIEW === 'home') addNewsCard();
+    return;
+  }
+  if (VIEW === 'news') {
+    try { await loadNews(); }
+    catch (e) { showFatal('What\u2019s new would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'updates') {
+    try { await loadUpdatesAdmin(); }
+    catch (e) { showFatal('Updates would not load', e.message || e); }
     return;
   }
   if (VIEW === 'week') {

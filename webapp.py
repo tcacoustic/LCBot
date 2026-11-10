@@ -375,7 +375,8 @@ def home_payload(user_id: int) -> dict:
 
     first, last = week_bounds(today)
     t = timesheet(user_id, first, last)
-    cases = open_cases()
+    # Cases Online has finished go first: SH can clear them straight away.
+    cases = sorted(open_cases(), key=lambda c: not online_done_line(c))
 
     return {
         "name": name,
@@ -398,6 +399,7 @@ def home_payload(user_id: int) -> dict:
                 "flag": c["flag"] or "",
                 "from": display_name_of(c["agent_id"], ""),
                 "age": (today - date.fromisoformat(c["the_date"])).days,
+                "onlineDone": online_done_line(c),
             }
             for c in cases[:5]
         ],
@@ -608,6 +610,17 @@ def web_claim(user_id: int, slot_id: int, want: bool) -> dict:
     }
 
 
+def online_done_line(r) -> str:
+    """Online has finished with a case SH still has open: who, and how.
+    '' when Online isn't done or SH has closed it too."""
+    if r["closed"] or r["sh_closed"] or not r["on_closed"]:
+        return ""
+    pick = pm_pick(r["id"])
+    if pick and pick[0] == "skip":
+        return f"{display_name_of(pick[1], 'Online')}: not needed"
+    return f"{display_name_of(r['on_closed_by'], 'Online')} closed it"
+
+
 def case_shape(r, today: date, closed: bool = False) -> dict:
     """One case as the App draws it (handover list and search results)."""
     added = date.fromisoformat(r["the_date"])
@@ -631,7 +644,10 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
         "sla": "" if closed else sla_mark(due, today),
         "shClosed": bool(r["sh_closed"]),
         "onClosed": bool(r["on_closed"]),
+        "onlineDone": online_done_line(r),
         "handedBack": bool(r["handed_back"]),
+        "helper": display_name_of(helper_of(r["id"]), "Online") if helper_of(r["id"]) else "",
+        "canPick": awaiting_pm(r),
         "waiting": (not closed) and bool(r["sh_closed"] or r["on_closed"]
                                          or r["handed_back"] or r["origin"] == "on"),
         "status": case_status_line(r),
@@ -666,6 +682,9 @@ def handover_payload(user_id: int) -> dict:
     """Open cases, recently closed ones, and the pickers for a new case."""
     today = now().date()
     open_rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    if online_view(user_id):            # Not needed: off the Online team's list
+        skipped = skipped_ids()
+        open_rows = [r for r in open_rows if r["id"] not in skipped]
     closed_rows = q(
         "SELECT * FROM ho_cases WHERE closed=1 ORDER BY closed_at DESC LIMIT 12"
     )
@@ -677,7 +696,7 @@ def handover_payload(user_id: int) -> dict:
         "myChannels": online_channels(user_id),
         "openCases": [case_shape(r, today) for r in open_rows],
         "closedCases": [case_shape(r, today, True) for r in closed_rows],
-        "stores": [{"flag": f, "store": st,
+        "stores": [{"flag": f, "store": st, "key": STORE_CHANNEL.get(st, ""),
                     "channel": CHANNEL_NAMES.get(STORE_CHANNEL.get(st, ""), ""),
                     "orderExample": case_example("order_no", "DUOKE", st)}
                    for f, st in STORES],
@@ -686,7 +705,7 @@ def handover_payload(user_id: int) -> dict:
         "fields": [{"key": k, "label": lb, "required": req,
                     "hint": CASE_HINTS[k], "example": CASE_EXAMPLES.get(k, "")}
                    for k, lb, req in CASE_FIELDS],
-        "webstores": [{"flag": f, "store": st,
+        "webstores": [{"flag": f, "store": st, "key": STORE_CHANNEL[st],
                        "channel": CHANNEL_NAMES[STORE_CHANNEL[st]],
                        "orderExample": case_example("order_no", "LIVECHAT", st)}
                       for f, st in WEBSTORES],
@@ -711,7 +730,23 @@ def case_history_lines(case_id: int, limit: int = 8) -> list:
 
 # What the Online team may do from the app.
 ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback",
-                "/api/case/edit", "/api/case"}
+                "/api/case/edit", "/api/case", "/api/case/pick"}
+
+
+def web_case_pick(user_id: int, case_id: int, help: bool) -> dict:
+    """A PM's I'll help / Not needed on a new SH case."""
+    if not online_view(user_id):
+        return {"ok": False, "error": "This is for the platform managers."}
+    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not row or not awaiting_pm(row):
+        return {"ok": False, "error": "Someone already answered this one."}
+    if help:
+        pm_will_help(case_id, user_id)
+    else:
+        pm_not_needed(case_id, user_id)
+    on_bot_loop(refresh_case_post(bot_ref(), case_id) if help
+                else move_to_tc_online(bot_ref(), case_id, user_id))
+    return {"ok": True}
 
 
 def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
@@ -822,7 +857,7 @@ def web_case_note(user_id: int, case_id: int, note: str) -> dict:
     row = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
     if not row:
         return {"ok": False, "error": "That case is gone."}
-    log_case(case_id, user_id, "on" if is_online(user_id) else "sh", "note", note[:500])
+    log_case(case_id, user_id, "on" if online_view(user_id) else "sh", "note", note[:500])
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
     on_bot_loop(notify_reply(bot_ref(), case_id, user_id, note=note[:500]))
     return {"ok": True, "username": row["username"]}
@@ -833,7 +868,7 @@ def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
     if not row:
         return {"ok": False, "error": "That case is gone."}
     if close:
-        close_case(case_id, user_id, "on" if is_online(user_id) else "sh")
+        close_case(case_id, user_id, "on" if online_view(user_id) else "sh")
     else:
         reopen_case(case_id, user_id)
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
@@ -1017,13 +1052,106 @@ def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
 # admins set channels, On-Site admins set the country, only an owner makes admins.
 # --------------------------------------------------------------------------
 
-ADMIN_POSTS = {"/api/admin/approve", "/api/admin/decline", "/api/admin/person"}
+ADMIN_POSTS = {"/api/admin/approve", "/api/admin/decline", "/api/admin/person", "/api/admin/update"}
+
+# --------------------------------------------------------------------------
+# What's new: short updates for everyone or chosen teams, shown on Home.
+# Kept in settings (no DB change): "updates" = JSON list, and
+# "updates_seen:<uid>" = the newest id that person has opened.
+# --------------------------------------------------------------------------
+UPDATE_KINDS = {"NEW": "New", "PROCESS": "Process", "GOOD": "Good news"}
+UPDATE_TEAMS = ["ALL"] + [k for k, _ in DEPARTMENTS]
+def all_updates() -> list:
+    """Every update, as posted in 🛡 Admin. Starts empty: nothing shows until
+    the owner (or a full admin) posts it."""
+    try:
+        return json.loads(setting("updates", "[]") or "[]")
+    except (TypeError, ValueError):
+        return []
+
+
+def may_post_updates(user_id: int) -> bool:
+    return is_owner(user_id) or (is_admin(user_id) and is_full_admin(user_id))
+
+
+def updates_for(user_id: int) -> list:
+    """Newest first: everyone's, plus their teams'. Posters see them all,
+    except the owner viewing as a team, who sees just what that team sees."""
+    mine = depts_of(user_id)
+    every = may_post_updates(user_id) and not viewing_as(user_id)
+    out = [u for u in all_updates() if every or "ALL" in u["teams"] or mine & set(u["teams"])]
+    return sorted(out, key=lambda u: -u["id"])
+
+
+def team_label(teams: list) -> str:
+    return "Everyone" if "ALL" in teams else " + ".join(DEPT_NAMES.get(t, t) for t in teams)
+
+
+def updates_payload(user_id: int) -> dict:
+    seen = int(setting(f"updates_seen:{user_id}", "0") or 0)
+    items = [{"id": u["id"], "kind": u["kind"], "kindName": UPDATE_KINDS.get(u["kind"], ""),
+              "title": u["title"], "body": u["body"], "teams": u["teams"], "for": team_label(u["teams"]),
+              "date": datetime.fromisoformat(u["at"]).strftime("%a %-d %b"), "unread": u["id"] > seen}
+             for u in updates_for(user_id)]
+    return {"items": items, "unread": sum(1 for i in items if i["unread"]),
+            "canPost": may_post_updates(user_id),
+            "teams": [{"key": t, "name": "Everyone" if t == "ALL" else DEPT_NAMES.get(t, t)} for t in UPDATE_TEAMS],
+            "kinds": [{"key": k, "name": n} for k, n in UPDATE_KINDS.items()]}
+
+
+def web_updates_seen(user_id: int) -> dict:
+    newest = max((u["id"] for u in updates_for(user_id)), default=0)
+    set_setting(f"updates_seen:{user_id}", str(newest))
+    return {"ok": True}
+
+
+def web_admin_update(user_id: int, body: dict) -> dict:
+    """Post, edit or remove an update (owner and full admins)."""
+    if not may_post_updates(user_id):
+        return {"ok": False, "error": "Only the owner and full admins post updates."}
+    items = all_updates()
+    try:
+        uid = int(body.get("id") or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    if body.get("remove"):
+        items = [u for u in items if u["id"] != uid]
+        set_setting("updates", json.dumps(items))
+        return {"ok": True}
+    title = " ".join(str(body.get("title") or "").split())[:80]
+    text = str(body.get("body") or "").strip()[:600]
+    kind = str(body.get("kind") or "")
+    teams = [t for t in (body.get("teams") or []) if t in UPDATE_TEAMS]
+    if "ALL" in teams:
+        teams = ["ALL"]
+    if kind not in UPDATE_KINDS:
+        return {"ok": False, "error": "Pick a type."}
+    if len(title) < 3:
+        return {"ok": False, "error": "Give it a title."}
+    if len(text) < 5:
+        return {"ok": False, "error": "Say a little more."}
+    if not teams:
+        return {"ok": False, "error": "Pick who sees it."}
+    if uid:
+        for u in items:
+            if u["id"] == uid:
+                u.update(kind=kind, title=title, body=text, teams=teams)
+                break
+        else:
+            return {"ok": False, "error": "That update has gone."}
+    else:
+        items.append({"id": max((u["id"] for u in items), default=0) + 1, "kind": kind, "title": title,
+                      "body": text, "teams": teams, "at": now().isoformat(), "by": user_id})
+    set_setting("updates", json.dumps(items))
+    log.info("%s %s an update: %s", user_id, "edited" if uid else "posted", title)
+    return {"ok": True}
 
 
 def admin_tabs(user_id: int) -> list:
     if not is_admin(user_id):
         return []
-    return ["people"] + (["team"] if admin_for(user_id, "LIVECHAT", "ONSITE") else [])
+    return (["people"] + (["team"] if admin_for(user_id, "LIVECHAT", "ONSITE") else [])
+            + (["updates"] if may_post_updates(user_id) else []))
 
 
 def teams_of(user_id: int) -> list:
@@ -1038,6 +1166,7 @@ def person_dict(r) -> dict:
     return {
         "id": uid, "name": r["display_name"] or r["name"] or "", "username": r["username"] or "",
         "teams": teams, "admin": bool(is_owner(uid) or r["role"] == "admin"), "owner": is_owner(uid),
+        "fullAdmin": r["role"] == "admin" and is_full_admin(uid),
         "channels": online_channels(uid) if "ON" in teams else [],
         "country": (r["country"] or "") if "ONSITE" in teams else "",
         "store": store_of(uid) if "FS" in teams else "",
@@ -1201,10 +1330,22 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         if is_owner(uid):
             return {"ok": False, "error": "The owner is set in the bot's settings, not here."}
         run("UPDATE agents SET role=? WHERE user_id=?", ("admin" if value else "agent", uid))
+        if not value:
+            set_setting(f"full_admin:{uid}", "")     # no longer an admin: not a full one either
         menus = True
         if value:
             on_bot_loop(bot_ref().send_message(
                 uid, "You've been given admin rights. Send /help to see what's new."))
+    elif field == "fulladmin":
+        if not is_owner(admin_id):
+            return {"ok": False, "error": "Only the owner gives admin tools for every team."}
+        if row["role"] != "admin":
+            return {"ok": False, "error": "Make them an admin first."}
+        set_setting(f"full_admin:{uid}", "1" if value else "")
+        menus = True
+        if value:
+            on_bot_loop(bot_ref().send_message(
+                uid, "You now have admin tools for every team. Send /help to see what's new."))
     elif field == "name":
         nm = " ".join(str(value or "").split())
         if not 2 <= len(nm) <= 40:
@@ -1279,7 +1420,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                                                      "/api/visits", "/api/cases/search",
                                                      "/api/requests", "/api/admin",
                                                      "/api/admin/people", "/api/pay",
-                                                     "/api/team/onsite"):
+                                                     "/api/team/onsite", "/api/updates"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
@@ -1509,6 +1650,24 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return
+        if path == "/api/updates":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                self._send(200, json.dumps(updates_payload(uid)).encode())
+            except Exception as e:
+                log.warning("Updates failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
         if path in ("/api/admin", "/api/admin/people"):
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
@@ -1597,7 +1756,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if path in ADMIN_POSTS and not is_admin(uid):
             self._send(403, b'{"error":"admins only"}')
             return
-        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | ADMIN_POSTS | {"/api/feedback"} \
+        if not is_livechat(uid) and path not in ONLINE_POSTS | VISIT_POSTS | ADMIN_POSTS | {"/api/feedback", "/api/updates/seen"} \
                 and not (path == "/api/handover/post" and may_post_handover(uid)):
             self._send(403, b'{"error":"online team: handover only"}')
             return
@@ -1635,6 +1794,10 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = web_admin_decline(uid, body if isinstance(body, dict) else {})
         elif path == "/api/admin/person":
             out = web_admin_person(uid, body if isinstance(body, dict) else {})
+        elif path == "/api/admin/update":
+            out = web_admin_update(uid, body if isinstance(body, dict) else {})
+        elif path == "/api/updates/seen":
+            out = web_updates_seen(uid)
         elif path == "/api/case":
             out = web_case_add(uid, body if isinstance(body, dict) else {})
         elif path == "/api/case/toggle":
@@ -1648,6 +1811,13 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = web_request_add(uid, body)
         elif path in VISIT_POSTS:
             out = web_visit_post(uid, path, body if isinstance(body, dict) else {})
+        elif path == "/api/case/pick":
+            try:
+                cid = int(body.get("id", 0))
+            except (TypeError, ValueError):
+                cid = 0
+            out = (web_case_pick(uid, cid, bool(body.get("help")))
+                   if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/case/handback":
             try:
                 cid = int(body.get("id", 0))
@@ -1703,3 +1873,49 @@ def start_web_server(app=None) -> None:
         return
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log.info("Mini App server listening on port %s", WEB_PORT)
+
+
+# /postupdate — post a What's new update with one message (owner, full admins):
+#   /postupdate NEW | LIVECHAT | Title | Text
+# Type: NEW, PROCESS or GOOD. Teams: ALL, or several joined by commas
+# (LIVECHAT, SH, ON, FS, ONSITE, OPS). The text may run over several lines.
+TEAM_ALIASES = {"EVERYONE": "ALL", "ON-SITE": "ONSITE", "LC": "LIVECHAT"}
+
+
+def parse_update_message(text: str) -> tuple:
+    """(fields, '') or (None, what's wrong)."""
+    parts = [p.strip() for p in text.split("|", 3)]
+    if len(parts) != 4:
+        return None, "Use: /postupdate TYPE | TEAMS | Title | Text"
+    kind, teams_raw, title, body = parts
+    kind = kind.upper()
+    teams = [TEAM_ALIASES.get(t.strip().upper(), t.strip().upper()) for t in teams_raw.replace("+", ",").split(",")]
+    teams = [t for t in teams if t]
+    bad = [t for t in teams if t not in UPDATE_TEAMS]
+    if kind not in UPDATE_KINDS:
+        return None, "Type must be NEW, PROCESS or GOOD."
+    if not teams or bad:
+        return None, ("I don't know " + ", ".join(bad) + ". " if bad else "") + \
+            "Teams: ALL, or LIVECHAT, SH, ON, FS, ONSITE, OPS joined by commas."
+    return {"kind": kind, "teams": teams, "title": title, "body": body}, ""
+
+
+async def cmd_postupdate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if not may_post_updates(uid):
+        return
+    raw = (update.message.text or "").split(None, 1)
+    fields, err = parse_update_message(raw[1] if len(raw) > 1 else "")
+    if not fields:
+        await update.message.reply_text(err)
+        return
+    out = web_admin_update(uid, fields)
+    if not out.get("ok"):
+        await update.message.reply_text(out.get("error") or "Couldn't post that.")
+        return
+    teams = team_label([t for t in fields["teams"]] if "ALL" not in fields["teams"] else ["ALL"])
+    await update.message.reply_text(
+        f"✅ Posted to What's new · {esc(teams)}\n\n<b>{esc(fields['title'])}</b>\n{esc(fields['body'])}\n\n"
+        "<i>Edit or remove it in 🛡 Admin → Updates.</i>", parse_mode=constants.ParseMode.HTML)
