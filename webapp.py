@@ -1412,7 +1412,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true}')
             return
         if path.startswith("/api/") and path not in ("/api/handover", "/api/home",
-                                                     "/api/visits", "/api/cases/search",
+                                                     "/api/visits", "/api/visits/tracker",
+                                                     "/api/cases/search",
                                                      "/api/requests", "/api/admin",
                                                      "/api/admin/people", "/api/updates"):
             # The Online team's app is the handover view only: no week, pay or team.
@@ -1420,6 +1421,25 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             if user and "id" in user and not is_livechat(int(user["id"])):
                 self._send(403, b'{"error":"online team: handover only"}')
                 return
+        if path == "/api/visits/tracker":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid) or not tracker_countries(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._send(200, json.dumps(tracker_payload(uid, (qs.get("week") or [""])[0])).encode())
+            except Exception as e:
+                log.warning("Tracker failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
         if path == "/api/visits":
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
