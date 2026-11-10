@@ -198,7 +198,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
 
 # The App's bottom bar: every team brings its tabs, shown once each and always
 # in this order. Someone in two teams (SH who also do Livechat) gets both sets.
-TAB_ORDER = ["home", "week", "me", "ho", "vis", "pay", "team"]
+TAB_ORDER = ["home", "week", "me", "ho", "vis", "team"]
 
 # The platform logos on the Online team's tabs (assets/logos).
 LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logos")
@@ -219,8 +219,6 @@ def app_tabs(user_id: int) -> list:
         tabs.add("vis")
     if admin_for(user_id, "SH", "FS", "ONSITE"):
         tabs.add("vis")
-    if is_specialist(user_id):
-        tabs.add("pay")     # paid per visit
     return [t for t in TAB_ORDER if t in tabs]   # Team is in 🛡 Admin (admin_tabs)
 
 
@@ -293,9 +291,6 @@ def team_home_payload(user_id: int) -> dict:
                   "day": span_of(nxt)[0].strftime("%a %-d %b")} if nxt else None,
             todayVisits=[visit_item(r, "specialist") for r in todays],
             weekVisits=len(rows),
-            pay={**{k: v for k, v in pay_summary(user_id, today.replace(day=1)).items()
-                    if k in ("count", "total")},
-                 "label": today.strftime("%B") + " so far"},
             waiting=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='WAITING' AND country=?",
                        ((me["country"] if me else "") or "SG",))["n"],
             arranging=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='ARRANGING' AND specialist_id=?",
@@ -1170,7 +1165,7 @@ def web_admin_update(user_id: int, body: dict) -> dict:
 def admin_tabs(user_id: int) -> list:
     if not is_admin(user_id):
         return []
-    return (["people"] + (["team"] if admin_for(user_id, "LIVECHAT", "ONSITE") else [])
+    return (["people"] + (["team"] if admin_for(user_id, "LIVECHAT") else [])
             + (["updates"] if may_post_updates(user_id) else []))
 
 
@@ -1454,8 +1449,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                                                      "/api/visits", "/api/visits/tracker",
                                                      "/api/cases/search",
                                                      "/api/requests", "/api/admin",
-                                                     "/api/admin/people", "/api/pay",
-                                                     "/api/team/onsite", "/api/updates"):
+                                                     "/api/admin/people", "/api/updates"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
@@ -1680,30 +1674,6 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return
-        if path in ("/api/pay", "/api/team/onsite"):
-            try:
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                user = verify_init_data(self.headers.get("X-Init-Data", ""))
-                if not user or "id" not in user:
-                    self._send(401, b'{"error":"unverified"}')
-                    return
-                uid = int(user["id"])
-                month = (qs.get("month") or [""])[0]
-                if not web_has_access(uid):
-                    self._send(403, b'{"error":"no access"}')
-                elif path == "/api/pay" and is_specialist(uid):
-                    self._send(200, json.dumps(pay_payload(uid, month)).encode())
-                elif path == "/api/team/onsite" and admin_for(uid, "ONSITE"):
-                    self._send(200, json.dumps(onsite_team_payload(month)).encode())
-                else:
-                    self._send(403, b'{"error":"not allowed"}')
-            except Exception as e:
-                log.warning("Pay view failed: %s", e)
-                try:
-                    self._send(500, b'{"error":"server"}')
-                except Exception:
-                    pass
-            return
         if path == "/api/updates":
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
@@ -1733,9 +1703,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     self._send(403, b'{"error":"no access"}')
                     return
                 if path == "/api/admin":
-                    kinds = [k for k, d in (("lc", "LIVECHAT"), ("onsite", "ONSITE"))
-                             if admin_tabs(uid) and admin_for(uid, d)]
-                    self._send(200, json.dumps({"tabs": admin_tabs(uid), "teamKinds": kinds}).encode())
+                    self._send(200, json.dumps({"tabs": admin_tabs(uid)}).encode())
                 elif not is_admin(uid):
                     self._send(403, b'{"error":"admins only"}')
                 else:
