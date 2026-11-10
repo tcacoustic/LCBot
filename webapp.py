@@ -375,7 +375,8 @@ def home_payload(user_id: int) -> dict:
 
     first, last = week_bounds(today)
     t = timesheet(user_id, first, last)
-    cases = open_cases()
+    # Cases Online has finished go first: SH can clear them straight away.
+    cases = sorted(open_cases(), key=lambda c: not online_done_line(c))
 
     return {
         "name": name,
@@ -398,6 +399,7 @@ def home_payload(user_id: int) -> dict:
                 "flag": c["flag"] or "",
                 "from": display_name_of(c["agent_id"], ""),
                 "age": (today - date.fromisoformat(c["the_date"])).days,
+                "onlineDone": online_done_line(c),
             }
             for c in cases[:5]
         ],
@@ -608,6 +610,17 @@ def web_claim(user_id: int, slot_id: int, want: bool) -> dict:
     }
 
 
+def online_done_line(r) -> str:
+    """Online has finished with a case SH still has open: who, and how.
+    '' when Online isn't done or SH has closed it too."""
+    if r["closed"] or r["sh_closed"] or not r["on_closed"]:
+        return ""
+    pick = pm_pick(r["id"])
+    if pick and pick[0] == "skip":
+        return f"{display_name_of(pick[1], 'Online')}: not needed"
+    return f"{display_name_of(r['on_closed_by'], 'Online')} closed it"
+
+
 def case_shape(r, today: date, closed: bool = False) -> dict:
     """One case as the App draws it (handover list and search results)."""
     added = date.fromisoformat(r["the_date"])
@@ -631,6 +644,7 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
         "sla": "" if closed else sla_mark(due, today),
         "shClosed": bool(r["sh_closed"]),
         "onClosed": bool(r["on_closed"]),
+        "onlineDone": online_done_line(r),
         "handedBack": bool(r["handed_back"]),
         "helper": display_name_of(helper_of(r["id"]), "Online") if helper_of(r["id"]) else "",
         "canPick": awaiting_pm(r),

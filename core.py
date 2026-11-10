@@ -3461,6 +3461,10 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:4px; background:var(--ink); }
   .tag.red { background:var(--red); } .tag.amber { background:var(--amber); }
   .tag.green { background:var(--green); } .tag.blue { background:var(--blue); }
+  .tag.orange { background:var(--accent); }
+  /* Online has finished with it: SH can close it. */
+  .ondone { border-color:var(--accent) !important; }
+  .ondone-why { font-size:13px; font-weight:700; color:var(--accent); margin-top:4px; }
   /* What's new: the card on Home and the list behind it. */
   .newscard { display:grid; grid-template-columns:auto 1fr auto; gap:10px; align-items:center; cursor:pointer;
     background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px; margin-bottom:14px; }
@@ -3863,11 +3867,14 @@ async function loadHome() {
       if (c.store) bits.push(esc(c.flag) + esc(c.store));
       if (c.from) bits.push('from ' + esc(c.from));
       if (c.age) bits.push(c.age + 'd' + (c.age >= 3 ? ' ⏳' : ''));
-      h += `<div class="p tappable" data-case="${c.id}">` + caseTags(c);
+      h += `<div class="p tappable${c.onlineDone ? ' ondone' : ''}" data-case="${c.id}">`
+         + caseTags(c, c.onlineDone ? [['ONLINE DONE · CLOSE IT', 'orange']] : []);
       h += '<div class="ptop">';
       h += `<div class="pn">${esc(c.username)}</div>`;
       h += '<div class="t">›</div></div>';
-      h += `<div class="t">${bits.join(' · ')}</div></div>`;
+      h += `<div class="t">${bits.join(' · ')}</div>`;
+      if (c.onlineDone) h += `<div class="ondone-why">${esc(c.onlineDone)}</div>`;
+      h += '</div>';
     }
     h += `<div class="note">Tap a case to read it. ${d.openCases} will carry `
        + 'into your handover.</div>';
@@ -4086,12 +4093,14 @@ let AGENT = null;   // whose detail we're looking at
 function caseCard(c, closed) {
   // SH's tick: done once SH has closed it, even while Online still has to.
   const ticked = closed || c.shClosed;
-  let h = `<div class="case${closed ? ' gone' : ''}">`;
+  const done = !closed && c.onlineDone;
+  let h = `<div class="case${closed ? ' gone' : ''}${done ? ' ondone' : ''}">`;
   h += '<div class="top">';
   h += `<div class="tick${ticked ? '' : ' on'}" data-id="${c.id}" `
      + `data-close="${ticked ? '0' : '1'}">${ticked ? '' : '✓'}</div>`;
   h += '<div style="flex:1">';
-  h += caseTags(c, c.handedBack ? [['HANDED BACK', '']] : (c.request && !c.shClosed) ? [['ONLINE REQUEST', 'blue']] : []);
+  h += caseTags(c, done ? [['ONLINE DONE · CLOSE IT', 'orange']]
+    : c.handedBack ? [['HANDED BACK', '']] : (c.request && !c.shClosed) ? [['ONLINE REQUEST', 'blue']] : []);
   h += `<div class="nm">${esc(c.username)}</div>`;
   const bits = [];
   if (c.channelName) bits.push(esc(c.channelName));
@@ -4106,6 +4115,7 @@ function caseCard(c, closed) {
   if (c.section === 'follow') bits.push('follow up');
   h += `<div class="meta">${bits.join(' · ')}</div>`;
   if (c.request && !c.shClosed && !c.handedBack) h += `<div class="st">From ${esc(c.request)} (Online)</div>`;
+  if (done) h += `<div class="ondone-why">${esc(c.onlineDone)}</div>`;
   else if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
   else if (c.helper && !closed) h += `<div class="st">🙋 ${esc(c.helper)} is helping</div>`;
   h += '</div></div>';
@@ -4251,7 +4261,7 @@ async function loadHandover() {
     h += '<div class="note" style="margin-top:0">Untick a case to close it. '
        + 'Cases waiting on Online stay here until they close it too.</div>';
     // Anything Online handed back goes first: someone is waiting on SH.
-    const first = c => (c.handedBack || (c.request && !c.shClosed)) ? 1 : 0;
+    const first = c => c.onlineDone ? 2 : (c.handedBack || (c.request && !c.shClosed)) ? 1 : 0;
     const order = [...d.openCases].sort((a, b) => (first(b) - first(a)) || (a.id - b.id));
     for (const c of order) h += caseCard(c, false);
   }
