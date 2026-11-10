@@ -287,10 +287,7 @@ def team_home_payload(user_id: int) -> dict:
         todays = [r for r in rows if r["starts_at"][:10] == today.isoformat()]
         nxt = next((r for r in todays if span_of(r)[1] > now()), None) or next(
             (r for r in rows if r["starts_at"][:10] > today.isoformat()), None)
-        parts = {"AM": "AM", "PM": "PM", "FD": "full day"}
-        blocks = q("SELECT * FROM specialist_blocks WHERE user_id=? AND part IS NOT NULL"
-                   " AND substr(starts_at,1,10) BETWEEN ? AND ? ORDER BY starts_at",
-                   (user_id, today.isoformat(), week[-1]))
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
         out.update(
             next={**visit_item(nxt, "specialist"),
                   "day": span_of(nxt)[0].strftime("%a %-d %b")} if nxt else None,
@@ -299,8 +296,10 @@ def team_home_payload(user_id: int) -> dict:
             pay={**{k: v for k, v in pay_summary(user_id, today.replace(day=1)).items()
                     if k in ("count", "total")},
                  "label": today.strftime("%B") + " so far"},
-            notFree=[date.fromisoformat(b["starts_at"][:10]).strftime("%a %-d %b") + " "
-                     + parts.get(b["part"], b["part"]) for b in blocks])
+            waiting=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='WAITING' AND country=?",
+                       ((me["country"] if me else "") or "SG",))["n"],
+            arranging=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='ARRANGING' AND specialist_id=?",
+                         (user_id,))["n"])
     elif kind == "ON":
         mine = online_channels(user_id)
         running = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 AND on_closed=0 ORDER BY id")
@@ -775,7 +774,7 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
 
 
 VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
-               "/api/block", "/api/block/remove", "/api/block/day"}
+               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -788,13 +787,42 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         except (TypeError, ValueError):
             return 0
     if path == "/api/visit":
-        if role != "booker":
-            return {"ok": False, "error": "Only SH, FS and admins book visits."}
+        # A specialist adds a customer they've agreed a time with, as their own visit.
+        if role != "specialist":
+            return {"ok": False, "error": "SH and FS hand customers over instead."}
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        b = dict(b, country=(me["country"] if me else "") or "SG", specialist_id=user_id)
         vid, err = create_visit(user_id, b)
         if err:
             return {"ok": False, "error": err}
-        on_bot_loop(notify_booked(bot_ref(), vid))
+        on_bot_loop(notify_booked_fyi(bot_ref(), vid))
         return {"ok": True, "id": vid}
+    if path == "/api/visit/handover":
+        if role != "booker":
+            return {"ok": False, "error": "Only SH, FS and admins hand customers over."}
+        vid, err = create_handover(user_id, b)
+        if err:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_handover(bot_ref(), vid))
+        return {"ok": True, "id": vid}
+    if path == "/api/visit/take":
+        ok, err = on_bot_loop(_take(num("id"), user_id), timeout=10) or (False, "Couldn't take it just now. Try again.")
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(after_take(bot_ref(), num("id"), user_id))
+        return {"ok": True}
+    if path == "/api/visit/giveback":
+        ok, err = give_back(num("id"), user_id)
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_handover(bot_ref(), num("id"), skip=user_id))
+        return {"ok": True}
+    if path == "/api/visit/settime":
+        ok, err = set_time(num("id"), user_id, str(b.get("date", "")), str(b.get("time", "")))
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_booked_fyi(bot_ref(), num("id")))
+        return {"ok": True}
     if path == "/api/visit/reschedule":
         if role != "booker":
             return {"ok": False, "error": "Only SH, FS and admins move visits."}
@@ -813,21 +841,13 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
             return {"ok": False, "error": err}
         on_bot_loop(notify_cancelled(bot_ref(), num("id"), reason))
         return {"ok": True}
-    if not is_specialist(user_id):
-        return {"ok": False, "error": "Only the specialist blocks out their own time."}
-    if path == "/api/block/day":
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
-        ok, err = set_day_part(user_id, (me["country"] if me else "") or "SG",
-                               str(b.get("date", "")), str(b.get("part", "")).upper())
-        return {"ok": True} if ok else {"ok": False, "error": err}
-    if path == "/api/block":
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
-        bid, err = add_block(user_id, (me["country"] if me else "") or "SG",
-                             str(b.get("date", "")), str(b.get("start", "")),
-                             str(b.get("end", "")), str(b.get("note", "")))
-        return {"ok": True, "id": bid} if bid else {"ok": False, "error": err}
-    return ({"ok": True} if remove_block(user_id, num("id"))
-            else {"ok": False, "error": "That time is already gone."})
+    return {"ok": False, "error": "Unknown action."}
+
+
+async def _take(appt_id: int, user_id: int) -> tuple:
+    """On the bot's loop, under the write lock, so two taps can't both win."""
+    async with write_lock:
+        return take_handover(appt_id, user_id)
 
 
 def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
@@ -1167,6 +1187,7 @@ def person_dict(r) -> dict:
         "id": uid, "name": r["display_name"] or r["name"] or "", "username": r["username"] or "",
         "teams": teams, "admin": bool(is_owner(uid) or r["role"] == "admin"), "owner": is_owner(uid),
         "fullAdmin": r["role"] == "admin" and is_full_admin(uid),
+        "adminTeams": [k for k, _ in DEPARTMENTS if k in admin_teams(uid)] if r["role"] == "admin" else [],
         "channels": online_channels(uid) if "ON" in teams else [],
         "country": (r["country"] or "") if "ONSITE" in teams else "",
         "store": store_of(uid) if "FS" in teams else "",
@@ -1332,6 +1353,7 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         run("UPDATE agents SET role=? WHERE user_id=?", ("admin" if value else "agent", uid))
         if not value:
             set_setting(f"full_admin:{uid}", "")     # no longer an admin: not a full one either
+            set_setting(f"admin_teams:{uid}", "")
         menus = True
         if value:
             on_bot_loop(bot_ref().send_message(
@@ -1346,6 +1368,18 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         if value:
             on_bot_loop(bot_ref().send_message(
                 uid, "You now have admin tools for every team. Send /help to see what's new."))
+    elif field == "adminteams":
+        if not is_owner(admin_id):
+            return {"ok": False, "error": "Only the owner picks which teams an admin looks after."}
+        if row["role"] != "admin":
+            return {"ok": False, "error": "Make them an admin first."}
+        teams = clean_list(value, [k for k, _ in DEPARTMENTS])
+        if not teams:
+            return {"ok": False, "error": "Keep at least one team, or turn Admin off."}
+        set_setting(f"full_admin:{uid}", "")
+        # The same as their own teams: store nothing, so it follows their teams.
+        set_setting(f"admin_teams:{uid}", "" if set(teams) == set(teams_of(uid)) else ",".join(teams))
+        menus = True
     elif field == "name":
         nm = " ".join(str(value or "").split())
         if not 2 <= len(nm) <= 40:
@@ -1417,7 +1451,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true}')
             return
         if path.startswith("/api/") and path not in ("/api/handover", "/api/home",
-                                                     "/api/visits", "/api/cases/search",
+                                                     "/api/visits", "/api/visits/tracker",
+                                                     "/api/cases/search",
                                                      "/api/requests", "/api/admin",
                                                      "/api/admin/people", "/api/pay",
                                                      "/api/team/onsite", "/api/updates"):
@@ -1426,6 +1461,25 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             if user and "id" in user and not is_livechat(int(user["id"])):
                 self._send(403, b'{"error":"online team: handover only"}')
                 return
+        if path == "/api/visits/tracker":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid) or not tracker_countries(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._send(200, json.dumps(tracker_payload(uid, (qs.get("week") or [""])[0])).encode())
+            except Exception as e:
+                log.warning("Tracker failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
         if path == "/api/visits":
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
