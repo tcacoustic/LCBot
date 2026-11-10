@@ -3488,7 +3488,8 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .tk-st .booked { background:var(--blue); } .tk-st .onsite { background:var(--accent); }
   .tk-st .done { background:var(--green); } .tk-st .followup { background:var(--amber); }
   .tk-st .cancelled { background:#6B7280; }
-  .tag.grey { background:#6B7280; }
+  .tag.grey { background:#6B7280; } .tag.purple { background:#6D28D9; } .tag.teal { background:#0E7490; }
+  .tk-st .waiting { background:#6D28D9; } .tk-st .arranging { background:#0E7490; }
   .tk-v { cursor:pointer; }
   .tk-v .nm { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
   .tk-sec { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px 14px; margin-bottom:10px; }
@@ -3974,7 +3975,7 @@ function renderTeamHome(d) {
     h += b ? hero('Next appointment you booked', b.day + ' ' + b.start, [b.type, b.customer, b.specialist].filter(Boolean).join(' · '))
            : hero('Next appointment you booked', 'None yet', '');
     h += cards([[d.bookedWeek, 'Booked this week'], [d.requestsOpen, 'Requests open']]);
-    h += '<button class="big" id="hBook">Book an appointment</button>';
+    h += '<button class="big" id="hBook">Hand over to On-Site</button>';
     h += requestButton();
     h += '<h2>Look up a case</h2>' + searchBar() + '<div id="fsResults"></div>';
     if (d.booked.length) h += '<h2>Appointments you booked</h2>' + d.booked.map(v => visitRow(v, v.day)).join('');
@@ -3989,9 +3990,10 @@ function renderTeamHome(d) {
        + `<div class="t">${esc(plural(d.pay.count, 'visit'))} · see Pay</div></div>`;
     h += cards([[d.todayVisits.length, 'Visits today'], [d.weekVisits, 'This week']]);
     if (d.todayVisits.length) h += '<h2>Today</h2>' + d.todayVisits.map(v => visitRow({ ...v, specialist: '' })).join('');
+    h += '<div class="p tappable" data-gotovis="1" style="margin-top:14px"><div class="pn">'
+       + plural(d.waiting, 'handover') + ' waiting' + (d.arranging ? ' · ' + d.arranging + ' you’re arranging' : '')
+       + '</div><div class="t">Take one in My visits</div></div>';
     h += '<div class="note">At the visit, send /visits to the bot to tap 🚗 Arrived and 🏁 Leave.</div>';
-    h += '<h2>Not free this week</h2><div class="p tappable" data-gotovis="1"><div class="pn">'
-       + esc(d.notFree.length ? d.notFree.join(' · ') : 'Free all week') + '</div><div class="t">Change it in My visits</div></div>';
   } else if (d.teamHome === 'ON') {
     h += hero('Open on your channels', plural(d.open, 'case'),
               d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
@@ -4041,7 +4043,7 @@ function renderTeamHome(d) {
   });
   if (d.teamHome === 'FS') wireFsSearch();
   const bk = document.getElementById('hBook');
-  if (bk) bk.onclick = () => { VS.form = { country: '', spec: '', visit_type: 'SETUP', date: '', time: '' }; VIEW = 'vis'; render(); };
+  if (bk) bk.onclick = () => { VS.form = { mode: 'handover', country: '', visit_type: 'SETUP' }; VIEW = 'vis'; render(); };
   const no = document.getElementById('hNewOnline');
   if (no) no.onclick = () => { HO_FORM = { section: 'open', prio: '', platform: '', store: '' }; VIEW = 'ho'; render(); };
 }
@@ -4680,46 +4682,64 @@ function visitCard(it, d) {
 }
 
 function bookForm(d) {
-  const f = VS.form;
-  const team = (d.countries.find(c => c.code === f.country) || {}).specialists || [];
-  let h = '<h1>Book an appointment</h1>';
-  h += '<div class="fld"><label>Country</label><div class="pick">' + d.countries.map(c =>
+  // Two forms: SH, FS and admins hand a customer over (no date); a specialist
+  // adds a customer they've already agreed a time with.
+  const f = VS.form, hand = f.mode === 'handover';
+  let h = '<div class="back" id="bfBack">‹ Visits</div>';
+  h += '<h1>' + (hand ? 'Hand over to On-Site' : 'Add appointment') + '</h1>';
+  h += '<div class="sub">' + (hand ? 'No date needed: the specialist agrees the time with the customer.'
+                                   : 'For a customer you’ve agreed a time with. It’s booked under you.') + '</div>';
+  if (hand) h += '<div class="fld"><label>Country</label><div class="pick">' + d.countries.map(c =>
       '<button data-bf="country" data-v="' + c.code + '" class="' + (f.country === c.code ? 'on' : '') + '">' + esc(c.name) + '</button>').join('') + '</div></div>';
-  if (!team.length) {
-    h += '<div class="note">There is no On-Site Specialist in this country yet.</div>';
-  } else if (team.length > 1) {
-    h += '<div class="fld"><label>Specialist</label><div class="pick">' + team.map(s =>
-        '<button data-bf="spec" data-v="' + s.id + '" class="' + (String(f.spec) === String(s.id) ? 'on' : '') + '">' + esc(s.name) + '</button>').join('') + '</div></div>';
-  } else {
-    h += '<div class="note" style="margin-top:0">Specialist: ' + esc(team[0].name) + '</div>';
-  }
-  h += '<div class="fld"><label>Appointment type</label><div class="pick">' + d.types.map(t =>
+  h += '<div class="fld"><label>Type</label><div class="pick">' + d.types.map(t =>
       '<button data-bf="visit_type" data-v="' + t.key + '" class="' + (f.visit_type === t.key ? 'on' : '') + '">' + esc(t.name) + '</button>').join('') + '</div></div>';
-  h += '<div class="fld"><label>Date and start time (local time there)</label><input type="date" id="bf_date" value="' + esc(f.date || '') + '">'
-     + '<input type="time" id="bf_time" value="' + esc(f.time || '') + '" style="margin-top:6px">'
-     + '<div class="note" id="bf_free" style="margin-top:6px">' + (f.date ? 'Checking that day…' : 'Pick a date to see when the specialist is available.') + '</div></div>';
-  const fields = [['customer_name', 'Customer name'], ['phone', 'Phone'], ['email', 'Email (optional)'],
-    ['address', 'Address'], ['postal', 'Postal code'], ['product', 'Product'],
-    ['issue', 'Issue or what to set up'], ['order_no', 'Order number (optional)']];
+  if (!hand) h += '<div class="fld"><label>Date and start time</label><input type="date" id="bf_date" value="' + esc(f.date || '') + '">'
+     + '<input type="time" id="bf_time" value="' + esc(f.time || '') + '" style="margin-top:6px"></div>';
+  const fields = [['customer_name', 'Customer name'], ['phone', 'Phone'], ['product', 'Product'],
+    ['issue', 'Issue faced'], ['address', 'Location (address)'], ['postal', 'Postal code (optional)'],
+    ['order_no', 'Order number (optional)']].concat(hand ? [['note', 'Anything else? (optional)']] : []);
   for (const [k, label] of fields) {
-    h += '<div class="fld"><label>' + esc(label) + '</label>' + (k === 'issue'
+    h += '<div class="fld"><label>' + esc(label) + '</label>' + (k === 'issue' || k === 'note'
       ? '<textarea id="bf_' + k + '" rows="2">' + esc(f[k] || '') + '</textarea>'
-      : '<input id="bf_' + k + '" value="' + esc(f[k] || '') + '">') + '</div>';
+      : '<input id="bf_' + k + '" value="' + esc(f[k] || '') + '"' + (k === 'phone' ? ' type="tel"' : '') + '>') + '</div>';
   }
-  h += '<button class="big" id="bfSave">Book the appointment</button>';
-  h += '<button class="big" id="bfCancel" style="margin-top:8px;background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111)">Back</button>';
+  h += '<button class="big" id="bfSave">' + (hand ? 'Hand over to On-Site' : 'Add appointment') + '</button>';
   return h;
 }
 
 function keepBookForm() {
   if (!VS.form) return;
-  for (const k of ['date', 'time', 'customer_name', 'phone', 'email', 'address', 'postal', 'product', 'issue', 'order_no']) {
+  for (const k of ['date', 'time', 'customer_name', 'phone', 'email', 'address', 'postal', 'product', 'issue', 'order_no', 'note']) {
     const el = document.getElementById('bf_' + k);
     if (el) VS.form[k] = el.value;
   }
 }
 
-const TK_STATUS = { booked: ['blue', 'Booked'], onsite: ['orange', 'On site now'], done: ['green', 'Done'],
+function openCard(it) {
+  const tag = it.status === 'waiting' ? ['purple', 'WAITING'] : ['teal', 'ARRANGING'];
+  let h = '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px">'
+    + '<span>' + (REGION_FLAGS[it.country] || '') + ' ' + esc(it.customer) + ' · ' + esc(it.type) + '</span>'
+    + '<span class="tag ' + tag[0] + '" style="align-self:flex-start">' + tag[1] + '</span></div>';
+  h += '<div class="meta">' + [it.product, it.postal, it.from ? 'from ' + it.from : '', it.handed].filter(Boolean).map(esc).join(' · ') + '</div>';
+  if (it.specialist && it.status === 'arranging') h += '<div class="st">Taken by ' + esc(it.specialist) + '</div>';
+  let b = '';
+  if (it.issue) b += 'Issue: ' + esc(it.issue) + '<br>';
+  if (it.note) b += 'Note: ' + esc(it.note) + '<br>';
+  if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+  if (it.address) b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '<br>';
+  if (it.order) b += 'Order: ' + esc(it.order);
+  if (b) h += '<div class="body" style="white-space:normal">' + b + '</div>';
+  if (it.map) h += '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div>';
+  if (it.canTake) h += '<div class="acts"><button data-take="' + it.id + '">🙋 I’ll take it</button></div>';
+  if (it.canSet) h += '<div class="fld" style="margin-top:8px"><label>Date and time agreed with the customer</label>'
+     + '<input type="date" id="st_d_' + it.id + '"><input type="time" id="st_t_' + it.id + '" style="margin-top:6px"></div>'
+     + '<div class="acts"><button data-settime="' + it.id + '">Book it</button>'
+     + (it.canGiveBack ? '<button class="soft" data-giveback="' + it.id + '">Give back</button>' : '') + '</div>';
+  if (it.canCancel) h += '<div class="more" data-hcancel="' + it.id + '">Cancel this handover</div>';
+  return h + '</div>';
+}
+
+const TK_STATUS = { waiting: ['purple', 'Waiting'], arranging: ['teal', 'Arranging'], booked: ['blue', 'Booked'], onsite: ['orange', 'On site now'], done: ['green', 'Done'],
   followup: ['amber', 'Follow-up'], cancelled: ['grey', 'Cancelled'] };
 
 function trackerSwitch() {
@@ -4739,6 +4759,7 @@ function trackerVisit(it) {
   if (it.product) a += '<b>Product</b><span>' + esc(it.product) + '</span>';
   if (it.issue) a += '<b>Issue</b><span>' + esc(it.issue) + '</span>';
   if (it.order) a += '<b>Order</b><span>' + esc(it.order) + '</span>';
+  if (it.note) a += '<b>Note</b><span>' + esc(it.note) + '</span>';
   h += '<div class="tk-sec"><h2>Appointment</h2><div class="tk-kv">' + a + '</div></div>';
   if (it.customer !== undefined) {
     let c = '<b>Name</b><span>' + esc(it.customer) + '</span>';
@@ -4761,7 +4782,7 @@ async function loadTracker(d) {
   const app = document.getElementById('app');
   const t = await getJSON('/api/visits/tracker?' + new URLSearchParams({ week: VS.tw }).toString());
   VS.tw = t.weekStart;
-  const open = VS.tv ? t.items.find(x => x.id === VS.tv) : null;
+  const open = VS.tv ? t.items.concat(t.open || []).find(x => x.id === VS.tv) : null;
   if (open) { app.innerHTML = trackerVisit(open) + navBar(); wireVisits(d); return; }
   VS.tv = null;
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch();
@@ -4781,7 +4802,17 @@ async function loadTracker(d) {
       + t.statuses[k] + ' ' + esc(TK_STATUS[k][1].toLowerCase()) + '</button>').join('') + '</div>';
   if (VS.tc || VS.ts) h += '<div class="search-clear" data-tclear="1">Show all</div>';
   const shown = t.items.filter(it => (!VS.tc || it.country === VS.tc) && (!VS.ts || it.status === VS.ts));
-  if (!shown.length) h += '<div class="empty">No visits' + (VS.tc || VS.ts ? ' match' : ' this week') + '.</div>';
+  const openShown = (t.open || []).filter(it => (!VS.tc || it.country === VS.tc) && (!VS.ts || it.status === VS.ts));
+  if (openShown.length) {
+    h += '<h2>Not booked yet</h2>';
+    for (const it of openShown) {
+      const st = TK_STATUS[it.status];
+      h += '<div class="case tk-v" data-tv="' + it.id + '"><div class="nm"><span>' + (REGION_FLAGS[it.country] || '') + ' '
+         + esc(it.customer) + ' · ' + esc(it.type) + '</span><span class="tag ' + st[0] + '">' + esc(st[1].toUpperCase()) + '</span></div>'
+         + '<div class="meta">' + esc(it.status === 'arranging' ? (it.specialist || '') + ' is arranging' : 'Nobody has taken it yet') + ' ›</div></div>';
+    }
+  }
+  if (!shown.length && !openShown.length) h += '<div class="empty">No visits' + (VS.tc || VS.ts ? ' match' : ' this week') + '.</div>';
   let day = '';
   for (const it of shown) {
     if (it.date !== day) { day = it.date; h += '<h2>' + esc(t.dayLabels[day] || day) + '</h2>'; }
@@ -4823,32 +4854,20 @@ async function loadVisits() {
     } else if (!team.length) {
       h += '<div class="note">No On-Site Specialist in this country yet.</div>';
     }
-    h += '<button class="big" id="bookNew" style="margin:6px 0 4px">+ Book an appointment</button>';
+    h += '<button class="big" id="bookNew" style="margin:6px 0 4px">Hand over to On-Site</button>';
     h += requestButton();
   } else {
-    h += '<h2>My availability</h2>'
-       + '<div class="note" style="margin-top:0">Tap a day. AM = not free 10am–2pm, '
-       + 'PM = not free 2pm–6pm, FD = not free all day.</div>';
-    for (const day of d.availability) {
-      h += '<div class="case' + (day.part ? ' gone' : '') + '" data-aday="' + day.date + '" style="cursor:pointer">'
-         + '<div class="nm">' + esc(day.label) + ' · ' + esc(day.text) + '</div>';
-      if (VS.day === day.date) {
-        h += '<div class="otabs small" style="margin-bottom:0">' + ['AM', 'PM', 'FD'].map(k =>
-            '<button data-apart="' + k + '" data-adate="' + day.date + '" class="' + (day.part === k ? 'on' : '') + '">' + k + '</button>').join('')
-           + '<button data-apart="FREE" data-adate="' + day.date + '" class="' + (!day.part ? 'on' : '') + '">Free</button></div>';
-      }
-      h += '</div>';
-    }
-    h += '<div class="otabs small">' + (d.availPrev ? '<button data-av="' + d.availPrev + '">◀ Earlier</button>' : '')
-       + '<button data-av="' + d.availNext + '">Next 5 days ▶</button></div>'
-       + '<h2>My visits</h2>';
+    h += '<button class="big ghost" id="addOwn" style="margin:6px 0 4px">+ Add appointment</button>';
   }
+  const waiting = d.open.filter(x => x.status === 'waiting'), arranging = d.open.filter(x => x.status === 'arranging');
+  if (waiting.length) h += '<h2>Waiting for a specialist</h2>' + waiting.map(x => openCard(x)).join('');
+  if (arranging.length) h += '<h2>Arranging with the customer</h2>' + arranging.map(x => openCard(x)).join('');
+  if (d.role === 'specialist') h += '<h2>Booked</h2>';
   h += '<div class="otabs small"><button data-vw="' + d.prev + '">◀ Prev</button>'
      + '<button class="on">' + esc(d.weekLabel) + '</button>'
      + '<button data-vw="' + d.next + '">Next ▶</button></div>';
   for (const day of d.days) {
     h += '<h2>' + esc(day.label) + (day.today ? ' · today' : '') + '</h2>';
-    if (day.free) h += '<div class="note" style="margin-top:0">' + esc(day.free) + '</div>';
     for (const it of day.items) h += visitCard(it, d);
   }
   app.innerHTML = h + navBar();
@@ -4894,51 +4913,55 @@ function wireVisits(d) {
     if (!out.ok) { toast(out.error || 'Could not cancel that.'); return; }
     delete VS.cancel[id]; toast('Cancelled. The specialist has been told.'); loadVisits();
   });
-  on('[data-aday]', el => { VS.day = VS.day === el.dataset.aday ? '' : el.dataset.aday; loadVisits(); });
-  on('[data-av]', el => { VS.avail = el.dataset.av; VS.day = ''; loadVisits(); });
-  document.querySelectorAll('[data-apart]').forEach(el => {
-    el.onclick = async ev => {
-      ev.stopPropagation();
-      const day = d.availability.find(x => x.date === el.dataset.adate);
-      const part = (day && day.part === el.dataset.apart) ? 'FREE' : el.dataset.apart;
-      const out = await post('/api/block/day', { date: el.dataset.adate, part });
-      if (!out.ok) { toast(out.error || 'Could not change that.'); return; }
-      toast(part === 'FREE' ? 'Free all day' : 'Saved'); loadVisits();
-    };
-  });
   const bn = document.getElementById('bookNew');
-  if (bn) bn.onclick = () => { VS.form = { country: d.country, spec: VS.spec, visit_type: 'SETUP', date: '', time: '' }; loadVisits(); };
-  on('[data-bf]', el => {
-    keepBookForm();
-    VS.form[el.dataset.bf] = el.dataset.v;
-    if (el.dataset.bf === 'country') { VS.form.spec = ''; VS.country = el.dataset.v; VS.spec = ''; }
-    if (el.dataset.bf === 'spec') VS.spec = el.dataset.v;
-    loadVisits();
-  });
-  const showFree = async () => {
-    const box = document.getElementById('bf_free'), date = (document.getElementById('bf_date') || {}).value;
-    if (!box || !date) return;
-    const qs = new URLSearchParams({ week: date, country: VS.form.country, spec: VS.spec });
-    const wk = await getJSON('/api/visits?' + qs.toString());
-    const day = (wk.days || []).find(x => x.date === date);
-    box.textContent = day ? 'On ' + day.label + ': ' + (day.free || 'no specialist yet') : '';
-  };
-  const bd = document.getElementById('bf_date');
-  if (bd) { bd.onchange = () => { keepBookForm(); showFree(); }; if (bd.value) showFree(); }
-  const bc = document.getElementById('bfCancel');
-  if (bc) bc.onclick = () => { VS.form = null; loadVisits(); };
+  if (bn) bn.onclick = () => { VS.form = { mode: 'handover', country: d.country, visit_type: 'SETUP' }; loadVisits(); };
+  const ao = document.getElementById('addOwn');
+  if (ao) ao.onclick = () => { VS.form = { mode: 'add', visit_type: 'SETUP', date: '', time: '' }; loadVisits(); };
+  on('[data-bf]', el => { keepBookForm(); VS.form[el.dataset.bf] = el.dataset.v; loadVisits(); });
+  const bb = document.getElementById('bfBack');
+  if (bb) bb.onclick = () => { VS.form = null; loadVisits(); };
   const bs = document.getElementById('bfSave');
   if (bs) bs.onclick = async () => {
     keepBookForm();
-    const team = (d.countries.find(c => c.code === VS.form.country) || {}).specialists || [];
-    const body = Object.assign({}, VS.form, { specialist_id: VS.form.spec || (team.length === 1 ? team[0].id : '') });
-    bs.disabled = true; bs.textContent = 'Booking…';
-    const out = await post('/api/visit', body);
-    bs.disabled = false; bs.textContent = 'Book the appointment';
-    if (!out.ok) { toast(out.error || 'Could not book that.'); return; }
+    const hand = VS.form.mode === 'handover', label = bs.textContent;
+    bs.disabled = true; bs.textContent = hand ? 'Handing over…' : 'Adding…';
+    const out = await post(hand ? '/api/visit/handover' : '/api/visit', VS.form);
+    bs.disabled = false; bs.textContent = label;
+    if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
     const when = VS.form.date;
-    VS.form = null; VS.week = when; toast('Booked. The specialist has been told.'); loadVisits();
+    if (hand) VS.country = VS.form.country; else VS.week = when;
+    VS.form = null;
+    toast(hand ? 'Handed over. The specialists there have been told.' : 'Added. The On-Site admins have been told.');
+    loadVisits();
   };
+  on('[data-take]', async el => {
+    el.disabled = true;
+    const out = await post('/api/visit/take', { id: Number(el.dataset.take) });
+    if (!out.ok) { toast(out.error || 'Could not take it.'); loadVisits(); return; }
+    toast('It’s yours. Call the customer, then set the time.'); loadVisits();
+  });
+  on('[data-settime]', async el => {
+    const id = el.dataset.settime;
+    const date = document.getElementById('st_d_' + id).value, time = document.getElementById('st_t_' + id).value;
+    if (!date || !time) { toast('Pick the date and time you agreed.'); return; }
+    el.disabled = true;
+    const out = await post('/api/visit/settime', { id: Number(id), date, time });
+    el.disabled = false;
+    if (!out.ok) { toast(out.error || 'Could not book that.'); return; }
+    VS.week = date; toast('Booked'); loadVisits();
+  });
+  on('[data-giveback]', async el => {
+    if (!await askSure('Give this back so another specialist can take it?')) return;
+    const out = await post('/api/visit/giveback', { id: Number(el.dataset.giveback) });
+    if (!out.ok) { toast(out.error || 'Could not give it back.'); return; }
+    toast('Given back. The other specialists have been told.'); loadVisits();
+  });
+  on('[data-hcancel]', async el => {
+    if (!await askSure('Cancel this handover? The specialist is told if someone took it.')) return;
+    const out = await post('/api/visit/cancel', { id: Number(el.dataset.hcancel), reason: '' });
+    if (!out.ok) { toast(out.error || 'Could not cancel it.'); return; }
+    toast('Cancelled'); loadVisits();
+  });
 }
 
 async function loadWeek() {

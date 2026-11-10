@@ -287,10 +287,7 @@ def team_home_payload(user_id: int) -> dict:
         todays = [r for r in rows if r["starts_at"][:10] == today.isoformat()]
         nxt = next((r for r in todays if span_of(r)[1] > now()), None) or next(
             (r for r in rows if r["starts_at"][:10] > today.isoformat()), None)
-        parts = {"AM": "AM", "PM": "PM", "FD": "full day"}
-        blocks = q("SELECT * FROM specialist_blocks WHERE user_id=? AND part IS NOT NULL"
-                   " AND substr(starts_at,1,10) BETWEEN ? AND ? ORDER BY starts_at",
-                   (user_id, today.isoformat(), week[-1]))
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
         out.update(
             next={**visit_item(nxt, "specialist"),
                   "day": span_of(nxt)[0].strftime("%a %-d %b")} if nxt else None,
@@ -299,8 +296,10 @@ def team_home_payload(user_id: int) -> dict:
             pay={**{k: v for k, v in pay_summary(user_id, today.replace(day=1)).items()
                     if k in ("count", "total")},
                  "label": today.strftime("%B") + " so far"},
-            notFree=[date.fromisoformat(b["starts_at"][:10]).strftime("%a %-d %b") + " "
-                     + parts.get(b["part"], b["part"]) for b in blocks])
+            waiting=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='WAITING' AND country=?",
+                       ((me["country"] if me else "") or "SG",))["n"],
+            arranging=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='ARRANGING' AND specialist_id=?",
+                         (user_id,))["n"])
     elif kind == "ON":
         mine = online_channels(user_id)
         running = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 AND on_closed=0 ORDER BY id")
@@ -775,7 +774,7 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
 
 
 VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
-               "/api/block", "/api/block/remove", "/api/block/day"}
+               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -788,13 +787,42 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         except (TypeError, ValueError):
             return 0
     if path == "/api/visit":
-        if role != "booker":
-            return {"ok": False, "error": "Only SH, FS and admins book visits."}
+        # A specialist adds a customer they've agreed a time with, as their own visit.
+        if role != "specialist":
+            return {"ok": False, "error": "SH and FS hand customers over instead."}
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        b = dict(b, country=(me["country"] if me else "") or "SG", specialist_id=user_id)
         vid, err = create_visit(user_id, b)
         if err:
             return {"ok": False, "error": err}
-        on_bot_loop(notify_booked(bot_ref(), vid))
+        on_bot_loop(notify_booked_fyi(bot_ref(), vid))
         return {"ok": True, "id": vid}
+    if path == "/api/visit/handover":
+        if role != "booker":
+            return {"ok": False, "error": "Only SH, FS and admins hand customers over."}
+        vid, err = create_handover(user_id, b)
+        if err:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_handover(bot_ref(), vid))
+        return {"ok": True, "id": vid}
+    if path == "/api/visit/take":
+        ok, err = on_bot_loop(_take(num("id"), user_id), timeout=10) or (False, "Couldn't take it just now. Try again.")
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(after_take(bot_ref(), num("id"), user_id))
+        return {"ok": True}
+    if path == "/api/visit/giveback":
+        ok, err = give_back(num("id"), user_id)
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_handover(bot_ref(), num("id"), skip=user_id))
+        return {"ok": True}
+    if path == "/api/visit/settime":
+        ok, err = set_time(num("id"), user_id, str(b.get("date", "")), str(b.get("time", "")))
+        if not ok:
+            return {"ok": False, "error": err}
+        on_bot_loop(notify_booked_fyi(bot_ref(), num("id")))
+        return {"ok": True}
     if path == "/api/visit/reschedule":
         if role != "booker":
             return {"ok": False, "error": "Only SH, FS and admins move visits."}
@@ -813,21 +841,13 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
             return {"ok": False, "error": err}
         on_bot_loop(notify_cancelled(bot_ref(), num("id"), reason))
         return {"ok": True}
-    if not is_specialist(user_id):
-        return {"ok": False, "error": "Only the specialist blocks out their own time."}
-    if path == "/api/block/day":
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
-        ok, err = set_day_part(user_id, (me["country"] if me else "") or "SG",
-                               str(b.get("date", "")), str(b.get("part", "")).upper())
-        return {"ok": True} if ok else {"ok": False, "error": err}
-    if path == "/api/block":
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
-        bid, err = add_block(user_id, (me["country"] if me else "") or "SG",
-                             str(b.get("date", "")), str(b.get("start", "")),
-                             str(b.get("end", "")), str(b.get("note", "")))
-        return {"ok": True, "id": bid} if bid else {"ok": False, "error": err}
-    return ({"ok": True} if remove_block(user_id, num("id"))
-            else {"ok": False, "error": "That time is already gone."})
+    return {"ok": False, "error": "Unknown action."}
+
+
+async def _take(appt_id: int, user_id: int) -> tuple:
+    """On the bot's loop, under the write lock, so two taps can't both win."""
+    async with write_lock:
+        return take_handover(appt_id, user_id)
 
 
 def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
