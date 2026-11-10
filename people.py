@@ -58,6 +58,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         from ops import start_cant_reason
         return await start_cant_reason(update, context, context.args[0][4:])
 
+    # From 📋 Open all in SH Bot under the 10am bump: the case list.
+    if context.args and context.args[0] == "cases" and (status == "active" or is_owner(user.id)):
+        from handover import cases_list
+        text, kb = cases_list(user.id)
+        await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+        return ConversationHandler.END
+
     # From 📝 Note under a case in a store chat: take the note here, privately.
     if context.args and context.args[0].startswith("note_") and (
             status == "active" or is_owner(user.id)):
