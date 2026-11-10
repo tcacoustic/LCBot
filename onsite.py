@@ -293,13 +293,6 @@ def clash(specialist_id: int, start: datetime, end: datetime,
         s, e = span_of(v)
         if s < end and start < e:
             return f"another visit ({VISIT_NAMES[v['visit_type']]}, {when_text(v)})"
-    for b in q("SELECT * FROM specialist_blocks WHERE user_id=?", (specialist_id,)):
-        s, e = datetime.fromisoformat(b["starts_at"]), datetime.fromisoformat(b["ends_at"])
-        if s < end and start < e:
-            if b["part"]:
-                half = {"AM": "10am–2pm", "PM": "2pm–6pm", "FD": "all day"}[b["part"]]
-                return f"marked themselves not free {half} ({s.strftime('%a %-d %b')})"
-            return f"a time they aren't free ({s.strftime('%a %-d %b, %H:%M')}–{e.strftime('%H:%M')})"
     return None
 
 
@@ -475,8 +468,8 @@ async def on_reschedule_answer(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def cancel_visit(appt_id: int, user_id: int, reason: str = "") -> tuple:
     v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
-    if not v or v["status"] != "SCHEDULED":
-        return False, "Only a scheduled visit can be cancelled."
+    if not v or v["status"] not in ("SCHEDULED",) + OPEN_STATUSES:
+        return False, "Only a visit that hasn't started can be cancelled."
     run("UPDATE appointments SET status='CANCELLED', proposed_starts_at=NULL, "
         "proposed_by=NULL WHERE id=?", (appt_id,))
     log_visit(appt_id, user_id, "cancelled", reason)
@@ -488,9 +481,263 @@ async def notify_cancelled(bot, appt_id: int, reason: str = "") -> None:
     who = display_name_of(q1("SELECT user_id FROM appointment_log WHERE appt_id=? "
                              "AND action='cancelled' ORDER BY id DESC LIMIT 1",
                              (appt_id,))["user_id"], "SH")
+    await close_handover_msgs(bot, appt_id, "🚫 Cancelled")
     await tell(bot, v["specialist_id"],
                f"🚫 {who} cancelled a visit" + (f": {reason}" if reason else "")
-               + "\n\n" + visit_text(v))
+               + "\n\n" + (visit_text(v) if has_time(appt_id) else handover_text(v, True)))
+
+
+# --------------------------------------------------------------------------
+# Handovers: SH or FS pass a customer to On-Site with no date. Whichever
+# specialist is free takes it, agrees the time with the customer and sets it.
+# No database change: two more statuses on appointments, and until a time is
+# set, starts_at holds when it was handed over.
+# --------------------------------------------------------------------------
+
+OPEN_STATUSES = ("WAITING", "ARRANGING")
+
+
+def has_time(appt_id: int) -> bool:
+    """Whether a real date and time was ever set (booked directly, or set later)."""
+    return bool(q1("SELECT 1 FROM appointment_log WHERE appt_id=? AND action='booked' LIMIT 1",
+                   (appt_id,)))
+
+
+def handover_note(appt_id: int) -> str:
+    row = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='handover' "
+             "ORDER BY id LIMIT 1", (appt_id,))
+    return (row["note"] if row else "") or ""
+
+
+def handover_text(v, full: bool) -> str:
+    """A handover as a message. Without full: no phone or address (for
+    specialists who haven't taken it)."""
+    lines = [f"{COUNTRY_NAMES[v['country']]} · {VISIT_NAMES.get(v['visit_type'], v['visit_type'])}",
+             f"Customer: {v['customer_name']}" + (f" · {v['phone']}" if full and v["phone"] else "")]
+    if full:
+        lines.append(f"Address: {v['address']}" + (f" {v['postal']}" if v["postal"] else ""))
+    elif v["postal"]:
+        lines.append(f"Area: {v['postal']}")
+    if v["product"]:
+        lines.append(f"Product: {v['product']}")
+    if v["issue"]:
+        lines.append(f"Issue: {v['issue']}")
+    note = handover_note(v["id"])
+    if note:
+        lines.append(f"Note: {note}")
+    if v["order_no"]:
+        lines.append(f"Order: {v['order_no']}")
+    if v["created_by"]:
+        lines.append(f"From {booker_name(v['created_by'])}")
+    if full:
+        lines.append(f"Map: {map_link(v)}")
+    return "\n".join(lines)
+
+
+def create_handover(user_id: int, f: dict) -> tuple:
+    """Hand a customer over to On-Site. Returns (id, None) or (None, error)."""
+    country = str(f.get("country", "")).upper()
+    if country not in COUNTRY_NAMES:
+        return None, "Pick a country."
+    vtype = str(f.get("visit_type", "")).upper()
+    if vtype not in dict(VISIT_TYPES):
+        return None, "Pick the visit type."
+    clean = {k: str(f.get(k, "") or "").strip()[:300] for k in
+             ("customer_name", "phone", "email", "address", "postal", "product",
+              "issue", "order_no", "note")}
+    need = {"customer_name": "the customer's name", "phone": "a phone number",
+            "product": "the product", "issue": "the issue", "address": "the location"}
+    for k, label in need.items():
+        if len(clean[k]) < 2:
+            return None, f"Fill in {label}."
+    cur = run(
+        "INSERT INTO appointments (country, specialist_id, visit_type, starts_at, duration_min,"
+        " customer_name, phone, email, address, postal, product, issue, order_no, status,"
+        " created_by, created_at) VALUES (?,NULL,?,?,?,?,?,?,?,?,?,?,?,'WAITING',?,?)",
+        (country, vtype, now().isoformat(), RESERVE_MIN, clean["customer_name"], clean["phone"],
+         clean["email"] or None, clean["address"], clean["postal"] or None, clean["product"],
+         clean["issue"], clean["order_no"] or None, user_id, now().isoformat()))
+    log_visit(cur.lastrowid, user_id, "handover", clean["note"])
+    return cur.lastrowid, None
+
+
+def take_kb(appt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🙋 I'll take it", callback_data=f"vz:tk:{appt_id}")]])
+
+
+def app_kb() -> InlineKeyboardMarkup | None:
+    url = app_url()
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📱 Open My visits", web_app=WebAppInfo(url=url))]]) if url else None
+
+
+async def notify_handover(bot, appt_id: int, skip: int = 0) -> None:
+    """DM every specialist in that country, with I'll take it."""
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] != "WAITING":
+        return
+    sent = []
+    for r in specialists_in(v["country"]):
+        if r["user_id"] == skip:
+            continue
+        try:
+            m = await bot.send_message(r["user_id"], "📋 New On-Site handover\n\n" + handover_text(v, False),
+                                       reply_markup=take_kb(appt_id), disable_web_page_preview=True)
+            sent.append([r["user_id"], m.message_id])
+        except Exception as e:
+            log.info("Couldn't tell %s about handover %s: %s", r["user_id"], appt_id, e)
+    async with write_lock:
+        set_setting(f"handover_msgs:{appt_id}", json.dumps(sent))
+
+
+async def close_handover_msgs(bot, appt_id: int, line: str, keep: int = 0) -> None:
+    """Take the I'll take it button off the specialists' messages."""
+    try:
+        sent = json.loads(setting(f"handover_msgs:{appt_id}", "") or "[]")
+    except ValueError:
+        sent = []
+    if not sent:
+        return
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    for uid, mid in sent:
+        if uid == keep:
+            continue
+        try:
+            await bot.edit_message_text(f"{line}\n\n" + handover_text(v, False), chat_id=uid,
+                                        message_id=mid, disable_web_page_preview=True)
+        except Exception:
+            pass
+    async with write_lock:
+        set_setting(f"handover_msgs:{appt_id}", "")
+
+
+def take_handover(appt_id: int, user_id: int) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] not in OPEN_STATUSES:
+        return False, "That handover is no longer open."
+    if not is_specialist(user_id):
+        return False, "Only On-Site specialists take handovers."
+    me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+    if ((me["country"] if me else "") or "SG") != v["country"]:
+        return False, f"That one is for {COUNTRY_NAMES[v['country']]}."
+    if v["status"] == "ARRANGING":
+        return False, ("You already have it." if v["specialist_id"] == user_id
+                       else f"{display_name_of(v['specialist_id'], 'Someone')} already took it.")
+    cur = run("UPDATE appointments SET status='ARRANGING', specialist_id=? WHERE id=? AND status='WAITING'",
+              (user_id, appt_id))
+    if not cur.rowcount:
+        return False, "Someone just took it."
+    log_visit(appt_id, user_id, "taken")
+    return True, None
+
+
+async def after_take(bot, appt_id: int, user_id: int) -> None:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    await close_handover_msgs(bot, appt_id, f"🙋 Taken by {display_name_of(user_id, 'a specialist')}", keep=user_id)
+    await tell(bot, user_id, "🙋 It's yours. Call the customer, agree a time, then set it in "
+               "the App → My visits.\n\n" + handover_text(v, True), app_kb())
+
+
+def give_back(appt_id: int, user_id: int) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] != "ARRANGING" or v["specialist_id"] != user_id:
+        return False, "Only the specialist who took it can give it back."
+    run("UPDATE appointments SET status='WAITING', specialist_id=NULL WHERE id=?", (appt_id,))
+    log_visit(appt_id, user_id, "given back")
+    return True, None
+
+
+def set_time(appt_id: int, user_id: int, day: str, hhmm: str) -> tuple:
+    """The time agreed with the customer: the handover becomes a booked visit."""
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] != "ARRANGING":
+        return False, "That one isn't waiting for a time."
+    if v["specialist_id"] != user_id and not admin_for(user_id, "ONSITE"):
+        return False, "Only the specialist who took it sets the time."
+    try:
+        start = local_start(v["country"], day, hhmm)
+    except (ValueError, TypeError):
+        return False, "Pick the date and time."
+    if start < now():
+        return False, "That time has already passed."
+    busy = clash(v["specialist_id"], start, start + timedelta(minutes=v["duration_min"]), exclude_id=appt_id)
+    if busy:
+        return False, f"That clashes: {clash_phrase(busy)}."
+    run("UPDATE appointments SET status='SCHEDULED', starts_at=? WHERE id=?", (start.isoformat(), appt_id))
+    log_visit(appt_id, user_id, "booked")
+    return True, None
+
+
+def onsite_fyi_ids() -> list:
+    """Who gets the Booked FYI: admins looking after On-Site (e.g. Zoe), not
+    the owner or Admin for all teams."""
+    return [r["user_id"] for r in q("SELECT user_id FROM agents WHERE role='admin' AND status='active'")
+            if not is_owner(r["user_id"]) and not is_full_admin(r["user_id"])
+            and "ONSITE" in admin_teams(r["user_id"])]
+
+
+async def notify_booked_fyi(bot, appt_id: int) -> None:
+    """One line to On-Site admins, and to whoever handed it over."""
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    start = span_of(v)[0].astimezone(COUNTRY_TZ[v["country"]])
+    text = (f"✅ Booked · {COUNTRY_NAMES[v['country']].split(' ')[0]} {start.strftime('%a %-d %b, %H:%M')}"
+            f" · {VISIT_NAMES.get(v['visit_type'], v['visit_type'])}\n"
+            f"{v['customer_name']} · {display_name_of(v['specialist_id'], '')}")
+    told = set()
+    for uid in onsite_fyi_ids() + ([v["created_by"]] if v["created_by"] else []):
+        if uid and uid != v["specialist_id"] and uid not in told:
+            told.add(uid)
+            await tell(bot, uid, text)
+
+
+async def on_take_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vz:tk:<id> — a specialist takes a handover from their DM."""
+    query = update.callback_query
+    appt_id = int(query.data.split(":")[2])
+    uid = update.effective_user.id
+    async with write_lock:
+        ok, err = take_handover(appt_id, uid)
+    if not ok:
+        await query.answer(err, show_alert=True)
+        try:
+            await query.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        return
+    await query.answer("It's yours")
+    try:
+        await query.edit_message_reply_markup(None)
+    except Exception:
+        pass
+    await after_take(context.bot, appt_id, uid)
+
+
+HANDOVER_NUDGE_TIME = os.environ.get("HANDOVER_NUDGE_TIME", "").strip() or "11:00"
+
+
+async def job_handover_nudge(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """11am on working days: handovers from earlier days nobody has taken, to
+    On-Site admins. Once a day."""
+    from ops import is_working_day
+    today = now().date()
+    if not is_working_day("SG", today) or setting("handover_nudge_done", "") == today.isoformat():
+        return
+    async with write_lock:
+        set_setting("handover_nudge_done", today.isoformat())
+    rows = [v for v in q("SELECT * FROM appointments WHERE status='WAITING' ORDER BY created_at")
+            if datetime.fromisoformat(v["created_at"]).astimezone(TZ).date() < today]
+    if not rows:
+        return
+    lines = [f"⏳ <b>Not taken yet</b> ({len(rows)})"]
+    for v in rows:
+        lines.append(f"{COUNTRY_NAMES[v['country']].split(' ')[0]} {esc(v['customer_name'])} · "
+                     f"{VISIT_NAMES.get(v['visit_type'], v['visit_type'])} · handed over "
+                     f"{datetime.fromisoformat(v['created_at']).astimezone(TZ).strftime('%a %-d %b')}"
+                     f" by {esc(booker_name(v['created_by']) if v['created_by'] else 'SH')}")
+    for uid in onsite_fyi_ids():
+        try:
+            await context.bot.send_message(uid, "\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            log.info("Couldn't nudge %s about handovers: %s", uid, e)
 
 
 # --------------------------------------------------------------------------
@@ -635,6 +882,29 @@ def visit_item(v, role: str) -> dict:
     }
 
 
+def open_item(v, user_id: int, role: str) -> dict:
+    """A handover not booked yet. A specialist sees phone and address only
+    once they've taken it."""
+    mine = v["specialist_id"] == user_id
+    full = role == "booker" or mine
+    item = {
+        "id": v["id"], "status": v["status"].lower(), "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+        "country": v["country"], "customer": v["customer_name"], "postal": v["postal"] or "",
+        "product": v["product"] or "", "issue": v["issue"] or "", "order": v["order_no"] or "",
+        "note": handover_note(v["id"]),
+        "from": booker_name(v["created_by"]) if v["created_by"] else "",
+        "handed": datetime.fromisoformat(v["created_at"]).astimezone(COUNTRY_TZ[v["country"]]).strftime("%a %-d %b, %H:%M"),
+        "specialist": ("You" if mine else display_name_of(v["specialist_id"], "")) if v["specialist_id"] else "",
+        "canTake": role == "specialist" and v["status"] == "WAITING",
+        "canSet": v["status"] == "ARRANGING" and (mine or admin_for(user_id, "ONSITE")),
+        "canGiveBack": v["status"] == "ARRANGING" and mine,
+        "canCancel": role == "booker",
+    }
+    if full:
+        item.update(phone=v["phone"] or "", email=v["email"] or "", address=v["address"], map=map_link(v))
+    return item
+
+
 def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = "",
                    avail: str = "") -> dict:
     role = visit_role(user_id)
@@ -669,30 +939,24 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
              "today": first + timedelta(days=i) == today, "items": []} for i in range(7)]
     by_day = {d["date"]: d for d in days}
     if spec_id:
-        for v in q("SELECT * FROM appointments WHERE specialist_id=? AND status<>'CANCELLED'",
-                   (spec_id,)):
+        for v in q("SELECT * FROM appointments WHERE specialist_id=? AND status NOT IN "
+                   "('CANCELLED','WAITING','ARRANGING')", (spec_id,)):
             key = datetime.fromisoformat(v["starts_at"]).astimezone(tz).date().isoformat()
             if key in by_day:
                 by_day[key]["items"].append(visit_item(v, role))
-        for d in days:
-            d["free"] = free_text(free_windows(spec_id, country, d["date"]))
     for d in days:
         d["items"].sort(key=lambda it: it["start"])
-    availability, a_prev, a_next = [], "", ""
+    # Handovers not booked yet: a specialist sees their country's waiting ones
+    # and the ones they took; bookers see the country they're looking at.
     if role == "specialist":
-        try:
-            a0 = max(date.fromisoformat(avail), today)
-        except (TypeError, ValueError):
-            a0 = today
-        for i in range(AVAIL_DAYS):
-            d = a0 + timedelta(days=i)
-            part = day_part(user_id, country, d.isoformat())
-            availability.append({"date": d.isoformat(), "label": d.strftime("%a %-d %b"),
-                                 "part": part, "text": AVAIL_TEXT[part]})
-        a_prev = max(today, a0 - timedelta(days=AVAIL_DAYS)).isoformat() if a0 > today else ""
-        a_next = (a0 + timedelta(days=AVAIL_DAYS)).isoformat()
+        open_rows = q("SELECT * FROM appointments WHERE country=? AND (status='WAITING' OR "
+                      "(status='ARRANGING' AND specialist_id=?)) ORDER BY created_at", (country, user_id))
+    else:
+        open_rows = q("SELECT * FROM appointments WHERE country=? AND status IN ('WAITING','ARRANGING') "
+                      "ORDER BY created_at", (country,))
     return {
-        "availability": availability, "availPrev": a_prev, "availNext": a_next,
+        "open": [open_item(v, user_id, role) for v in open_rows],
+        "myCountry": country if role == "specialist" else "",
         "role": role, "countries": countries, "country": country, "specId": spec_id,
         "types": [{"key": k, "name": n} for k, n in VISIT_TYPES],
         "weekStart": first.isoformat(), "prev": (first - timedelta(days=7)).isoformat(),
@@ -722,6 +986,8 @@ def tracker_countries(user_id: int) -> list:
 
 
 def tracker_status(v) -> str:
+    if v["status"] in OPEN_STATUSES:
+        return v["status"].lower()
     if v["status"] == "CANCELLED":
         return "cancelled"
     if v["status"] == "ONSITE":
@@ -739,9 +1005,13 @@ def tracker_item(v, user_id: int, all_countries: bool) -> dict:
     hhmm = lambda iso: datetime.fromisoformat(iso).astimezone(tz).strftime("%H:%M") if iso else ""
     mine = v["specialist_id"] == user_id
     steps = []
+    timed = v["status"] not in OPEN_STATUSES and has_time(v["id"])
+    handed = q1("SELECT 1 FROM appointment_log WHERE appt_id=? AND action='handover'", (v["id"],))
     if v["created_by"]:
-        steps.append(f"Booked by {booker_name(v['created_by'])} · "
+        steps.append(f"{'Handed over' if handed else 'Booked'} by {booker_name(v['created_by'])} · "
                      f"{datetime.fromisoformat(v['created_at']).astimezone(tz).strftime('%a %-d %b')}")
+    if handed and v["specialist_id"]:
+        steps.append(f"🙋 Taken by {display_name_of(v['specialist_id'], '')}")
     if v["arrived_at"]:
         steps.append(f"🚗 Arrived {hhmm(v['arrived_at'])}")
     if v["left_at"]:
@@ -761,13 +1031,15 @@ def tracker_item(v, user_id: int, all_countries: bool) -> dict:
         steps.append("Cancelled" + (f": {why}" if why else ""))
     item = {
         "id": v["id"], "country": v["country"], "date": start.date().isoformat(),
-        "start": start.strftime("%H:%M"), "when": start.strftime("%a %-d %b · %H:%M"),
+        "start": start.strftime("%H:%M") if timed else "",
+        "when": start.strftime("%a %-d %b · %H:%M") if timed else "Not booked yet",
         "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
         "status": tracker_status(v),
         "outcome": OUTCOME_NAMES.get(v["outcome"], "")[2:] if v["outcome"] else "",
         "specialist": "You" if mine else display_name_of(v["specialist_id"], "") if v["specialist_id"] else "",
         "since": hhmm(v["arrived_at"]) if v["status"] == "ONSITE" else "", "why": why,
         "steps": steps, "product": v["product"] or "", "issue": v["issue"] or "",
+        "note": handover_note(v["id"]),
         "order": v["order_no"] or "",
     }
     # Everyone sees the customer's name, order and area, to spot double
@@ -797,7 +1069,12 @@ def tracker_payload(user_id: int, week: str = "") -> dict:
     hi = (last + timedelta(days=2)).isoformat() + "T99"
     marks = ",".join("?" * len(countries))
     rows = q(f"SELECT * FROM appointments WHERE country IN ({marks}) AND starts_at >= ? "
-             f"AND starts_at <= ? ORDER BY starts_at", (*countries, lo, hi))
+             f"AND starts_at <= ? AND status NOT IN ('WAITING','ARRANGING') ORDER BY starts_at",
+             (*countries, lo, hi))
+    # Not booked yet: every open handover, whatever the week.
+    open_items = [tracker_item(v, user_id, all_countries) for v in
+                  q(f"SELECT * FROM appointments WHERE country IN ({marks}) AND status IN "
+                    f"('WAITING','ARRANGING') ORDER BY created_at", tuple(countries))]
     items = []
     for v in rows:
         it = tracker_item(v, user_id, all_countries)
@@ -812,9 +1089,10 @@ def tracker_payload(user_id: int, week: str = "") -> dict:
                        "count": sum(1 for it in counted if it["country"] == c)} for c in countries],
         "allCountries": all_countries,
         "total": len(counted),
-        "statuses": {k: sum(1 for it in items if it["status"] == k)
-                     for k in ("booked", "onsite", "done", "followup", "cancelled")},
-        "items": items, "dayLabels": labels,
+        "statuses": {**{k: sum(1 for it in open_items if it["status"] == k) for k in ("waiting", "arranging")},
+                     **{k: sum(1 for it in items if it["status"] == k)
+                        for k in ("booked", "onsite", "done", "followup", "cancelled")}},
+        "items": items, "open": open_items, "dayLabels": labels,
         "weekStart": first.isoformat(), "prev": (first - timedelta(days=7)).isoformat(),
         "next": (first + timedelta(days=7)).isoformat(),
         "weekLabel": f"{first.strftime('%a %-d %b')} – {last.strftime('%a %-d %b')}",

@@ -483,6 +483,10 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_daily(
         job_case_bump, time(kmins // 60, kmins % 60, tzinfo=TZ), name="case-bump",
     )
+    hmins = parse_time_token(HANDOVER_NUDGE_TIME)
+    app.job_queue.run_daily(
+        job_handover_nudge, time(hmins // 60, hmins % 60, tzinfo=TZ), name="handover-nudge",
+    )
     rmins = parse_time_token(os.environ.get("REPORT_TIME", "").strip() or "09:00")
     app.job_queue.run_daily(
         job_case_report, time(rmins // 60, rmins % 60, tzinfo=TZ),
@@ -696,6 +700,7 @@ def main() -> None:
     app.add_handler(CommandHandler("store", cmd_store))
     app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^vz:(fc|fs):\d+:\w+$"))
     app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_take_button, pattern=r"^vz:tk:\d+$"))
     app.add_handler(CommandHandler("visits", cmd_visits))
     app.add_handler(CommandHandler("visitchat", cmd_visitchat))
     # Ops special requests (sr: buttons)
