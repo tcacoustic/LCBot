@@ -781,7 +781,7 @@ def visit_buttons(v, user_id: int) -> InlineKeyboardMarkup:
     rows = []
     mine = v["specialist_id"] == user_id
     if mine and v["status"] == "SCHEDULED":
-        rows.append([InlineKeyboardButton("📍 Arrived", callback_data=f"vz:ar:{v['id']}")])
+        rows.append([InlineKeyboardButton("🚗 Arrived", callback_data=f"vz:ar:{v['id']}")])
     if mine and v["status"] == "ONSITE":
         rows.append([InlineKeyboardButton("📝 Open the visit form", url=VISIT_FORM_URL)])
         rows.append([InlineKeyboardButton("🏁 Leave", callback_data=f"vz:lv:{v['id']}")])
