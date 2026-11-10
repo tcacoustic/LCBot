@@ -4722,11 +4722,17 @@ function trackerVisit(it) {
   h += '<div class="tk-sec"><h2>Appointment</h2><div class="tk-kv">' + a + '</div></div>';
   if (it.customer !== undefined) {
     let c = '<b>Name</b><span>' + esc(it.customer) + '</span>';
-    if (it.phone) c += '<b>Phone</b><span><a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a></span>';
-    if (it.email) c += '<b>Email</b><span>' + esc(it.email) + '</span>';
-    c += '<b>Address</b><span>' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '</span>';
-    h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
-       + '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div></div>';
+    if (it.address === undefined) {
+      if (it.postal) c += '<b>Area</b><span>' + esc(it.postal) + '</span>';
+      h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
+         + '<div class="note" style="margin-top:8px">Phone and address are with whoever booked it and the specialist doing it.</div></div>';
+    } else {
+      if (it.phone) c += '<b>Phone</b><span><a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a></span>';
+      if (it.email) c += '<b>Email</b><span>' + esc(it.email) + '</span>';
+      c += '<b>Address</b><span>' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '</span>';
+      h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
+         + '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div></div>';
+    }
   }
   return h;
 }

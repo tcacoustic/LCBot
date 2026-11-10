@@ -708,13 +708,17 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
 # --------------------------------------------------------------------------
 
 def tracker_countries(user_id: int) -> list:
-    """Admins and SH see every country; a specialist sees their own."""
+    """Admins and SH see every country; a specialist sees their own, and FS
+    their store's country."""
     if admin_for(user_id, "SH", "FS", "ONSITE") or "SH" in depts_of(user_id):
         return [c for c, _, _, _ in COUNTRIES]
+    me = q1("SELECT country, store FROM agents WHERE user_id=?", (user_id,))
+    mine = set()
     if is_specialist(user_id):
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
-        return [(me["country"] if me else "") or "SG"]
-    return []
+        mine.add((me["country"] if me else "") or "SG")
+    if "FS" in depts_of(user_id):
+        mine.add(FS_STORE_COUNTRY.get((me["store"] if me else "") or "", "") or "SG")
+    return [c for c, _, _, _ in COUNTRIES if c in mine]
 
 
 def tracker_status(v) -> str:
@@ -766,11 +770,13 @@ def tracker_item(v, user_id: int, all_countries: bool) -> dict:
         "steps": steps, "product": v["product"] or "", "issue": v["issue"] or "",
         "order": v["order_no"] or "",
     }
-    # Customer details: everyone who sees all countries, and a specialist on
-    # their own visits only (not colleagues').
-    if all_countries or mine:
-        item.update(customer=v["customer_name"], phone=v["phone"] or "", email=v["email"] or "",
-                    address=v["address"], postal=v["postal"] or "", map=map_link(v))
+    # Everyone sees the customer's name, order and area, to spot double
+    # bookings. Phone, email and address only for admins and SH (all
+    # countries), whoever booked it, and the specialist doing it.
+    item.update(customer=v["customer_name"], postal=v["postal"] or "")
+    if all_countries or mine or v["created_by"] == user_id:
+        item.update(phone=v["phone"] or "", email=v["email"] or "",
+                    address=v["address"], map=map_link(v))
     return item
 
 
