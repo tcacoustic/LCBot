@@ -404,7 +404,10 @@ def reminder_due(v, at: datetime) -> tuple:
     start = span_of(v)[0]
     confirm = datetime.combine(start.date() - timedelta(days=CONFIRM_DAYS),
                                time(CONFIRM_HOUR), tzinfo=start.tzinfo)
-    booked = datetime.fromisoformat(v["created_at"])
+    # When it got its time: a handover is created first and booked later.
+    row = q1("SELECT created_at FROM appointment_log WHERE appt_id=? AND action='booked' "
+             "ORDER BY id DESC LIMIT 1", (v["id"],))
+    booked = datetime.fromisoformat(row["created_at"] if row else v["created_at"])
     out = []
     if booked < confirm <= at < start - timedelta(hours=12):
         out.append(("confirm", confirm))
