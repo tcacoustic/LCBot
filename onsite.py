@@ -699,6 +699,119 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
         "next": (first + timedelta(days=7)).isoformat(),
         "weekLabel": f"{first.strftime('%-d %b')} – {(first + timedelta(days=6)).strftime('%-d %b')}",
         "today": today.isoformat(), "days": days,
+        "canTrack": bool(tracker_countries(user_id)),
+    }
+
+
+# --------------------------------------------------------------------------
+# The tracker: a week of visits across countries, with counts
+# --------------------------------------------------------------------------
+
+def tracker_countries(user_id: int) -> list:
+    """Admins and SH see every country; a specialist sees their own."""
+    if admin_for(user_id, "SH", "FS", "ONSITE") or "SH" in depts_of(user_id):
+        return [c for c, _, _, _ in COUNTRIES]
+    if is_specialist(user_id):
+        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        return [(me["country"] if me else "") or "SG"]
+    return []
+
+
+def tracker_status(v) -> str:
+    if v["status"] == "CANCELLED":
+        return "cancelled"
+    if v["status"] == "ONSITE":
+        return "onsite"
+    if v["status"] == "COMPLETED":
+        if v["outcome"] in ("RETURN", "REPLACE") and not v["followup_done"]:
+            return "followup"
+        return "done"
+    return "booked"
+
+
+def tracker_item(v, user_id: int, all_countries: bool) -> dict:
+    tz = COUNTRY_TZ[v["country"]]
+    start = span_of(v)[0].astimezone(tz)
+    hhmm = lambda iso: datetime.fromisoformat(iso).astimezone(tz).strftime("%H:%M") if iso else ""
+    mine = v["specialist_id"] == user_id
+    steps = []
+    if v["created_by"]:
+        steps.append(f"Booked by {booker_name(v['created_by'])} · "
+                     f"{datetime.fromisoformat(v['created_at']).astimezone(tz).strftime('%a %-d %b')}")
+    if v["arrived_at"]:
+        steps.append(f"🚗 Arrived {hhmm(v['arrived_at'])}")
+    if v["left_at"]:
+        steps.append(f"🏁 Left {hhmm(v['left_at'])} · {mins_text(visit_minutes(v))}")
+    if v["status"] == "COMPLETED":
+        if v["outcome"] == "RESOLVED":
+            steps.append(f"Paid {money_text(v['amount_cents'], v['currency'])} · "
+                         f"{dict(PAY_METHODS).get(v['pay_method'], v['pay_method'] or '')}"
+                         if v["amount_cents"] else "No charge")
+        elif v["followup_done"]:
+            steps.append("Follow-up done")
+    why = ""
+    if v["status"] == "CANCELLED":
+        row = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='cancelled' "
+                 "ORDER BY id DESC LIMIT 1", (v["id"],))
+        why = (row["note"] if row else "") or ""
+        steps.append("Cancelled" + (f": {why}" if why else ""))
+    item = {
+        "id": v["id"], "country": v["country"], "date": start.date().isoformat(),
+        "start": start.strftime("%H:%M"), "when": start.strftime("%a %-d %b · %H:%M"),
+        "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+        "status": tracker_status(v),
+        "outcome": OUTCOME_NAMES.get(v["outcome"], "")[2:] if v["outcome"] else "",
+        "specialist": "You" if mine else display_name_of(v["specialist_id"], "") if v["specialist_id"] else "",
+        "since": hhmm(v["arrived_at"]) if v["status"] == "ONSITE" else "", "why": why,
+        "steps": steps, "product": v["product"] or "", "issue": v["issue"] or "",
+        "order": v["order_no"] or "",
+    }
+    # Customer details: everyone who sees all countries, and a specialist on
+    # their own visits only (not colleagues').
+    if all_countries or mine:
+        item.update(customer=v["customer_name"], phone=v["phone"] or "", email=v["email"] or "",
+                    address=v["address"], postal=v["postal"] or "", map=map_link(v))
+    return item
+
+
+def tracker_payload(user_id: int, week: str = "") -> dict:
+    countries = tracker_countries(user_id)
+    if not countries:
+        return {"countries": [], "items": [], "days": []}
+    all_countries = len(countries) == len(COUNTRIES)
+    today = datetime.now(COUNTRY_TZ[countries[0]] if not all_countries else TZ).date()
+    try:
+        first = date.fromisoformat(week)
+    except (TypeError, ValueError):
+        first = today
+    first = first - timedelta(days=first.weekday())
+    last = first + timedelta(days=6)
+    # A loose window on the stored time, then each visit by its own country's date.
+    lo = (first - timedelta(days=2)).isoformat()
+    hi = (last + timedelta(days=2)).isoformat() + "T99"
+    marks = ",".join("?" * len(countries))
+    rows = q(f"SELECT * FROM appointments WHERE country IN ({marks}) AND starts_at >= ? "
+             f"AND starts_at <= ? ORDER BY starts_at", (*countries, lo, hi))
+    items = []
+    for v in rows:
+        it = tracker_item(v, user_id, all_countries)
+        if first.isoformat() <= it["date"] <= last.isoformat():
+            items.append(it)
+    items.sort(key=lambda it: (it["date"], it["start"]))
+    counted = [it for it in items if it["status"] != "cancelled"]
+    labels = {(first + timedelta(days=i)).isoformat(): (first + timedelta(days=i)).strftime("%a %-d %b")
+              for i in range(7)}
+    return {
+        "countries": [{"code": c, "name": COUNTRY_NAMES[c],
+                       "count": sum(1 for it in counted if it["country"] == c)} for c in countries],
+        "allCountries": all_countries,
+        "total": len(counted),
+        "statuses": {k: sum(1 for it in items if it["status"] == k)
+                     for k in ("booked", "onsite", "done", "followup", "cancelled")},
+        "items": items, "dayLabels": labels,
+        "weekStart": first.isoformat(), "prev": (first - timedelta(days=7)).isoformat(),
+        "next": (first + timedelta(days=7)).isoformat(),
+        "weekLabel": f"{first.strftime('%a %-d %b')} – {last.strftime('%a %-d %b')}",
     }
 
 

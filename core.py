@@ -3462,6 +3462,31 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .tag.red { background:var(--red); } .tag.amber { background:var(--amber); }
   .tag.green { background:var(--green); } .tag.blue { background:var(--blue); }
   .tag.orange { background:var(--accent); }
+  /* On-Site tracker */
+  .tk-total { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px 14px; margin:8px 0; }
+  .tk-total .k { font-size:11px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); }
+  .tk-total .v { font-size:30px; font-weight:800; line-height:1.1; font-variant-numeric:tabular-nums; }
+  .tk-ctry { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin-bottom:8px; }
+  .tk-ctry button { background:var(--card); border:2px solid var(--line); border-radius:8px; padding:8px 4px; cursor:pointer;
+    font:inherit; color:var(--ink); }
+  .tk-ctry button.on { border-color:var(--ink); background:var(--ink); color:#fff; }
+  .tk-ctry b { display:block; font-size:20px; font-variant-numeric:tabular-nums; }
+  .tk-ctry span { font-size:12px; font-weight:700; }
+  .tk-st { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px; }
+  .tk-st button { font:inherit; font-size:12px; font-weight:800; border:2px solid transparent; border-radius:999px;
+    padding:4px 10px; color:#fff; cursor:pointer; }
+  .tk-st button.dim { opacity:.35; }
+  .tk-st .booked { background:var(--blue); } .tk-st .onsite { background:var(--accent); }
+  .tk-st .done { background:var(--green); } .tk-st .followup { background:var(--amber); }
+  .tk-st .cancelled { background:#6B7280; }
+  .tag.grey { background:#6B7280; }
+  .tk-v { cursor:pointer; }
+  .tk-v .nm { display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }
+  .tk-sec { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:12px 14px; margin-bottom:10px; }
+  .tk-sec h2 { margin:0 0 8px; font-size:12px; color:var(--muted); }
+  .tk-kv { display:grid; grid-template-columns:96px 1fr; gap:4px 10px; font-size:14px; }
+  .tk-kv b { font-size:13px; color:var(--muted); font-weight:700; }
+  .tk-steps div { font-size:14px; padding:2px 0; }
   /* Online has finished with it: SH can close it. */
   .ondone { border-color:var(--accent) !important; }
   .ondone-why { font-size:13px; font-weight:700; color:var(--accent); margin-top:4px; }
@@ -3729,7 +3754,7 @@ let ONLINE = false, ON_GROUP = '', ON_REGION = '', ON_EDIT = {};
 // On-Site visits: SH and FS book, the specialist sees their week.
 let TABS = null;
 let CS_Q = '';   // what the case search box holds; '' = the normal lists
-let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '' };
+let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '', mode: 'sched', tw: '', tc: '', ts: '', tv: null };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 const ICONS = {
@@ -4674,6 +4699,79 @@ function keepBookForm() {
   }
 }
 
+const TK_STATUS = { booked: ['blue', 'Booked'], onsite: ['orange', 'On site now'], done: ['green', 'Done'],
+  followup: ['amber', 'Follow-up'], cancelled: ['grey', 'Cancelled'] };
+
+function trackerSwitch() {
+  return '<div class="otabs"><button data-vmode="sched" class="' + (VS.mode === 'sched' ? 'on' : '') + '">Schedule</button>'
+       + '<button data-vmode="track" class="' + (VS.mode === 'track' ? 'on' : '') + '">Tracker</button></div>';
+}
+
+function trackerVisit(it) {
+  const st = TK_STATUS[it.status];
+  let h = '<div class="back" data-tkback="1">‹ Tracker</div>';
+  h += '<h1>' + esc(it.type) + '</h1><div class="sub">' + (REGION_FLAGS[it.country] || '') + ' ' + esc(it.when) + '</div>';
+  h += '<div class="tk-sec"><h2>Status</h2><div class="tags"><span class="tag ' + st[0] + '">' + esc(st[1].toUpperCase()) + '</span>'
+     + (it.outcome ? '<span style="font-size:13px;font-weight:700">' + esc(it.outcome) + '</span>' : '') + '</div>'
+     + '<div class="tk-steps">' + it.steps.map(x => '<div>' + esc(x) + '</div>').join('') + '</div></div>';
+  let a = '<b>Type</b><span>' + esc(it.type) + '</span>';
+  if (it.specialist) a += '<b>Specialist</b><span>' + esc(it.specialist) + '</span>';
+  if (it.product) a += '<b>Product</b><span>' + esc(it.product) + '</span>';
+  if (it.issue) a += '<b>Issue</b><span>' + esc(it.issue) + '</span>';
+  if (it.order) a += '<b>Order</b><span>' + esc(it.order) + '</span>';
+  h += '<div class="tk-sec"><h2>Appointment</h2><div class="tk-kv">' + a + '</div></div>';
+  if (it.customer !== undefined) {
+    let c = '<b>Name</b><span>' + esc(it.customer) + '</span>';
+    if (it.phone) c += '<b>Phone</b><span><a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a></span>';
+    if (it.email) c += '<b>Email</b><span>' + esc(it.email) + '</span>';
+    c += '<b>Address</b><span>' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '</span>';
+    h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
+       + '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div></div>';
+  }
+  return h;
+}
+
+async function loadTracker(d) {
+  const app = document.getElementById('app');
+  const t = await getJSON('/api/visits/tracker?' + new URLSearchParams({ week: VS.tw }).toString());
+  VS.tw = t.weekStart;
+  const open = VS.tv ? t.items.find(x => x.id === VS.tv) : null;
+  if (open) { app.innerHTML = trackerVisit(open) + navBar(); wireVisits(d); return; }
+  VS.tv = null;
+  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch();
+  h += '<div class="otabs small"><button data-tw="' + t.prev + '">◀ Prev</button>'
+     + '<button class="on">' + esc(t.weekLabel) + '</button>'
+     + '<button data-tw="' + t.next + '">Next ▶</button></div>';
+  const one = !t.allCountries && t.countries.length === 1;
+  h += '<div class="tk-total"><div class="k">' + (one ? (REGION_FLAGS[t.countries[0].code] || '') + ' ' : '')
+     + 'Visits this week</div><div class="v">' + t.total + '</div></div>';
+  if (!one) {
+    h += '<div class="tk-ctry">' + t.countries.map(c =>
+        '<button data-tc="' + c.code + '" class="' + (VS.tc === c.code ? 'on' : '') + '"><b>' + c.count + '</b><span>'
+        + (REGION_FLAGS[c.code] || '') + ' ' + esc(c.code) + '</span></button>').join('') + '</div>';
+  }
+  h += '<div class="tk-st">' + Object.keys(TK_STATUS).filter(k => t.statuses[k]).map(k =>
+      '<button data-ts="' + k + '" class="' + k + (VS.ts && VS.ts !== k ? ' dim' : '') + '">'
+      + t.statuses[k] + ' ' + esc(TK_STATUS[k][1].toLowerCase()) + '</button>').join('') + '</div>';
+  if (VS.tc || VS.ts) h += '<div class="search-clear" data-tclear="1">Show all</div>';
+  const shown = t.items.filter(it => (!VS.tc || it.country === VS.tc) && (!VS.ts || it.status === VS.ts));
+  if (!shown.length) h += '<div class="empty">No visits' + (VS.tc || VS.ts ? ' match' : ' this week') + '.</div>';
+  let day = '';
+  for (const it of shown) {
+    if (it.date !== day) { day = it.date; h += '<h2>' + esc(t.dayLabels[day] || day) + '</h2>'; }
+    const st = TK_STATUS[it.status];
+    const who = it.status === 'onsite' && it.since ? (it.specialist || '') + ' · since ' + it.since
+      : it.status === 'cancelled' && it.why ? (it.specialist || '') + ' · ' + it.why
+      : [it.specialist, it.customer].filter(Boolean).join(' · ');
+    h += '<div class="case tk-v' + (it.status === 'cancelled' ? ' gone' : '') + '" data-tv="' + it.id + '">'
+       + '<div class="nm"><span>' + (REGION_FLAGS[it.country] || '') + ' ' + esc(it.start) + ' · ' + esc(it.type) + '</span>'
+       + '<span class="tag ' + st[0] + '">' + esc(st[1].toUpperCase()) + '</span></div>'
+       + '<div class="meta">' + esc(who) + ' ›</div></div>';
+  }
+  app.innerHTML = h + navBar();
+  wireVisits(d);
+}
+
 async function loadVisits() {
   const app = document.getElementById('app');
   const qs = new URLSearchParams({ week: VS.week, country: VS.country, spec: VS.spec, avail: VS.avail });
@@ -4685,7 +4783,10 @@ async function loadVisits() {
     wireVisits(d);
     return;
   }
+  if (!d.canTrack) VS.mode = 'sched';
+  if (VS.mode === 'track') return loadTracker(d);
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
+  if (d.canTrack) h += trackerSwitch();
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
         '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + (REGION_FLAGS[c.code] || '') + ' ' + esc(c.code) + '</button>').join('') + '</div>';
@@ -4732,6 +4833,13 @@ function wireVisits(d) {
   wire();
   wireRequestButton();
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
+  on('[data-vmode]', el => { VS.mode = el.dataset.vmode; VS.tv = null; loadVisits(); });
+  on('[data-tw]', el => { VS.tw = el.dataset.tw; loadVisits(); });
+  on('[data-tc]', el => { VS.tc = VS.tc === el.dataset.tc ? '' : el.dataset.tc; loadVisits(); });
+  on('[data-ts]', el => { VS.ts = VS.ts === el.dataset.ts ? '' : el.dataset.ts; loadVisits(); });
+  on('[data-tclear]', () => { VS.tc = ''; VS.ts = ''; loadVisits(); });
+  on('[data-tv]', el => { VS.tv = Number(el.dataset.tv); loadVisits(); window.scrollTo(0, 0); });
+  on('[data-tkback]', () => { VS.tv = null; loadVisits(); });
   on('[data-vc]', el => { VS.country = el.dataset.vc; VS.spec = ''; loadVisits(); });
   on('[data-vsp]', el => { VS.spec = el.dataset.vsp; loadVisits(); });
   on('[data-vw]', el => { VS.week = el.dataset.vw; loadVisits(); });
