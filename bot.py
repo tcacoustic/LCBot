@@ -752,7 +752,8 @@ def main() -> None:
     app.add_handler(
         ConversationHandler(
             entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:\d+$"),
-                          CallbackQueryHandler(on_rq_reason_start, pattern=r"^oq:r:\d+$")],
+                          CallbackQueryHandler(on_rq_reason_start, pattern=r"^oq:r:\d+$"),
+                          CallbackQueryHandler(on_cab_trip, pattern=r"^cb:p:\d+:[A-Z]+$")],
             states={ONS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ons_text)]},
             fallbacks=[CommandHandler("cancel", cancel)],
             allow_reentry=True,
@@ -764,6 +765,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_rq_button, pattern=r"^oq:[td]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_paynow_button, pattern=r"^vq:[pb]:\d+$"))
     app.add_handler(CommandHandler("requestchat", cmd_requestchat))
+    app.add_handler(CallbackQueryHandler(on_cab_form, pattern=r"^cb:n:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_cab_decision, pattern=r"^cb:[arbx]:\d+(:[A-Z]+)?$"))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))

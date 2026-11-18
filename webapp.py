@@ -771,7 +771,7 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
 VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
                "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime",
                "/api/visit/arrive", "/api/visit/check", "/api/visit/leave", "/api/visit/one",
-               "/api/visit/request", "/api/visit/paynow", "/api/visit/reviewqr"}
+               "/api/visit/request", "/api/visit/paynow", "/api/visit/reviewqr", "/api/visit/cab"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -865,6 +865,9 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         qr = paynow_qr(v, cents)
         return {"ok": True, "sample": qr["sample"], "img": data_uri(qr["png"]), "ref": qr["ref"],
                 "amount": money_text(cents, CURRENCY.get(v["country"], "SGD"))}
+    if path == "/api/visit/cab":
+        return on_bot_loop(cab_from_app(user_id, num("id"), str(b.get("trip") or ""), str(b.get("amount") or "")),
+                           timeout=10) or {"ok": False, "error": "Couldn't send that just now."}
     if path == "/api/visit/reviewqr":
         if not REVIEW_URL:
             return {"ok": False, "error": "No review link is set up yet."}

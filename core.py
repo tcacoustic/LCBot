@@ -587,6 +587,21 @@ db.execute("""CREATE TABLE IF NOT EXISTS onsite_requests (
     chat_id     INTEGER,
     msg_id      INTEGER
 )""")
+# On-Site cab claims: a ride to or from a visit, with a receipt photo.
+db.execute("""CREATE TABLE IF NOT EXISTS cab_claims (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    appt_id      INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    trip         TEXT NOT NULL,      -- TO, FROM, BOTH
+    amount_cents INTEGER NOT NULL,
+    currency     TEXT NOT NULL,
+    receipt      TEXT,               -- Telegram file_id of the receipt photo
+    status       TEXT NOT NULL DEFAULT 'RECEIPT',   -- RECEIPT, PENDING, APPROVED, REJECTED
+    reason       TEXT,
+    decided_by   INTEGER,
+    decided_at   TEXT,
+    created_at   TEXT NOT NULL
+)""")
 # Follow-up visits: the visit it follows on from, and how urgent it is.
 _ap_cols = {r[1] for r in db.execute("PRAGMA table_info(appointments)")}
 for _col in ("urgency TEXT", "followup_of INTEGER"):
@@ -4812,10 +4827,15 @@ function todayView(d) {
 }
 
 const RQ_TAG = { OPEN: ['amber', 'WAITING'], TAKEN: ['blue', 'BEING HANDLED'], DONE: ['green', 'DONE'] };
+const CAB_TAG = { RECEIPT: 'amber', PENDING: 'amber', APPROVED: 'green', REJECTED: 'red' };
 function requestsList(d) {
-  const rs = d.myRequests || [];
-  if (!rs.length) return '';
-  return '<h2>Your requests</h2>' + rs.map(r => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+  const rs = d.myRequests || [], cs = d.myClaims || [];
+  let h = '';
+  if (cs.length) h += '<h2>Your cab claims</h2>' + cs.map(c => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+    + esc(c.amount) + ' · #' + c.visit + '</span><span class="tag ' + CAB_TAG[c.status] + '">' + esc(c.statusName.toUpperCase()) + '</span></div>'
+    + '<div class="meta">' + esc(c.when) + ' · ' + esc(c.trip) + (c.reason ? ' · ' + esc(c.reason) : '') + '</div></div>').join('');
+  if (!rs.length) return h;
+  return h + '<h2>Your requests</h2>' + rs.map(r => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
     + esc(r.need) + ' · #' + r.visit + '</span><span class="tag ' + RQ_TAG[r.status][0] + '">' + RQ_TAG[r.status][1] + '</span></div>'
     + '<div class="meta">' + esc(r.when) + (r.who ? ' · ' + esc(r.who) : '') + ' · ' + esc(r.reason) + '</div>'
     + (r.note ? '<div class="body">📝 ' + esc(r.note) + '</div>' : '') + '</div>').join('');
@@ -4872,6 +4892,7 @@ function visitScreen(v) {
   if (v.status === 'COMPLETED' && v.report) h += '<div class="case"><div class="body">' + esc(v.report) + '</div></div>';
   if (v.status === 'COMPLETED' && v.reviewQr) h += '<button class="big ghost" data-rvqr="' + v.id + '">⭐ Show review QR</button><div id="rvbox"></div>';
   if (v.canRequest) h += VS.rq ? rqForm(v) : '<button class="big ghost" data-rqopen="1">📦 Replacement / payment request</button>';
+  if (v.canClaim) h += VS.cab ? cabForm(v) : '<button class="big ghost" data-cabopen="1">🚕 Cab claim</button>';
   return h;
 }
 
@@ -4887,6 +4908,15 @@ function rqForm(v) {
   h += '<div class="fld"><label>Customer pays by</label><div class="pick">' + pick('pays_by', 'LINK', 'Payment link') + pick('pays_by', 'PAYNOW', 'PayNow') + pick('pays_by', 'NONE', 'No charge') + '</div></div>';
   h += '<button class="big" id="rqSend">Send to SH x Ops</button><button class="big ghost" id="rqBack2">Back</button>';
   return h;
+}
+
+function cabForm(v) {
+  const f = VS.cab;
+  const pick = (val, name) => '<button data-cabt="' + val + '" class="' + (f.trip === val ? 'on' : '') + '">' + name + '</button>';
+  return '<h2>Cab claim</h2><div class="fld"><label>Trip</label><div class="pick">' + pick('TO', 'To the visit') + pick('FROM', 'From the visit') + pick('BOTH', 'Both ways') + '</div></div>'
+    + '<div class="fld"><label>Fare (' + esc(v.currency || 'SGD') + ')</label><input id="cab_amount" inputmode="decimal" placeholder="18.40" value="' + esc(f.amount || '') + '"></div>'
+    + '<div class="note">Next, send a photo of the receipt to SH Bot in your chat. It goes for approval once the photo is in.</div>'
+    + '<button class="big" id="cabSend">Send claim</button><button class="big ghost" id="cabBack">Back</button>';
 }
 
 function keepRq() {
@@ -4936,7 +4966,7 @@ async function loadVisitScreen(d) {
   app.innerHTML = visitScreen(v) + navBar();
   wireVisits(d);
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
-  on('[data-vvback]', () => { VS.vv = null; VS.lv = null; VS.rq = null; loadVisits(); });
+  on('[data-vvback]', () => { VS.vv = null; VS.lv = null; VS.rq = null; VS.cab = null; loadVisits(); });
   on('[data-arrive]', async el => {
     el.disabled = true;
     const r = await post('/api/visit/arrive', { id: v.id });
@@ -4963,6 +4993,20 @@ async function loadVisitScreen(d) {
     document.getElementById('rvbox').innerHTML = qrImg(r.img, false, 'Scan to leave us a review');
   });
   on('[data-rqopen]', () => { VS.rq = {}; loadVisits(); });
+  on('[data-cabopen]', () => { VS.cab = {}; loadVisits(); });
+  on('[data-cabt]', el => { const a = document.getElementById('cab_amount'); if (a) VS.cab.amount = a.value; VS.cab.trip = el.dataset.cabt; loadVisits(); });
+  const cb = document.getElementById('cabBack');
+  if (cb) cb.onclick = () => { VS.cab = null; loadVisits(); };
+  const cs = document.getElementById('cabSend');
+  if (cs) cs.onclick = async () => {
+    VS.cab.amount = document.getElementById('cab_amount').value;
+    if (!VS.cab.trip || !VS.cab.amount) { toast('Pick the trip and type the fare.'); return; }
+    cs.disabled = true;
+    const r = await post('/api/visit/cab', { id: v.id, trip: VS.cab.trip, amount: VS.cab.amount });
+    cs.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
+    VS.cab = null; toast('Now send the receipt photo to SH Bot in your chat.'); loadVisits();
+  };
   on('[data-rqf]', el => { keepRq(); VS.rq[el.dataset.rqf] = el.dataset.v; loadVisits(); });
   const rb = document.getElementById('rqBack2');
   if (rb) rb.onclick = () => { VS.rq = null; loadVisits(); };
