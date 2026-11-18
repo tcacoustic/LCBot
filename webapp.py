@@ -769,7 +769,8 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
 
 
 VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
-               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime"}
+               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime",
+               "/api/visit/arrive", "/api/visit/check", "/api/visit/leave", "/api/visit/one"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -821,6 +822,26 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         if v and v["followup_of"]:
             on_bot_loop(pin_next_visit(bot_ref(), num("id")))
         return {"ok": True}
+    if path == "/api/visit/one":
+        v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))
+        if not v or v["specialist_id"] != user_id:
+            return {"ok": False, "error": "That's not your visit."}
+        return {"ok": True, "visit": visit_screen(v, user_id)}
+    if path == "/api/visit/arrive":
+        async def _arrive():
+            async with write_lock:
+                return arrive(num("id"), user_id)
+        ok, err = on_bot_loop(_arrive(), timeout=10) or (False, "Couldn't save that just now.")
+        return {"ok": ok, "error": err} if not ok else {"ok": True}
+    if path == "/api/visit/check":
+        async def _tick():
+            async with write_lock:
+                return set_tick(num("id"), user_id, num("i"), bool(b.get("on")))
+        ok, err = on_bot_loop(_tick(), timeout=10) or (False, "Couldn't save that just now.")
+        return {"ok": ok, "error": err} if not ok else {"ok": True}
+    if path == "/api/visit/leave":
+        return on_bot_loop(leave_from_app(num("id"), user_id, b), timeout=20) or \
+            {"ok": False, "error": "Couldn't save that just now. Try again."}
     if path == "/api/visit/reschedule":
         if role != "booker":
             return {"ok": False, "error": "Only SH, FS and admins move visits."}

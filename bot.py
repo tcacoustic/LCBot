@@ -839,6 +839,8 @@ def main() -> None:
         )
     )
     app.add_handler(CommandHandler("reviews", cmd_reviews))
+    # Last: a photo sent to the bot goes with the visit the specialist is on.
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_visit_photo))
 
     log.info("Avails bot running.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -3652,6 +3652,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:15px; font-weight:800; cursor:pointer; }
   .case .tick.on { background:var(--ink); border-color:var(--ink); color:#fff; }
   .case .nm { font-weight:800; font-size:16px; }
+  .btnlink { display:inline-block; padding:10px 14px; border:2px solid var(--ink); border-radius:8px; font-weight:700; color:var(--ink); text-decoration:none; background:var(--card); }
   .case.fu { border-color:var(--red); box-shadow:inset 6px 0 0 var(--red); padding-left:18px; }
   .case .meta { font-size:12px; color:var(--muted); margin-top:2px; }
   .case .body { font-size:14px; white-space:pre-wrap; margin-top:10px; padding-top:10px;
@@ -3989,7 +3990,7 @@ function renderTeamHome(d) {
     h += '<div class="p tappable" data-gotovis="1" style="margin-top:14px"><div class="pn">'
        + plural(d.waiting, 'handover') + ' waiting' + (d.arranging ? ' · ' + d.arranging + ' you’re arranging' : '')
        + '</div><div class="t">Take one in My visits</div></div>';
-    h += '<div class="note">At the visit, send /visits to the bot to tap 🚗 Arrived and 🏁 Leave.</div>';
+    h += '<div class="note">At the visit, open it in My visits to tap 🚗 Arrived and 🏁 Leave (or send /visits).</div>';
   } else if (d.teamHome === 'ON') {
     h += hero('Open on your channels', plural(d.open, 'case'),
               d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
@@ -4674,6 +4675,7 @@ function visitCard(it, d) {
   } else {
     h += '<div class="more" data-vshow="' + it.id + '">Details</div>';
   }
+  if (d.role === 'specialist') h += '<div class="more" data-vv="' + it.id + '">Open the visit ›</div>';
   return h + '</div>';
 }
 
@@ -4756,9 +4758,152 @@ function openCard(it) {
 const TK_STATUS = { waiting: ['purple', 'Waiting'], arranging: ['teal', 'Arranging'], booked: ['blue', 'Booked'], onsite: ['orange', 'On site now'], done: ['green', 'Done'],
   followup: ['amber', 'Follow-up'], cancelled: ['grey', 'Cancelled'] };
 
-function trackerSwitch() {
-  return '<div class="otabs"><button data-vmode="sched" class="' + (VS.mode === 'sched' ? 'on' : '') + '">Schedule</button>'
-       + '<button data-vmode="track" class="' + (VS.mode === 'track' ? 'on' : '') + '">Tracker</button></div>';
+function trackerSwitch(d) {
+  const b = (k, n) => '<button data-vmode="' + k + '" class="' + (VS.mode === k ? 'on' : '') + '">' + n + '</button>';
+  return '<div class="otabs">' + (d && d.role === 'specialist' ? b('today', 'Today') : '') + b('sched', 'Schedule')
+       + (!d || d.canTrack ? b('track', 'Tracker') : '') + '</div>';
+}
+
+// The specialist's Today: the next visit with Directions and Call, then the day.
+function todayView(d) {
+  const t = d.myDay || { items: [] };
+  let h = '<h1>Today</h1><div class="sub">' + esc(t.label || '') + '</div>' + trackerSwitch(d);
+  if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
+  const n = t.next;
+  if (n) {
+    h += '<h2>' + (n.status === 'ONSITE' ? 'On site now' : 'Next visit') + '</h2>';
+    h += '<div class="case' + (n.followup ? ' fu' : '') + '" style="border-color:var(--accent);box-shadow:inset 6px 0 0 var(--accent);padding-left:18px">'
+       + '<div class="nm">' + esc(n.when) + ' · ' + esc(n.type) + '</div>'
+       + '<div class="meta">' + (REGION_FLAGS[n.country] || '') + ' ' + esc(n.customer) + (n.postal ? ' · ' + esc(n.postal) : '') + '</div>'
+       + (n.product ? '<div class="meta">' + esc(n.product) + '</div>' : '')
+       + '<div class="acts"><button data-map="' + esc(n.map) + '">Directions</button>'
+       + (n.phone ? '<a class="btnlink" href="tel:' + esc(n.phone) + '">Call</a>' : '')
+       + '<button class="soft" data-vv="' + n.id + '">Open</button></div></div>';
+  } else {
+    h += '<div class="empty">No visits coming up.</div>';
+  }
+  h += '<h2>' + esc(t.label || 'Today') + '</h2>';
+  if (!t.items.length) h += '<div class="empty">Nothing booked today.</div>';
+  for (const it of t.items) {
+    const st = it.status === 'COMPLETED' ? 'done' : it.status === 'ONSITE' ? 'on site' : '';
+    h += '<div class="case tk-v' + (it.status === 'COMPLETED' ? ' gone' : '') + (it.followup && it.status !== 'COMPLETED' ? ' fu' : '') + '" data-vv="' + it.id + '">'
+       + '<div class="nm"><span>' + esc(it.start) + ' · ' + esc(it.customer) + '</span>'
+       + (st ? '<span class="tag ' + (st === 'done' ? 'green' : 'orange') + '">' + st.toUpperCase() + '</span>' : '') + '</div>'
+       + '<div class="meta">' + esc(it.type) + (it.postal ? ' · ' + esc(it.postal) : '') + ' ›</div></div>';
+  }
+  return h;
+}
+
+// One visit: Arrived, the checklist, photos and Leave.
+function visitScreen(v) {
+  let h = '<div class="back" data-vvback="1">‹ ' + (VS.mode === 'today' ? 'Today' : 'Visits') + '</div>';
+  h += '<h1>' + esc(v.customer) + '</h1><div class="sub">' + (REGION_FLAGS[v.country] || '') + ' ' + esc(v.when) + ' · ' + esc(v.type)
+     + (v.status === 'ONSITE' ? ' · on site ' + esc(v.onSite) : '') + '</div>';
+  h += '<div class="tags" style="margin:6px 0 10px">'
+     + (v.arrived ? '<span class="tag green">ARRIVED ' + esc(v.arrived) + '</span>' : '')
+     + (v.followup ? '<span class="tag red">FOLLOW-UP · ' + esc(v.followup.toUpperCase()) + '</span>' : '')
+     + (v.status === 'COMPLETED' ? '<span class="tag grey">COMPLETED</span>' : '') + '</div>';
+  let b = '';
+  if (v.product) b += 'Product: ' + esc(v.product) + '<br>';
+  if (v.issue) b += 'Issue: ' + esc(v.issue) + '<br>';
+  if (v.why) b += 'Last time: ' + esc(v.why) + '<br>';
+  if (v.note) b += 'Note: ' + esc(v.note) + '<br>';
+  if (v.phone) b += 'Phone: <a href="tel:' + esc(v.phone) + '">' + esc(v.phone) + '</a><br>';
+  b += 'Address: ' + esc(v.address) + (v.postal ? ' ' + esc(v.postal) : '');
+  if (v.order) b += '<br>Order: ' + esc(v.order);
+  h += '<div class="case"><div class="body" style="white-space:normal">' + b + '</div>'
+     + '<div class="acts"><button data-map="' + esc(v.map) + '">Directions</button>'
+     + (v.phone ? '<a class="btnlink" href="tel:' + esc(v.phone) + '">Call</a>' : '') + '</div></div>';
+  if (v.status === 'SCHEDULED') h += '<button class="big" data-arrive="' + v.id + '">🚗 Arrived</button>';
+  if (v.status === 'ONSITE') {
+    if (VS.lv) return h + leaveForm(v);
+    h += '<h2>' + (v.type === 'Troubleshoot' ? 'Troubleshoot' : 'Set-up') + ' checklist</h2>';
+    if (v.draft) h += '<div class="note">Draft steps, to be confirmed with the specialist.</div>';
+    h += '<div class="case">' + v.checklist.map((x, i) => {
+      const on = v.ticks.includes(i);
+      return '<div class="top" style="padding:6px 0;border-bottom:1px solid var(--line)" data-tick="' + i + '" data-on="' + (on ? 1 : 0) + '">'
+        + '<div class="tick' + (on ? ' on' : '') + '">' + (on ? '✓' : '') + '</div><div style="padding-top:3px">' + esc(x) + '</div></div>';
+    }).join('') + '</div>';
+    h += '<h2>Photos (optional)</h2><div class="note">Send photos to SH Bot in your chat while you’re on site and they’re added here. '
+       + (v.photos ? v.photos + ' added so far.' : 'None yet.') + '</div>';
+    h += '<div class="more" data-map="' + esc(v.formUrl) + '">📝 Open the customer sign-off form</div>';
+    h += '<button class="big" data-leave="' + v.id + '">🏁 Leave</button>';
+  }
+  if (v.status === 'COMPLETED' && v.report) h += '<div class="case"><div class="body">' + esc(v.report) + '</div></div>';
+  return h;
+}
+
+function leaveForm(v) {
+  const f = VS.lv;
+  const pick = (k, val, name) => '<button data-lf="' + k + '" data-v="' + val + '" class="' + (String(f[k]) === String(val) ? 'on' : '') + '">' + name + '</button>';
+  let h = '<h2>How did it go?</h2><div class="pick">' + pick('outcome', 'RESOLVED', 'Resolved')
+        + pick('outcome', 'RETURN', 'Not finished, need to come back') + pick('outcome', 'REPLACE', 'Needs a replacement unit') + '</div>';
+  if (f.outcome === 'RESOLVED') {
+    h += '<div class="fld"><label>Charge (' + esc(v.currency || 'SGD') + ')</label><div class="pick">' + pick('noCharge', '', 'Charge') + pick('noCharge', '1', 'No charge') + '</div></div>';
+    if (!f.noCharge) {
+      h += '<div class="fld"><label>Amount</label><input id="lf_amount" inputmode="decimal" value="' + esc(f.amount || '') + '"></div>';
+      h += '<div class="fld"><label>How did the customer pay?</label><div class="pick">' + pick('method', 'CASH', 'Cash') + pick('method', 'PAYNOW', 'PayNow') + pick('method', 'OTHER', 'Other') + '</div></div>';
+    }
+  }
+  if (f.outcome === 'RETURN') {
+    h += '<div class="note">No charge for this visit. The customer pays when the job is done.</div>';
+    h += '<div class="fld"><label>Why didn’t it finish?</label><div class="pick">' + pick('reason', 'PART', 'Need a part') + pick('reason', 'TIME', 'Out of time')
+       + pick('reason', 'NOTREADY', 'Customer not ready') + pick('reason', 'OTHER', 'Other') + '</div></div>';
+    h += '<div class="fld"><label>Note (optional)</label><textarea id="lf_note" rows="2">' + esc(f.note || '') + '</textarea></div>';
+    h += '<div class="fld"><label>How urgent?</label><div class="pick">' + pick('urgency', 'HIGH', 'High') + pick('urgency', 'MEDIUM', 'Medium') + pick('urgency', 'LOW', 'Low') + '</div></div>';
+    h += '<div class="fld"><label>Next visit</label><div class="pick">' + pick('later', '', 'Pick a date') + pick('later', '1', 'Customer will confirm later') + '</div></div>';
+    if (!f.later) h += '<div class="fld"><input type="date" id="lf_date" value="' + esc(f.date || '') + '"><input type="time" id="lf_time" value="' + esc(f.time || '') + '" style="margin-top:6px"></div>';
+  }
+  if (f.outcome) h += '<button class="big" id="lfSave">' + (f.outcome === 'RETURN' && !f.later ? 'Book the next visit' : 'Finish the visit') + '</button>';
+  h += '<button class="big ghost" id="lfBack">Back</button>';
+  return h;
+}
+
+function keepLeave() {
+  if (!VS.lv) return;
+  for (const k of ['amount', 'note', 'date', 'time']) { const el = document.getElementById('lf_' + k); if (el) VS.lv[k] = el.value; }
+}
+
+async function loadVisitScreen(d) {
+  const app = document.getElementById('app');
+  const out = await post('/api/visit/one', { id: VS.vv });
+  if (!out.ok) { VS.vv = null; toast(out.error || 'Could not open that.'); return loadVisits(); }
+  const v = out.visit;
+  if (VS.lv && VS.lv.amount === undefined && v.suggest) VS.lv.amount = (v.suggest / 100).toFixed(2);
+  app.innerHTML = visitScreen(v) + navBar();
+  wireVisits(d);
+  const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
+  on('[data-vvback]', () => { VS.vv = null; VS.lv = null; loadVisits(); });
+  on('[data-arrive]', async el => {
+    el.disabled = true;
+    const r = await post('/api/visit/arrive', { id: v.id });
+    if (!r.ok) { el.disabled = false; toast(r.error || 'Could not save that.'); return; }
+    toast('Arrived'); loadVisits();
+  });
+  on('[data-tick]', async el => {
+    const r = await post('/api/visit/check', { id: v.id, i: Number(el.dataset.tick), on: el.dataset.on !== '1' });
+    if (!r.ok) { toast(r.error || 'Could not save that.'); return; }
+    loadVisits();
+  });
+  on('[data-leave]', () => { VS.lv = { urgency: 'MEDIUM' }; loadVisits(); });
+  on('[data-lf]', el => { keepLeave(); VS.lv[el.dataset.lf] = el.dataset.v; loadVisits(); });
+  const back = document.getElementById('lfBack');
+  if (back) back.onclick = () => { VS.lv = null; loadVisits(); };
+  const save = document.getElementById('lfSave');
+  if (save) save.onclick = async () => {
+    keepLeave();
+    const f = VS.lv;
+    if (f.outcome === 'RETURN' && !f.reason) { toast('Pick why it didn’t finish.'); return; }
+    if (f.outcome === 'RETURN' && !f.later && (!f.date || !f.time)) { toast('Pick the date and time, or Customer will confirm later.'); return; }
+    if (f.outcome === 'RESOLVED' && !f.noCharge && (!f.amount || !f.method)) { toast('Type the amount and pick how they paid.'); return; }
+    save.disabled = true;
+    const r = await post('/api/visit/leave', Object.assign({ id: v.id }, f, { later: !!f.later, noCharge: !!f.noCharge }));
+    save.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not save that.'); return; }
+    VS.lv = null; VS.vv = null;
+    toast(f.outcome === 'RETURN' && !f.later ? 'Done. The next visit is booked and pinned in your chat.' : 'Done. The report has gone to SH.');
+    loadVisits();
+  };
 }
 
 function trackerVisit(it) {
@@ -4799,7 +4944,7 @@ async function loadTracker(d) {
   const open = VS.tv ? t.items.concat(t.open || []).find(x => x.id === VS.tv) : null;
   if (open) { app.innerHTML = trackerVisit(open) + navBar(); wireVisits(d); return; }
   VS.tv = null;
-  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch();
+  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch(d);
   h += '<div class="otabs small"><button data-tw="' + t.prev + '">◀ Prev</button>'
      + '<button class="on">' + esc(t.weekLabel) + '</button>'
      + '<button data-tw="' + t.next + '">Next ▶</button></div>';
@@ -4854,10 +4999,14 @@ async function loadVisits() {
     wireVisits(d);
     return;
   }
-  if (!d.canTrack) VS.mode = 'sched';
+  if (d.role === 'specialist' && !VS.modeSet) { VS.mode = 'today'; VS.modeSet = true; }
+  if (!d.canTrack && VS.mode === 'track') VS.mode = 'sched';
+  if (d.role !== 'specialist' && VS.mode === 'today') VS.mode = 'sched';
+  if (VS.vv) return loadVisitScreen(d);
   if (VS.mode === 'track') return loadTracker(d);
+  if (VS.mode === 'today') { app.innerHTML = todayView(d) + navBar(); wireVisits(d); return; }
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
-  if (d.canTrack) h += trackerSwitch();
+  if (d.canTrack || d.role === 'specialist') h += trackerSwitch(d);
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
         '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + (REGION_FLAGS[c.code] || '') + ' ' + esc(c.code) + '</button>').join('') + '</div>';
@@ -4900,6 +5049,7 @@ function wireVisits(d) {
   on('[data-tclear]', () => { VS.tc = ''; VS.ts = ''; loadVisits(); });
   on('[data-tv]', el => { VS.tv = Number(el.dataset.tv); loadVisits(); window.scrollTo(0, 0); });
   on('[data-tkback]', () => { VS.tv = null; loadVisits(); });
+  on('[data-vv]', el => { VS.vv = Number(el.dataset.vv); VS.lv = null; loadVisits(); window.scrollTo(0, 0); });
   on('[data-vc]', el => { VS.country = el.dataset.vc; VS.spec = ''; loadVisits(); });
   on('[data-vsp]', el => { VS.spec = el.dataset.vsp; loadVisits(); });
   on('[data-vw]', el => { VS.week = el.dataset.vw; loadVisits(); });

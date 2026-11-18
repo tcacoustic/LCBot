@@ -1016,6 +1016,7 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
                     "AND status IN ('SCHEDULED','ARRANGING','ONSITE')", (country,))
     fu_rows = sorted(fu_rows, key=followup_sort)
     return {
+        "myDay": today_payload(user_id, country) if role == "specialist" else None,
         "followups": [followup_item(v, user_id, role) for v in fu_rows],
         "open": [open_item(v, user_id, role) for v in open_rows if not v["followup_of"]],
         "myCountry": country if role == "specialist" else "",
@@ -1792,3 +1793,183 @@ async def on_ons_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def ons_text_more(update, context, job: dict, text: str) -> int:
     """Other typed steps (added with later features)."""
     return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------
+# The specialist's day in the App: Today, the visit screen (Arrived, a
+# checklist, optional photos) and Leave. The checklists are DRAFT steps until
+# the specialist confirms them. Ticks and photos are kept without new tables:
+# ticks in settings, photos in the visit's log.
+# --------------------------------------------------------------------------
+
+CHECKLISTS = {
+    "SETUP": [
+        "Unbox and check for damage",
+        "Place it and connect power (and the TV cable for a soundbar)",
+        "Connect to Wi-Fi in the Sonos or Marshall app",
+        "Update the firmware, and pair the sub or surrounds if any",
+        "Test it with the customer and show them the app",
+    ],
+    "TROUBLESHOOT": [
+        "Check the problem matches what the customer reported",
+        "Check power and cables (power, HDMI eARC or optical, Ethernet if used)",
+        "Check Wi-Fi: right network, good signal where it sits",
+        "Open the Sonos or Marshall app and check it sees every product",
+        "Update the firmware and the app",
+        "Power cycle the product (unplug, wait, plug back in)",
+        "Sub (Sonos or Marshall Sub 200): check it's paired, re-pair if needed",
+        "Factory reset and set up again, only if needed",
+        "Test it with the customer: TV audio, music, sub with the soundbar",
+        "Record the result",
+    ],
+}
+CHECKLIST_DRAFT = True     # flip once the specialist has confirmed the steps
+
+
+def checklist_of(v) -> list:
+    return CHECKLISTS.get(v["visit_type"], CHECKLISTS["SETUP"])
+
+
+def ticks_of(appt_id: int) -> list:
+    try:
+        return [int(i) for i in json.loads(setting(f"visit_checks:{appt_id}", "") or "[]")]
+    except (ValueError, TypeError):
+        return []
+
+
+def set_tick(appt_id: int, user_id: int, i: int, on: bool) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id:
+        return False, "That's not your visit."
+    if not 0 <= i < len(checklist_of(v)):
+        return False, "That step isn't on the list."
+    ticks = set(ticks_of(appt_id))
+    (ticks.add if on else ticks.discard)(i)
+    set_setting(f"visit_checks:{appt_id}", json.dumps(sorted(ticks)))
+    return True, None
+
+
+def photos_of(appt_id: int) -> int:
+    return q1("SELECT COUNT(*) AS n FROM appointment_log WHERE appt_id=? AND action='photo'",
+              (appt_id,))["n"]
+
+
+def arrive(appt_id: int, user_id: int) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id:
+        return False, "That's not your visit."
+    if v["status"] != "SCHEDULED":
+        return False, "Already marked."
+    run("UPDATE appointments SET status='ONSITE', arrived_at=? WHERE id=?", (now().isoformat(), appt_id))
+    log_visit(appt_id, user_id, "arrived")
+    return True, None
+
+
+def visit_screen(v, user_id: int) -> dict:
+    """Everything the visit screen in the App needs, for the specialist's own visit."""
+    tz = COUNTRY_TZ[v["country"]]
+    start = span_of(v)[0].astimezone(tz)
+    hhmm = lambda iso: datetime.fromisoformat(iso).astimezone(tz).strftime("%H:%M") if iso else ""
+    item = {
+        "id": v["id"], "status": v["status"], "country": v["country"],
+        "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+        "when": start.strftime("%a %-d %b, %H:%M"), "start": start.strftime("%H:%M"),
+        "customer": v["customer_name"], "phone": v["phone"] or "", "email": v["email"] or "",
+        "address": v["address"], "postal": v["postal"] or "", "product": v["product"] or "",
+        "issue": v["issue"] or "", "order": v["order_no"] or "", "map": map_link(v),
+        "note": handover_note(v["id"]), "arrived": hhmm(v["arrived_at"]),
+        "minutes": visit_minutes(v), "onSite": mins_text(visit_minutes(v)),
+        "followup": URGENCY_NAMES.get(v["urgency"] or "MEDIUM", "") if v["followup_of"] else "",
+        "why": nf_reason_text(v["followup_of"]) if v["followup_of"] else "",
+        "checklist": checklist_of(v), "ticks": ticks_of(v["id"]), "draft": CHECKLIST_DRAFT,
+        "photos": photos_of(v["id"]), "formUrl": VISIT_FORM_URL,
+        "mine": v["specialist_id"] == user_id,
+    }
+    if v["status"] == "ONSITE":
+        suggest = visit_charge(v["country"], max(1, visit_minutes(v)))
+        item["suggest"] = suggest[0] if suggest else None
+        item["currency"] = CURRENCY.get(v["country"], "SGD")
+    if v["status"] == "COMPLETED":
+        item["report"] = report_lines(v)
+    return item
+
+
+def today_payload(user_id: int, country: str) -> dict:
+    """The specialist's Today: the next visit on top, then today's timeline."""
+    tz = COUNTRY_TZ[country]
+    today = datetime.now(tz).date()
+    rows = q("SELECT * FROM appointments WHERE specialist_id=? AND status IN "
+             "('SCHEDULED','ONSITE','COMPLETED')", (user_id,))
+    todays = sorted((v for v in rows if span_of(v)[0].astimezone(tz).date() == today),
+                    key=lambda v: v["starts_at"])
+    upcoming = sorted((v for v in rows if v["status"] in ("SCHEDULED", "ONSITE")),
+                      key=lambda v: (v["status"] != "ONSITE", v["starts_at"]))
+    nxt = upcoming[0] if upcoming else None
+    return {
+        "label": today.strftime("%a %-d %b"),
+        "next": visit_screen(nxt, user_id) if nxt else None,
+        "items": [{"id": v["id"], "start": span_of(v)[0].astimezone(tz).strftime("%H:%M"),
+                   "customer": v["customer_name"], "postal": v["postal"] or "",
+                   "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]), "status": v["status"],
+                   "followup": bool(v["followup_of"])} for v in todays],
+    }
+
+
+async def leave_from_app(appt_id: int, user_id: int, b: dict) -> dict:
+    """Leave from the App: outcome, then the charge (Resolved), the next visit
+    (Not finished) or nothing more (Replacement). Runs on the bot's loop."""
+    bot = bot_ref()
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "That visit isn't open on your side any more."}
+    outcome = str(b.get("outcome") or "")
+    if outcome not in OUTCOME_NAMES:
+        return {"ok": False, "error": "Pick how it went."}
+    if outcome == "RETURN":
+        async with write_lock:
+            run("UPDATE appointments SET left_at=? WHERE id=?", (now().isoformat(), appt_id))
+            new_id, err = book_followup(appt_id, user_id, b)
+        if err:
+            return {"ok": False, "error": err}
+        await finish_visit(bot, None, appt_id, user_id)
+        await pin_next_visit(bot, new_id)
+        return {"ok": True, "next": new_id}
+    cents, cur, method = 0, None, None
+    if outcome == "RESOLVED" and not b.get("noCharge"):
+        try:
+            cents = round(float(str(b.get("amount") or "0").replace(",", "")) * 100)
+        except ValueError:
+            cents = -1
+        if cents <= 0 or cents > 10_000_000:
+            return {"ok": False, "error": "Type the amount, or pick No charge."}
+        method = str(b.get("method") or "")
+        if method not in dict(PAY_METHODS):
+            return {"ok": False, "error": "Pick how the customer paid."}
+        cur = CURRENCY.get(v["country"], "SGD")
+    async with write_lock:
+        run("UPDATE appointments SET outcome=?, left_at=?, amount_cents=?, currency=?, pay_method=? "
+            "WHERE id=?", (outcome, now().isoformat(), cents, cur, method, appt_id))
+    await finish_visit(bot, None, appt_id, user_id)
+    return {"ok": True}
+
+
+async def on_visit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A photo sent to the bot while on site goes with that visit (optional)."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE or not update.message.photo:
+        return
+    uid = update.effective_user.id
+    if await photo_for_other(update, context):
+        return
+    here = q("SELECT * FROM appointments WHERE specialist_id=? AND status='ONSITE'", (uid,))
+    if len(here) != 1:
+        return
+    v = here[0]
+    async with write_lock:
+        log_visit(v["id"], uid, "photo", update.message.photo[-1].file_id)
+    await update.message.reply_text(f"📷 Added to {v['customer_name']}'s visit "
+                                    f"({photos_of(v['id'])} so far).")
+
+
+async def photo_for_other(update, context) -> bool:
+    """Other uses of a photo sent to the bot (added with later features)."""
+    return False
