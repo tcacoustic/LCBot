@@ -769,7 +769,9 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
 
 
 VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
-               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime"}
+               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime",
+               "/api/visit/arrive", "/api/visit/check", "/api/visit/leave", "/api/visit/one",
+               "/api/visit/request", "/api/visit/paynow", "/api/visit/reviewqr", "/api/visit/cab"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -817,7 +819,59 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         if not ok:
             return {"ok": False, "error": err}
         on_bot_loop(notify_booked_fyi(bot_ref(), num("id")))
+        v = q1("SELECT followup_of FROM appointments WHERE id=?", (num("id"),))
+        if v and v["followup_of"]:
+            on_bot_loop(pin_next_visit(bot_ref(), num("id")))
         return {"ok": True}
+    if path == "/api/visit/one":
+        v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))
+        if not v or v["specialist_id"] != user_id:
+            return {"ok": False, "error": "That's not your visit."}
+        return {"ok": True, "visit": visit_screen(v, user_id)}
+    if path == "/api/visit/arrive":
+        async def _arrive():
+            async with write_lock:
+                return arrive(num("id"), user_id)
+        ok, err = on_bot_loop(_arrive(), timeout=10) or (False, "Couldn't save that just now.")
+        return {"ok": ok, "error": err} if not ok else {"ok": True}
+    if path == "/api/visit/check":
+        async def _tick():
+            async with write_lock:
+                return set_tick(num("id"), user_id, num("i"), bool(b.get("on")))
+        ok, err = on_bot_loop(_tick(), timeout=10) or (False, "Couldn't save that just now.")
+        return {"ok": ok, "error": err} if not ok else {"ok": True}
+    if path == "/api/visit/leave":
+        return on_bot_loop(leave_from_app(num("id"), user_id, b), timeout=20) or \
+            {"ok": False, "error": "Couldn't save that just now. Try again."}
+    if path == "/api/visit/request":
+        async def _rq():
+            async with write_lock:
+                return create_onsite_request(user_id, num("id"), b)
+        rid, err = on_bot_loop(_rq(), timeout=10) or (None, "Couldn't send that just now.")
+        if err:
+            return {"ok": False, "error": err}
+        posted = on_bot_loop(post_onsite_request(bot_ref(), rid), timeout=15)
+        return {"ok": True, "posted": bool(posted)}
+    if path == "/api/visit/paynow":
+        v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))
+        if not v or v["specialist_id"] != user_id:
+            return {"ok": False, "error": "That's not your visit."}
+        try:
+            cents = round(float(str(b.get("amount") or "0").replace(",", "")) * 100)
+        except ValueError:
+            cents = 0
+        if cents <= 0:
+            return {"ok": False, "error": "Type the amount first."}
+        qr = paynow_qr(v, cents)
+        return {"ok": True, "sample": qr["sample"], "img": data_uri(qr["png"]), "ref": qr["ref"],
+                "amount": money_text(cents, CURRENCY.get(v["country"], "SGD"))}
+    if path == "/api/visit/cab":
+        return on_bot_loop(cab_from_app(user_id, num("id"), str(b.get("trip") or ""), str(b.get("amount") or "")),
+                           timeout=10) or {"ok": False, "error": "Couldn't send that just now."}
+    if path == "/api/visit/reviewqr":
+        if not REVIEW_URL:
+            return {"ok": False, "error": "No review link is set up yet."}
+        return {"ok": True, "img": data_uri(qr_png(REVIEW_URL))}
     if path == "/api/visit/reschedule":
         if role != "booker":
             return {"ok": False, "error": "Only SH, FS and admins move visits."}

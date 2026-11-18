@@ -565,6 +565,48 @@ if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
 if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
+# On-Site replacement / payment requests, posted to the SH x Ops chat.
+db.execute("""CREATE TABLE IF NOT EXISTS onsite_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    appt_id     INTEGER NOT NULL,
+    country     TEXT NOT NULL,
+    need        TEXT NOT NULL,       -- REPLACEMENT, PART, OTHER
+    reason      TEXT NOT NULL,
+    warranty    TEXT NOT NULL,       -- IN, OUT
+    price_cents INTEGER,             -- NULL = to confirm
+    currency    TEXT,
+    pays_by     TEXT NOT NULL,       -- LINK, PAYNOW, NONE
+    status      TEXT NOT NULL DEFAULT 'OPEN',   -- OPEN, TAKEN, DONE
+    created_by  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    taken_by    INTEGER,
+    taken_at    TEXT,
+    done_by     INTEGER,
+    done_at     TEXT,
+    note        TEXT,
+    chat_id     INTEGER,
+    msg_id      INTEGER
+)""")
+# On-Site cab claims: a ride to or from a visit, with a receipt photo.
+db.execute("""CREATE TABLE IF NOT EXISTS cab_claims (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    appt_id      INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    trip         TEXT NOT NULL,      -- TO, FROM, BOTH
+    amount_cents INTEGER NOT NULL,
+    currency     TEXT NOT NULL,
+    receipt      TEXT,               -- Telegram file_id of the receipt photo
+    status       TEXT NOT NULL DEFAULT 'RECEIPT',   -- RECEIPT, PENDING, APPROVED, REJECTED
+    reason       TEXT,
+    decided_by   INTEGER,
+    decided_at   TEXT,
+    created_at   TEXT NOT NULL
+)""")
+# Follow-up visits: the visit it follows on from, and how urgent it is.
+_ap_cols = {r[1] for r in db.execute("PRAGMA table_info(appointments)")}
+for _col in ("urgency TEXT", "followup_of INTEGER"):
+    if _col.split()[0] not in _ap_cols:
+        db.execute(f"ALTER TABLE appointments ADD COLUMN {_col}")
 # Who did what to a case, and any note they left.
 # Special requests to Ops (ops.py): one row each, mirrored to the Ops sheet.
 db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
@@ -3168,6 +3210,7 @@ ADMIN_GROUPS = [
         ("specialists", "On-Site Specialists by country"),
         ("visits", "On-Site visits and follow-ups"),
         ("visitchat", "Post On-Site visit reports in this group"),
+        ("requestchat", "Post On-Site replacement / payment requests in this group"),
         ("request", "Send a special request to Ops"),
         ("requests", "Special requests still open"),
         ("opschat", "Post special requests in this group (Ops)"),
@@ -3257,7 +3300,7 @@ ONLINE_COMMANDS = [
 # not listed is a Livechat tool (the week, slots, hours and pay).
 ADMIN_TEAMS = {
     "onchat": ("ON",), "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
-    "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
+    "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",), "requestchat": ("ONSITE", "SH"),
     "departments": (), "access": (), "roster": (), "pending": (),
     "request": ("SH", "LIVECHAT", "ON", "FS"), "requests": ("OPS",), "opschat": ("OPS",), "opsrounds": ("OPS",),
 }
@@ -3647,6 +3690,8 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:15px; font-weight:800; cursor:pointer; }
   .case .tick.on { background:var(--ink); border-color:var(--ink); color:#fff; }
   .case .nm { font-weight:800; font-size:16px; }
+  .btnlink { display:inline-block; padding:10px 14px; border:2px solid var(--ink); border-radius:8px; font-weight:700; color:var(--ink); text-decoration:none; background:var(--card); }
+  .case.fu { border-color:var(--red); box-shadow:inset 6px 0 0 var(--red); padding-left:18px; }
   .case .meta { font-size:12px; color:var(--muted); margin-top:2px; }
   .case .body { font-size:14px; white-space:pre-wrap; margin-top:10px; padding-top:10px;
     border-top:1px solid #E2E0DA; color:var(--ink); }
@@ -4630,8 +4675,9 @@ function openLink(u) { if (tg && tg.openLink) tg.openLink(u); else window.open(u
 
 function visitCard(it, d) {
   const done = it.status === 'COMPLETED';
-  let h = '<div class="case' + (done ? ' gone' : '') + '">';
-  h += '<div class="nm">' + esc(it.start) + ' · ' + esc(it.type) + '</div>';
+  let h = '<div class="case' + (done ? ' gone' : '') + (it.followup && !done ? ' fu' : '') + '">';
+  h += '<div class="nm">' + esc(it.start) + ' · ' + esc(it.type)
+     + (it.followup && !done ? ' <span class="tag red">FOLLOW-UP · ' + esc(it.followup.toUpperCase()) + '</span>' : '') + '</div>';
   h += '<div class="meta">' + esc(it.customer) + (it.postal ? ' · ' + esc(it.postal) : '')
      + (d.role === 'booker' ? ' · ' + esc(it.specialist) : '') + '</div>';
   if (it.status === 'ONSITE') h += '<div class="st">On-Site now</div>';
@@ -4667,6 +4713,7 @@ function visitCard(it, d) {
   } else {
     h += '<div class="more" data-vshow="' + it.id + '">Details</div>';
   }
+  if (d.role === 'specialist') h += '<div class="more" data-vv="' + it.id + '">Open the visit ›</div>';
   return h + '</div>';
 }
 
@@ -4704,6 +4751,24 @@ function keepBookForm() {
   }
 }
 
+function followupCard(it) {
+  let h = '<div class="case fu"><div class="nm" style="display:flex;justify-content:space-between;gap:8px">'
+    + '<span>📌 ' + (REGION_FLAGS[it.country] || '') + ' ' + esc(it.customer) + ' · ' + esc(it.type) + '</span>'
+    + '<span class="tag red" style="align-self:flex-start">FOLLOW-UP · ' + esc(it.urgency.toUpperCase()) + '</span></div>';
+  h += '<div class="meta">' + [it.when, it.postal, it.specialist].filter(Boolean).map(esc).join(' · ') + '</div>';
+  let b = '';
+  if (it.why) b += 'Last time: ' + esc(it.why) + '<br>';
+  if (it.product) b += 'Product: ' + esc(it.product) + '<br>';
+  if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+  if (it.address) b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '');
+  if (b) h += '<div class="body" style="white-space:normal">' + b + '</div>';
+  if (it.map) h += '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div>';
+  if (it.canSet) h += '<div class="fld" style="margin-top:8px"><label>Date and time agreed with the customer</label>'
+     + '<input type="date" id="st_d_' + it.id + '"><input type="time" id="st_t_' + it.id + '" style="margin-top:6px"></div>'
+     + '<div class="acts"><button data-settime="' + it.id + '">Book it</button></div>';
+  return h + '</div>';
+}
+
 function openCard(it) {
   const tag = it.status === 'waiting' ? ['purple', 'WAITING'] : ['teal', 'ARRANGING'];
   let h = '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px">'
@@ -4731,9 +4796,250 @@ function openCard(it) {
 const TK_STATUS = { waiting: ['purple', 'Waiting'], arranging: ['teal', 'Arranging'], booked: ['blue', 'Booked'], onsite: ['orange', 'On site now'], done: ['green', 'Done'],
   followup: ['amber', 'Follow-up'], cancelled: ['grey', 'Cancelled'] };
 
-function trackerSwitch() {
-  return '<div class="otabs"><button data-vmode="sched" class="' + (VS.mode === 'sched' ? 'on' : '') + '">Schedule</button>'
-       + '<button data-vmode="track" class="' + (VS.mode === 'track' ? 'on' : '') + '">Tracker</button></div>';
+function trackerSwitch(d) {
+  const b = (k, n) => '<button data-vmode="' + k + '" class="' + (VS.mode === k ? 'on' : '') + '">' + n + '</button>';
+  return '<div class="otabs">' + (d && d.role === 'specialist' ? b('today', 'Today') : '') + b('sched', 'Schedule')
+       + (!d || d.canTrack ? b('track', 'Tracker') : '') + '</div>';
+}
+
+// The specialist's Today: the next visit with Directions and Call, then the day.
+function todayView(d) {
+  const t = d.myDay || { items: [] };
+  let h = '<h1>Today</h1><div class="sub">' + esc(t.label || '') + '</div>' + trackerSwitch(d);
+  if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
+  const n = t.next;
+  if (n) {
+    h += '<h2>' + (n.status === 'ONSITE' ? 'On site now' : 'Next visit') + '</h2>';
+    h += '<div class="case' + (n.followup ? ' fu' : '') + '" style="border-color:var(--accent);box-shadow:inset 6px 0 0 var(--accent);padding-left:18px">'
+       + '<div class="nm">' + esc(n.when) + ' · ' + esc(n.type) + '</div>'
+       + '<div class="meta">' + (REGION_FLAGS[n.country] || '') + ' ' + esc(n.customer) + (n.postal ? ' · ' + esc(n.postal) : '') + '</div>'
+       + (n.product ? '<div class="meta">' + esc(n.product) + '</div>' : '')
+       + '<div class="acts"><button data-map="' + esc(n.map) + '">Directions</button>'
+       + (n.phone ? '<a class="btnlink" href="tel:' + esc(n.phone) + '">Call</a>' : '')
+       + '<button class="soft" data-vv="' + n.id + '">Open</button></div></div>';
+  } else {
+    h += '<div class="empty">No visits coming up.</div>';
+  }
+  h += '<h2>' + esc(t.label || 'Today') + '</h2>';
+  h += todayList(t);
+  h += requestsList(d);
+  return h;
+}
+
+const RQ_TAG = { OPEN: ['amber', 'WAITING'], TAKEN: ['blue', 'BEING HANDLED'], DONE: ['green', 'DONE'] };
+const CAB_TAG = { RECEIPT: 'amber', PENDING: 'amber', APPROVED: 'green', REJECTED: 'red' };
+function requestsList(d) {
+  const rs = d.myRequests || [], cs = d.myClaims || [];
+  let h = '';
+  if (cs.length) h += '<h2>Your cab claims</h2>' + cs.map(c => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+    + esc(c.amount) + ' · #' + c.visit + '</span><span class="tag ' + CAB_TAG[c.status] + '">' + esc(c.statusName.toUpperCase()) + '</span></div>'
+    + '<div class="meta">' + esc(c.when) + ' · ' + esc(c.trip) + (c.reason ? ' · ' + esc(c.reason) : '') + '</div></div>').join('');
+  if (!rs.length) return h;
+  return h + '<h2>Your requests</h2>' + rs.map(r => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+    + esc(r.need) + ' · #' + r.visit + '</span><span class="tag ' + RQ_TAG[r.status][0] + '">' + RQ_TAG[r.status][1] + '</span></div>'
+    + '<div class="meta">' + esc(r.when) + (r.who ? ' · ' + esc(r.who) : '') + ' · ' + esc(r.reason) + '</div>'
+    + (r.note ? '<div class="body">📝 ' + esc(r.note) + '</div>' : '') + '</div>').join('');
+}
+
+function todayList(t) {
+  let h = '';
+  if (!t.items.length) h += '<div class="empty">Nothing booked today.</div>';
+  for (const it of t.items) {
+    const st = it.status === 'COMPLETED' ? 'done' : it.status === 'ONSITE' ? 'on site' : '';
+    h += '<div class="case tk-v' + (it.status === 'COMPLETED' ? ' gone' : '') + (it.followup && it.status !== 'COMPLETED' ? ' fu' : '') + '" data-vv="' + it.id + '">'
+       + '<div class="nm"><span>' + esc(it.start) + ' · ' + esc(it.customer) + '</span>'
+       + (st ? '<span class="tag ' + (st === 'done' ? 'green' : 'orange') + '">' + st.toUpperCase() + '</span>' : '') + '</div>'
+       + '<div class="meta">' + esc(it.type) + (it.postal ? ' · ' + esc(it.postal) : '') + ' ›</div></div>';
+  }
+  return h;
+}
+
+// One visit: Arrived, the checklist, photos and Leave.
+function visitScreen(v) {
+  let h = '<div class="back" data-vvback="1">‹ ' + (VS.mode === 'today' ? 'Today' : 'Visits') + '</div>';
+  h += '<h1>' + esc(v.customer) + '</h1><div class="sub">' + (REGION_FLAGS[v.country] || '') + ' ' + esc(v.when) + ' · ' + esc(v.type)
+     + (v.status === 'ONSITE' ? ' · on site ' + esc(v.onSite) : '') + '</div>';
+  h += '<div class="tags" style="margin:6px 0 10px">'
+     + (v.arrived ? '<span class="tag green">ARRIVED ' + esc(v.arrived) + '</span>' : '')
+     + (v.followup ? '<span class="tag red">FOLLOW-UP · ' + esc(v.followup.toUpperCase()) + '</span>' : '')
+     + (v.status === 'COMPLETED' ? '<span class="tag grey">COMPLETED</span>' : '') + '</div>';
+  let b = '';
+  if (v.product) b += 'Product: ' + esc(v.product) + '<br>';
+  if (v.issue) b += 'Issue: ' + esc(v.issue) + '<br>';
+  if (v.why) b += 'Last time: ' + esc(v.why) + '<br>';
+  if (v.note) b += 'Note: ' + esc(v.note) + '<br>';
+  if (v.phone) b += 'Phone: <a href="tel:' + esc(v.phone) + '">' + esc(v.phone) + '</a><br>';
+  b += 'Address: ' + esc(v.address) + (v.postal ? ' ' + esc(v.postal) : '');
+  if (v.order) b += '<br>Order: ' + esc(v.order);
+  h += '<div class="case"><div class="body" style="white-space:normal">' + b + '</div>'
+     + '<div class="acts"><button data-map="' + esc(v.map) + '">Directions</button>'
+     + (v.phone ? '<a class="btnlink" href="tel:' + esc(v.phone) + '">Call</a>' : '') + '</div></div>';
+  if (v.status === 'SCHEDULED') h += '<button class="big" data-arrive="' + v.id + '">🚗 Arrived</button>';
+  if (v.status === 'ONSITE') {
+    if (VS.lv) return h + leaveForm(v);
+    h += '<h2>' + (v.type === 'Troubleshoot' ? 'Troubleshoot' : 'Set-up') + ' checklist</h2>';
+    if (v.draft) h += '<div class="note">Draft steps, to be confirmed with the specialist.</div>';
+    h += '<div class="case">' + v.checklist.map((x, i) => {
+      const on = v.ticks.includes(i);
+      return '<div class="top" style="padding:6px 0;border-bottom:1px solid var(--line)" data-tick="' + i + '" data-on="' + (on ? 1 : 0) + '">'
+        + '<div class="tick' + (on ? ' on' : '') + '">' + (on ? '✓' : '') + '</div><div style="padding-top:3px">' + esc(x) + '</div></div>';
+    }).join('') + '</div>';
+    h += '<h2>Photos (optional)</h2><div class="note">Send photos to SH Bot in your chat while you’re on site and they’re added here. '
+       + (v.photos ? v.photos + ' added so far.' : 'None yet.') + '</div>';
+    h += '<div class="more" data-map="' + esc(v.formUrl) + '">📝 Open the customer sign-off form</div>';
+    h += '<button class="big" data-leave="' + v.id + '">🏁 Leave</button>';
+  }
+  if (v.status === 'COMPLETED' && v.report) h += '<div class="case"><div class="body">' + esc(v.report) + '</div></div>';
+  if (v.status === 'COMPLETED' && v.reviewQr) h += '<button class="big ghost" data-rvqr="' + v.id + '">⭐ Show review QR</button><div id="rvbox"></div>';
+  if (v.canRequest) h += VS.rq ? rqForm(v) : '<button class="big ghost" data-rqopen="1">📦 Replacement / payment request</button>';
+  if (v.canClaim) h += VS.cab ? cabForm(v) : '<button class="big ghost" data-cabopen="1">🚕 Cab claim</button>';
+  return h;
+}
+
+function rqForm(v) {
+  const f = VS.rq;
+  const pick = (k, val, name) => '<button data-rqf="' + k + '" data-v="' + val + '" class="' + (f[k] === val ? 'on' : '') + '">' + name + '</button>';
+  let h = '<h2>Replacement / payment request</h2><div class="note">Goes to the SH x Ops chat. No customer phone or address is posted.</div>';
+  h += '<div class="fld"><label>Visit</label><input value="#' + v.id + ' · ' + esc(v.product || v.type) + '" disabled></div>';
+  h += '<div class="fld"><label>Need</label><div class="pick">' + pick('need', 'REPLACEMENT', 'Replacement unit') + pick('need', 'PART', 'Part') + pick('need', 'OTHER', 'Other') + '</div></div>';
+  h += '<div class="fld"><label>Reason</label><textarea id="rq_reason" rows="2" placeholder="Won’t power on, fault confirmed on site">' + esc(f.reason || '') + '</textarea></div>';
+  h += '<div class="fld"><label>Warranty</label><div class="pick">' + pick('warranty', 'IN', 'In warranty') + pick('warranty', 'OUT', 'Out of warranty') + '</div></div>';
+  h += '<div class="fld"><label>Price (' + esc(v.currency || 'SGD') + ', leave empty if to confirm)</label><input id="rq_price" inputmode="decimal" value="' + esc(f.price || '') + '"></div>';
+  h += '<div class="fld"><label>Customer pays by</label><div class="pick">' + pick('pays_by', 'LINK', 'Payment link') + pick('pays_by', 'PAYNOW', 'PayNow') + pick('pays_by', 'NONE', 'No charge') + '</div></div>';
+  h += '<button class="big" id="rqSend">Send to SH x Ops</button><button class="big ghost" id="rqBack2">Back</button>';
+  return h;
+}
+
+function cabForm(v) {
+  const f = VS.cab;
+  const pick = (val, name) => '<button data-cabt="' + val + '" class="' + (f.trip === val ? 'on' : '') + '">' + name + '</button>';
+  return '<h2>Cab claim</h2><div class="fld"><label>Trip</label><div class="pick">' + pick('TO', 'To the visit') + pick('FROM', 'From the visit') + pick('BOTH', 'Both ways') + '</div></div>'
+    + '<div class="fld"><label>Fare (' + esc(v.currency || 'SGD') + ')</label><input id="cab_amount" inputmode="decimal" placeholder="18.40" value="' + esc(f.amount || '') + '"></div>'
+    + '<div class="note">Next, send a photo of the receipt to SH Bot in your chat. It goes for approval once the photo is in.</div>'
+    + '<button class="big" id="cabSend">Send claim</button><button class="big ghost" id="cabBack">Back</button>';
+}
+
+function keepRq() {
+  if (!VS.rq) return;
+  const r = document.getElementById('rq_reason'), p = document.getElementById('rq_price');
+  if (r) VS.rq.reason = r.value; if (p) VS.rq.price = p.value;
+}
+
+function leaveForm(v) {
+  const f = VS.lv;
+  const pick = (k, val, name) => '<button data-lf="' + k + '" data-v="' + val + '" class="' + (String(f[k]) === String(val) ? 'on' : '') + '">' + name + '</button>';
+  let h = '<h2>How did it go?</h2><div class="pick">' + pick('outcome', 'RESOLVED', 'Resolved')
+        + pick('outcome', 'RETURN', 'Not finished, need to come back') + pick('outcome', 'REPLACE', 'Needs a replacement unit') + '</div>';
+  if (f.outcome === 'RESOLVED') {
+    h += '<div class="fld"><label>Charge (' + esc(v.currency || 'SGD') + ')</label><div class="pick">' + pick('noCharge', '', 'Charge') + pick('noCharge', '1', 'No charge') + '</div></div>';
+    if (!f.noCharge) {
+      h += '<div class="fld"><label>Amount</label><input id="lf_amount" inputmode="decimal" value="' + esc(f.amount || '') + '"></div>';
+      h += '<div class="fld"><label>How did the customer pay?</label><div class="pick">' + pick('method', 'CASH', 'Cash') + pick('method', 'PAYNOW', 'PayNow') + pick('method', 'OTHER', 'Other') + '</div></div>';
+      if (f.method === 'PAYNOW') h += '<button class="big ghost" data-pnqr="' + v.id + '">Show PayNow QR</button><div id="pnbox"></div>';
+    }
+  }
+  if (f.outcome === 'RETURN') {
+    h += '<div class="note">No charge for this visit. The customer pays when the job is done.</div>';
+    h += '<div class="fld"><label>Why didn’t it finish?</label><div class="pick">' + pick('reason', 'PART', 'Need a part') + pick('reason', 'TIME', 'Out of time')
+       + pick('reason', 'NOTREADY', 'Customer not ready') + pick('reason', 'OTHER', 'Other') + '</div></div>';
+    h += '<div class="fld"><label>Note (optional)</label><textarea id="lf_note" rows="2">' + esc(f.note || '') + '</textarea></div>';
+    h += '<div class="fld"><label>How urgent?</label><div class="pick">' + pick('urgency', 'HIGH', 'High') + pick('urgency', 'MEDIUM', 'Medium') + pick('urgency', 'LOW', 'Low') + '</div></div>';
+    h += '<div class="fld"><label>Next visit</label><div class="pick">' + pick('later', '', 'Pick a date') + pick('later', '1', 'Customer will confirm later') + '</div></div>';
+    if (!f.later) h += '<div class="fld"><input type="date" id="lf_date" value="' + esc(f.date || '') + '"><input type="time" id="lf_time" value="' + esc(f.time || '') + '" style="margin-top:6px"></div>';
+  }
+  if (f.outcome) h += '<button class="big" id="lfSave">' + (f.outcome === 'RETURN' && !f.later ? 'Book the next visit' : 'Finish the visit') + '</button>';
+  h += '<button class="big ghost" id="lfBack">Back</button>';
+  return h;
+}
+
+function keepLeave() {
+  if (!VS.lv) return;
+  for (const k of ['amount', 'note', 'date', 'time']) { const el = document.getElementById('lf_' + k); if (el) VS.lv[k] = el.value; }
+}
+
+async function loadVisitScreen(d) {
+  const app = document.getElementById('app');
+  const out = await post('/api/visit/one', { id: VS.vv });
+  if (!out.ok) { VS.vv = null; toast(out.error || 'Could not open that.'); return loadVisits(); }
+  const v = out.visit;
+  if (VS.lv && VS.lv.amount === undefined && v.suggest) VS.lv.amount = (v.suggest / 100).toFixed(2);
+  app.innerHTML = visitScreen(v) + navBar();
+  wireVisits(d);
+  const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
+  on('[data-vvback]', () => { VS.vv = null; VS.lv = null; VS.rq = null; VS.cab = null; loadVisits(); });
+  on('[data-arrive]', async el => {
+    el.disabled = true;
+    const r = await post('/api/visit/arrive', { id: v.id });
+    if (!r.ok) { el.disabled = false; toast(r.error || 'Could not save that.'); return; }
+    toast('Arrived'); loadVisits();
+  });
+  on('[data-tick]', async el => {
+    const r = await post('/api/visit/check', { id: v.id, i: Number(el.dataset.tick), on: el.dataset.on !== '1' });
+    if (!r.ok) { toast(r.error || 'Could not save that.'); return; }
+    loadVisits();
+  });
+  on('[data-leave]', () => { VS.lv = { urgency: 'MEDIUM' }; loadVisits(); });
+  const qrImg = (img, sample, caption) => '<div class="case" style="text-align:center">' + (sample ? '<div class="warn">SAMPLE — not a payment code. PayNow isn’t set up yet.</div>' : '')
+    + (img ? '<img src="' + img + '" style="width:240px;max-width:100%;image-rendering:pixelated">' : '') + '<div class="meta">' + esc(caption) + '</div></div>';
+  on('[data-pnqr]', async () => {
+    keepLeave();
+    const r = await post('/api/visit/paynow', { id: v.id, amount: VS.lv.amount });
+    if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
+    document.getElementById('pnbox').innerHTML = qrImg(r.img, r.sample, r.amount + ' · Reference ' + r.ref);
+  });
+  on('[data-rvqr]', async () => {
+    const r = await post('/api/visit/reviewqr', {});
+    if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
+    document.getElementById('rvbox').innerHTML = qrImg(r.img, false, 'Scan to leave us a review');
+  });
+  on('[data-rqopen]', () => { VS.rq = {}; loadVisits(); });
+  on('[data-cabopen]', () => { VS.cab = {}; loadVisits(); });
+  on('[data-cabt]', el => { const a = document.getElementById('cab_amount'); if (a) VS.cab.amount = a.value; VS.cab.trip = el.dataset.cabt; loadVisits(); });
+  const cb = document.getElementById('cabBack');
+  if (cb) cb.onclick = () => { VS.cab = null; loadVisits(); };
+  const cs = document.getElementById('cabSend');
+  if (cs) cs.onclick = async () => {
+    VS.cab.amount = document.getElementById('cab_amount').value;
+    if (!VS.cab.trip || !VS.cab.amount) { toast('Pick the trip and type the fare.'); return; }
+    cs.disabled = true;
+    const r = await post('/api/visit/cab', { id: v.id, trip: VS.cab.trip, amount: VS.cab.amount });
+    cs.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
+    VS.cab = null; toast('Now send the receipt photo to SH Bot in your chat.'); loadVisits();
+  };
+  on('[data-rqf]', el => { keepRq(); VS.rq[el.dataset.rqf] = el.dataset.v; loadVisits(); });
+  const rb = document.getElementById('rqBack2');
+  if (rb) rb.onclick = () => { VS.rq = null; loadVisits(); };
+  const rs = document.getElementById('rqSend');
+  if (rs) rs.onclick = async () => {
+    keepRq();
+    const f = VS.rq;
+    if (!f.need || !f.warranty || !f.pays_by) { toast('Pick the need, warranty and how they pay.'); return; }
+    if (!f.reason || f.reason.trim().length < 3) { toast('Say why in a few words.'); return; }
+    rs.disabled = true;
+    const r = await post('/api/visit/request', Object.assign({ id: v.id }, f));
+    rs.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
+    VS.rq = null; toast(r.posted ? 'Sent to SH x Ops' : 'Sent to the On-Site admins (no request chat set yet)'); loadVisits();
+  };
+  on('[data-lf]', el => { keepLeave(); VS.lv[el.dataset.lf] = el.dataset.v; loadVisits(); });
+  const back = document.getElementById('lfBack');
+  if (back) back.onclick = () => { VS.lv = null; loadVisits(); };
+  const save = document.getElementById('lfSave');
+  if (save) save.onclick = async () => {
+    keepLeave();
+    const f = VS.lv;
+    if (f.outcome === 'RETURN' && !f.reason) { toast('Pick why it didn’t finish.'); return; }
+    if (f.outcome === 'RETURN' && !f.later && (!f.date || !f.time)) { toast('Pick the date and time, or Customer will confirm later.'); return; }
+    if (f.outcome === 'RESOLVED' && !f.noCharge && (!f.amount || !f.method)) { toast('Type the amount and pick how they paid.'); return; }
+    save.disabled = true;
+    const r = await post('/api/visit/leave', Object.assign({ id: v.id }, f, { later: !!f.later, noCharge: !!f.noCharge }));
+    save.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not save that.'); return; }
+    VS.lv = null; if (f.outcome !== 'RESOLVED') VS.vv = null;
+    toast(f.outcome === 'RETURN' && !f.later ? 'Done. The next visit is booked and pinned in your chat.' : 'Done. The report has gone to SH.');
+    loadVisits();
+  };
 }
 
 function trackerVisit(it) {
@@ -4774,7 +5080,7 @@ async function loadTracker(d) {
   const open = VS.tv ? t.items.concat(t.open || []).find(x => x.id === VS.tv) : null;
   if (open) { app.innerHTML = trackerVisit(open) + navBar(); wireVisits(d); return; }
   VS.tv = null;
-  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch();
+  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch(d);
   h += '<div class="otabs small"><button data-tw="' + t.prev + '">◀ Prev</button>'
      + '<button class="on">' + esc(t.weekLabel) + '</button>'
      + '<button data-tw="' + t.next + '">Next ▶</button></div>';
@@ -4829,10 +5135,14 @@ async function loadVisits() {
     wireVisits(d);
     return;
   }
-  if (!d.canTrack) VS.mode = 'sched';
+  if (d.role === 'specialist' && !VS.modeSet) { VS.mode = 'today'; VS.modeSet = true; }
+  if (!d.canTrack && VS.mode === 'track') VS.mode = 'sched';
+  if (d.role !== 'specialist' && VS.mode === 'today') VS.mode = 'sched';
+  if (VS.vv) return loadVisitScreen(d);
   if (VS.mode === 'track') return loadTracker(d);
+  if (VS.mode === 'today') { app.innerHTML = todayView(d) + navBar(); wireVisits(d); return; }
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
-  if (d.canTrack) h += trackerSwitch();
+  if (d.canTrack || d.role === 'specialist') h += trackerSwitch(d);
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
         '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + (REGION_FLAGS[c.code] || '') + ' ' + esc(c.code) + '</button>').join('') + '</div>';
@@ -4848,6 +5158,7 @@ async function loadVisits() {
   } else {
     h += '<button class="big ghost" id="addOwn" style="margin:6px 0 4px">+ Add appointment</button>';
   }
+  if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
   const waiting = d.open.filter(x => x.status === 'waiting'), arranging = d.open.filter(x => x.status === 'arranging');
   if (waiting.length) h += '<h2>Waiting for a specialist</h2>' + waiting.map(x => openCard(x)).join('');
   if (arranging.length) h += '<h2>Arranging with the customer</h2>' + arranging.map(x => openCard(x)).join('');
@@ -4874,6 +5185,7 @@ function wireVisits(d) {
   on('[data-tclear]', () => { VS.tc = ''; VS.ts = ''; loadVisits(); });
   on('[data-tv]', el => { VS.tv = Number(el.dataset.tv); loadVisits(); window.scrollTo(0, 0); });
   on('[data-tkback]', () => { VS.tv = null; loadVisits(); });
+  on('[data-vv]', el => { VS.vv = Number(el.dataset.vv); VS.lv = null; loadVisits(); window.scrollTo(0, 0); });
   on('[data-vc]', el => { VS.country = el.dataset.vc; VS.spec = ''; loadVisits(); });
   on('[data-vsp]', el => { VS.spec = el.dataset.vsp; loadVisits(); });
   on('[data-vw]', el => { VS.week = el.dataset.vw; loadVisits(); });

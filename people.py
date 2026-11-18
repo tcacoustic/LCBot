@@ -58,6 +58,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         from ops import start_cant_reason
         return await start_cant_reason(update, context, context.args[0][4:])
 
+    # From 📝 Note to the specialist under an On-Site request.
+    if context.args and context.args[0].startswith("oqn_"):
+        from onsite import start_rq_note
+        return await start_rq_note(update, context, context.args[0][4:])
+
     # From 📋 Open all in SH Bot under the 10am bump: the case list.
     if context.args and context.args[0] == "cases" and (status == "active" or is_owner(user.id)):
         from handover import cases_list
