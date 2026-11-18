@@ -1017,6 +1017,7 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
     fu_rows = sorted(fu_rows, key=followup_sort)
     return {
         "myDay": today_payload(user_id, country) if role == "specialist" else None,
+        "myRequests": my_onsite_requests(user_id) if role == "specialist" else [],
         "followups": [followup_item(v, user_id, role) for v in fu_rows],
         "open": [open_item(v, user_id, role) for v in open_rows if not v["followup_of"]],
         "myCountry": country if role == "specialist" else "",
@@ -1198,6 +1199,8 @@ def visit_buttons(v, user_id: int) -> InlineKeyboardMarkup:
     if mine and v["status"] == "ONSITE":
         rows.append([InlineKeyboardButton("📝 Open the visit form", url=VISIT_FORM_URL)])
         rows.append([InlineKeyboardButton("🏁 Leave", callback_data=f"vz:lv:{v['id']}")])
+    if mine and v["status"] in ("ONSITE", "COMPLETED"):
+        rows.append([InlineKeyboardButton("📦 Replacement / payment request", callback_data=f"oq:n:{v['id']}")])
     if (v["status"] == "COMPLETED" and v["outcome"] in ("RETURN", "REPLACE")
             and not v["followup_done"] and may_book(user_id)):
         rows.append([InlineKeyboardButton("✅ Follow-up done", callback_data=f"vz:fd:{v['id']}")])
@@ -1402,9 +1405,7 @@ async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def ask_method(query, appt_id: int) -> None:
     v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
     await edit_or_send(
-        query, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?",
-        InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=f"vz:pm:{appt_id}:{k}")
-                               for k, n in PAY_METHODS]]))
+        query, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?", pay_method_kb(appt_id))
 
 
 async def on_amount_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1445,8 +1446,7 @@ async def on_amount_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
     await update.message.reply_text(
         f"How did they pay {money_text(cents, cur)}?",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            n, callback_data=f"vz:pm:{appt_id}:{k}") for k, n in PAY_METHODS]]))
+        reply_markup=pay_method_kb(appt_id))
     return ConversationHandler.END
 
 
@@ -1461,10 +1461,21 @@ async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
     await unpin_visit(bot, appt_id)
     report = "🏁 Visit completed\n\n" + visit_text(v) + "\n\n" + report_lines(v)
     done = "✅ Done, the report has gone to SH. Thank you!\n\n" + report_lines(v)
-    if query is not None:
-        await edit_or_send(query, done)
+    kb = None
+    if v["outcome"] == "REPLACE":
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Send a replacement / payment request",
+                                                         callback_data=f"oq:n:{appt_id}")]])
+    if query is not None and not getattr(query.message, "photo", None):
+        await edit_or_send(query, done, kb)
     else:
-        await tell(bot, uid, done)
+        if query is not None:
+            try:
+                await query.edit_message_reply_markup(None)
+            except Exception:
+                pass
+        await tell(bot, uid, done, kb)
+    if v["outcome"] == "RESOLVED":
+        await send_review_qr(bot, uid)
     await tell(bot, v["created_by"], report)
     where = setting("visit_report_chat", "")
     if where:
@@ -1790,9 +1801,13 @@ async def on_ons_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return await ons_text_more(update, context, job, text)
 
 
+ONS_TEXT_HANDLERS = {}     # kind -> async fn(update, context, job, text) -> state
+
+
 async def ons_text_more(update, context, job: dict, text: str) -> int:
-    """Other typed steps (added with later features)."""
-    return ConversationHandler.END
+    """Other typed steps, by kind (requests, cab claims)."""
+    fn = ONS_TEXT_HANDLERS.get(job.get("kind"))
+    return await fn(update, context, job, text) if fn else ConversationHandler.END
 
 
 # --------------------------------------------------------------------------
@@ -1884,6 +1899,8 @@ def visit_screen(v, user_id: int) -> dict:
         "checklist": checklist_of(v), "ticks": ticks_of(v["id"]), "draft": CHECKLIST_DRAFT,
         "photos": photos_of(v["id"]), "formUrl": VISIT_FORM_URL,
         "mine": v["specialist_id"] == user_id,
+        "canRequest": may_request(v, user_id), "reviewQr": bool(REVIEW_URL),
+        "paynowReady": bool(PAYNOW_UEN) and v["country"] == "SG",
     }
     if v["status"] == "ONSITE":
         suggest = visit_charge(v["country"], max(1, visit_minutes(v)))
@@ -1970,6 +1987,452 @@ async def on_visit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                     f"({photos_of(v['id'])} so far).")
 
 
+ONS_PHOTO_HANDLERS = []    # async fn(update, context) -> True if it used the photo
+
+
 async def photo_for_other(update, context) -> bool:
-    """Other uses of a photo sent to the bot (added with later features)."""
+    """Other uses of a photo sent to the bot (e.g. a cab receipt)."""
+    for fn in ONS_PHOTO_HANDLERS:
+        if await fn(update, context):
+            return True
     return False
+
+
+# --------------------------------------------------------------------------
+# Replacement / payment requests: a fixed format posted to the SH x Ops chat
+# (set with /requestchat), with I'll handle it, Done and a Note back to the
+# specialist. No customer phone or address in the post.
+# --------------------------------------------------------------------------
+
+RQ_NEEDS = [("REPLACEMENT", "Replacement unit"), ("PART", "Part"), ("OTHER", "Other")]
+RQ_WARRANTY = [("IN", "In warranty"), ("OUT", "Out of warranty")]
+RQ_PAYS = [("LINK", "Payment link"), ("PAYNOW", "PayNow"), ("NONE", "No charge")]
+RQ_NEED_NAMES, RQ_WARRANTY_NAMES, RQ_PAYS_NAMES = dict(RQ_NEEDS), dict(RQ_WARRANTY), dict(RQ_PAYS)
+
+
+def may_request(v, user_id: int) -> bool:
+    return bool(v) and v["specialist_id"] == user_id and v["status"] in ("ONSITE", "COMPLETED")
+
+
+def create_onsite_request(user_id: int, appt_id: int, f: dict) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not may_request(v, user_id):
+        return None, "You can send a request for your own visit, on site or after it."
+    need, warranty, pays = (str(f.get(k) or "") for k in ("need", "warranty", "pays_by"))
+    if need not in RQ_NEED_NAMES:
+        return None, "Pick what's needed."
+    if warranty not in RQ_WARRANTY_NAMES:
+        return None, "Pick in or out of warranty."
+    if pays not in RQ_PAYS_NAMES:
+        return None, "Pick how the customer pays."
+    reason = str(f.get("reason") or "").strip()[:400]
+    if len(reason) < 3:
+        return None, "Say why in a few words."
+    price = None
+    raw = str(f.get("price") or "").replace(",", "").strip()
+    if raw:
+        try:
+            price = round(float(re.sub(r"^[A-Za-z$ ]+", "", raw)) * 100)
+        except ValueError:
+            return None, "Type the price as a number, or leave it empty (to confirm)."
+        if price < 0 or price > 10_000_000:
+            return None, "That price doesn't look right."
+    cur = run("INSERT INTO onsite_requests (appt_id, country, need, reason, warranty, price_cents, "
+              "currency, pays_by, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (appt_id, v["country"], need, reason, warranty, price, CURRENCY.get(v["country"], "SGD"),
+               pays, user_id, now().isoformat()))
+    log_visit(appt_id, user_id, "request", f"#{cur.lastrowid} {RQ_NEED_NAMES[need]}")
+    return cur.lastrowid, None
+
+
+def rq_text(r) -> str:
+    v = q1("SELECT * FROM appointments WHERE id=?", (r["appt_id"],))
+    tz = COUNTRY_TZ[r["country"]]
+    day = span_of(v)[0].astimezone(tz).strftime("%a %-d %b") if v else ""
+    price = money_text(r["price_cents"], r["currency"]) if r["price_cents"] is not None else "To confirm"
+    lines = [f"📦 <b>Replacement / payment request</b> · {COUNTRY_NAMES[r['country']].split(' ')[0]} {r['country']}",
+             f"Visit #{r['appt_id']} · {day}"]
+    if v and v["product"]:
+        lines.append(f"Product: {esc(v['product'])}")
+    lines += [f"Need: {RQ_NEED_NAMES[r['need']]}", f"Reason: {esc(r['reason'])}",
+              f"Warranty: {RQ_WARRANTY_NAMES[r['warranty']]}", f"Price: {price}",
+              f"Pays by: {RQ_PAYS_NAMES[r['pays_by']]}",
+              f"From: {esc(display_name_of(r['created_by'], 'the specialist'))}", ""]
+    if r["status"] == "OPEN":
+        lines.append("🔸 Open · nobody on it yet")
+    elif r["status"] == "TAKEN":
+        lines.append(f"🙋 {esc(display_name_of(r['taken_by'], 'Someone'))} is handling it")
+    else:
+        lines.append(f"✅ Done by {esc(display_name_of(r['done_by'], 'Someone'))}")
+    if r["note"]:
+        lines.append(f"📝 {esc(r['note'])}")
+    return "\n".join(lines)
+
+
+def rq_buttons(r, bot_username: str = "") -> InlineKeyboardMarkup | None:
+    rows = []
+    if r["status"] == "OPEN":
+        rows.append([InlineKeyboardButton("🙋 I'll handle it", callback_data=f"oq:t:{r['id']}")])
+    if r["status"] == "TAKEN":
+        rows.append([InlineKeyboardButton("✅ Done", callback_data=f"oq:d:{r['id']}")])
+    if r["status"] != "DONE" and bot_username:
+        rows.append([InlineKeyboardButton("📝 Note to the specialist",
+                                          url=f"https://t.me/{bot_username}?start=oqn_{r['id']}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def post_onsite_request(bot, rid: int) -> bool:
+    """Post to the request chat, or DM the On-Site admins if none is set."""
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+    where = setting("onsite_request_chat", "")
+    if where:
+        try:
+            target = json.loads(where)
+            kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
+            m = await bot.send_message(target["chat"], rq_text(r), parse_mode=constants.ParseMode.HTML,
+                                       reply_markup=rq_buttons(r, bot.username), **kw)
+            async with write_lock:
+                run("UPDATE onsite_requests SET chat_id=?, msg_id=? WHERE id=?", (m.chat_id, m.message_id, rid))
+            return True
+        except Exception as e:
+            log.info("Couldn't post On-Site request %s: %s", rid, e)
+    for uid in onsite_fyi_ids() or list(ADMIN_IDS):
+        try:
+            await bot.send_message(uid, rq_text(r) + "\n\n<i>No request chat is set yet: send "
+                                   "/requestchat in the SH x Ops chat.</i>", parse_mode=constants.ParseMode.HTML)
+        except Exception:
+            pass
+    return False
+
+
+async def refresh_onsite_request(bot, rid: int) -> None:
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+    if not r or not r["chat_id"]:
+        return
+    try:
+        await bot.edit_message_text(rq_text(r), chat_id=r["chat_id"], message_id=r["msg_id"],
+                                    parse_mode=constants.ParseMode.HTML,
+                                    reply_markup=rq_buttons(r, bot.username))
+    except BadRequest:
+        pass
+
+
+async def on_rq_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """oq:t:<id> I'll handle it · oq:d:<id> Done — in the request chat."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    uid = query.from_user.id
+    if agent_status(uid) != "active" and not is_owner(uid):
+        await query.answer("Only SH Bot members can do this.", show_alert=True)
+        return
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (int(raw),))
+    if not r:
+        await query.answer("That request is gone.", show_alert=True)
+        return
+    who = display_name_of(uid, "Someone")
+    async with write_lock:
+        if action == "t":
+            cur = run("UPDATE onsite_requests SET status='TAKEN', taken_by=?, taken_at=? WHERE id=? AND status='OPEN'",
+                      (uid, now().isoformat(), r["id"]))
+        else:
+            cur = run("UPDATE onsite_requests SET status='DONE', done_by=?, done_at=? WHERE id=? AND status='TAKEN'",
+                      (uid, now().isoformat(), r["id"]))
+    if not cur.rowcount:
+        await query.answer("Someone already did that.")
+        await refresh_onsite_request(context.bot, r["id"])
+        return
+    await query.answer("On it" if action == "t" else "Done")
+    await refresh_onsite_request(context.bot, r["id"])
+    await tell(context.bot, r["created_by"],
+               (f"🙋 {who} is handling your request for visit #{r['appt_id']} "
+                f"({RQ_NEED_NAMES[r['need']]})." if action == "t" else
+                f"✅ {who} marked your request for visit #{r['appt_id']} done "
+                f"({RQ_NEED_NAMES[r['need']]})."))
+
+
+async def start_rq_note(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
+    """/start oqn_<id>, from 📝 Note to the specialist under a request."""
+    uid = update.effective_user.id
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (int(raw),)) if raw.isdigit() else None
+    if not r or (agent_status(uid) != "active" and not is_owner(uid)):
+        await update.message.reply_text("That request is gone.")
+        return ConversationHandler.END
+    context.user_data["ons"] = {"kind": "rq_note", "id": r["id"]}
+    await update.message.reply_text(
+        f"📝 Note to {display_name_of(r['created_by'], 'the specialist')} about visit #{r['appt_id']} "
+        f"({RQ_NEED_NAMES[r['need']]}). Type it in one message, e.g. unit ships Fri, or payment link sent."
+        "\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def _rq_note_text(update, context, job, text) -> int:
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (job["id"],))
+    if not r or not text:
+        await update.message.reply_text("Nothing was sent.")
+        return ConversationHandler.END
+    async with write_lock:
+        run("UPDATE onsite_requests SET note=? WHERE id=?", (text[:500], r["id"]))
+    await tell(context.bot, r["created_by"], f"📝 Note on your request for visit #{r['appt_id']}:\n\n{text[:500]}"
+               f"\n— {display_name_of(update.effective_user.id, 'SH x Ops')}")
+    await refresh_onsite_request(context.bot, r["id"])
+    await update.message.reply_text("✅ Sent to the specialist, and added under the request.")
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["rq_note"] = _rq_note_text
+
+
+async def cmd_requestchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/requestchat (admins, inside a group) — On-Site replacement / payment
+    requests are posted here. /requestchat off — stop."""
+    if not admin_for(update.effective_user.id, "ONSITE", "SH"):
+        return
+    chat = update.effective_chat
+    if context.args and context.args[0].lower() == "off":
+        async with write_lock:
+            set_setting("onsite_request_chat", "")
+        await update.message.reply_text("On-Site requests now go to the On-Site admins by DM.")
+        return
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        await update.message.reply_text("Send this inside the SH x Ops chat where requests should go.")
+        return
+    thread = update.message.message_thread_id if update.message.is_topic_message else None
+    async with write_lock:
+        set_setting("onsite_request_chat", json.dumps({"chat": chat.id, "thread": thread}))
+    await update.message.reply_text("✅ On-Site replacement / payment requests will be posted here.")
+
+
+# The request form in /visits: need → warranty → pays by → reason (typed) → send.
+RQ_STEPS = [("need", RQ_NEEDS, "What's needed?"), ("warranty", RQ_WARRANTY, "Warranty?"),
+            ("pays_by", RQ_PAYS, "How does the customer pay?")]
+
+
+def rq_draft_key(appt_id: int, uid: int) -> str:
+    return f"rq_draft:{appt_id}:{uid}"
+
+
+def rq_draft(appt_id: int, uid: int) -> dict:
+    try:
+        return json.loads(setting(rq_draft_key(appt_id, uid), "") or "{}")
+    except ValueError:
+        return {}
+
+
+def rq_chat_view(v, d: dict, step: int) -> tuple:
+    """(text, keyboard) for step 0-2 (picks), 3 (reason), 4 (send)."""
+    head = [f"📦 Replacement / payment request · visit #{v['id']}", f"{v['customer_name']}"
+            + (f" · {v['product']}" if v["product"] else "")]
+    names = {"need": RQ_NEED_NAMES, "warranty": RQ_WARRANTY_NAMES, "pays_by": RQ_PAYS_NAMES}
+    for k, label in (("need", "Need"), ("warranty", "Warranty"), ("pays_by", "Pays by")):
+        if d.get(k):
+            head.append(f"{label}: {names[k][d[k]]}")
+    if d.get("reason"):
+        head.append(f"Reason: {d['reason']}")
+    head.append("Price: to confirm")
+    vid = v["id"]
+    back = f"oq:s:{vid}:{step - 1}" if step > 0 else f"vz:v:{vid}"
+    if step < 3:
+        key, opts, question = RQ_STEPS[step]
+        rows = [[InlineKeyboardButton(("✅ " if d.get(key) == k else "") + n, callback_data=f"oq:p:{vid}:{step}:{k}")]
+                for k, n in opts]
+        text = "\n".join(head) + "\n\n" + question
+    elif step == 3:
+        rows = [[InlineKeyboardButton("✏️ Type the reason" if not d.get("reason") else "✏️ Change the reason",
+                                      callback_data=f"oq:r:{vid}")]]
+        if d.get("reason"):
+            rows.append([InlineKeyboardButton("Next ›", callback_data=f"oq:s:{vid}:4")])
+        text = "\n".join(head) + "\n\nWhy is it needed? One line, e.g. won't power on, fault confirmed on site."
+    else:
+        rows = [[InlineKeyboardButton("✅ Send to SH x Ops", callback_data=f"oq:k:{vid}")]]
+        text = "\n".join(head) + "\n\nSend it?"
+    rows.append([InlineKeyboardButton("‹ Back", callback_data=back)])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def on_rq_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """oq:n:<visit> start · oq:p:<visit>:<step>:<key> pick · oq:s:<visit>:<step> go to
+    a step · oq:k:<visit> send — the request form in /visits."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, vid, uid = parts[1], int(parts[2]), query.from_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_request(v, uid):
+        await query.answer("That's not open for a request.", show_alert=True)
+        return
+    d = rq_draft(vid, uid)
+    step = 0
+    if action == "n":
+        d = {}
+    elif action == "p":
+        step = int(parts[3])
+        d[RQ_STEPS[step][0]] = parts[4]
+        step += 1
+    elif action == "s":
+        step = max(0, min(4, int(parts[3])))
+    elif action == "k":
+        async with write_lock:
+            rid, err = create_onsite_request(uid, vid, d)
+            if not err:
+                set_setting(rq_draft_key(vid, uid), "")
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        await query.answer("Sent")
+        posted = await post_onsite_request(context.bot, rid)
+        await edit_or_send(query, ("✅ Sent to SH x Ops. You'll get a message when someone picks it up."
+                                   if posted else "✅ Sent to the On-Site admins (no request chat is set yet)."),
+                           InlineKeyboardMarkup([[InlineKeyboardButton("◀️ All visits", callback_data="vz:lst")]]))
+        return
+    async with write_lock:
+        set_setting(rq_draft_key(vid, uid), json.dumps(d))
+    await query.answer()
+    text, kb = rq_chat_view(v, d, step)
+    await edit_or_send(query, text, kb)
+
+
+async def on_rq_reason_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """oq:r:<visit> — type the reason."""
+    query = update.callback_query
+    vid = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_request(v, query.from_user.id):
+        await query.answer("That's not open for a request.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "rq_reason", "id": vid}
+    await edit_or_send(query, "Type why it's needed, in one message.\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def _rq_reason_text(update, context, job, text) -> int:
+    uid = update.effective_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (job["id"],))
+    if not may_request(v, uid):
+        return ConversationHandler.END
+    async with write_lock:
+        d = rq_draft(v["id"], uid)
+        d["reason"] = text[:400]
+        set_setting(rq_draft_key(v["id"], uid), json.dumps(d))
+    t, kb = rq_chat_view(v, d, 4)
+    await update.message.reply_text(t, reply_markup=kb)
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["rq_reason"] = _rq_reason_text
+
+
+def my_onsite_requests(user_id: int) -> list:
+    out = []
+    for r in q("SELECT * FROM onsite_requests WHERE created_by=? ORDER BY id DESC LIMIT 30", (user_id,)):
+        out.append({"id": r["id"], "visit": r["appt_id"], "need": RQ_NEED_NAMES[r["need"]],
+                    "status": r["status"], "reason": r["reason"],
+                    "who": display_name_of(r["taken_by"] or r["done_by"], "") if r["taken_by"] else "",
+                    "note": r["note"] or "",
+                    "when": datetime.fromisoformat(r["created_at"]).astimezone(TZ).strftime("%a %-d %b")})
+    return out
+
+
+# --------------------------------------------------------------------------
+# QR codes: PayNow (a real SGQR only when PAYNOW_UEN is set, otherwise a
+# clearly marked SAMPLE that isn't a payment code) and the review link.
+# --------------------------------------------------------------------------
+
+PAYNOW_UEN = os.environ.get("PAYNOW_UEN", "").strip()
+PAYNOW_NAME = os.environ.get("PAYNOW_NAME", "").strip() or "TC Acoustic"
+REVIEW_URL = os.environ.get("REVIEW_URL", "").strip()
+
+
+def _tlv(tag: str, val: str) -> str:
+    return f"{tag}{len(val):02d}{val}"
+
+
+def _crc16(data: str) -> str:
+    crc = 0xFFFF
+    for ch in data.encode():
+        crc ^= ch << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else (crc << 1)
+            crc &= 0xFFFF
+    return f"{crc:04X}"
+
+
+def paynow_payload(cents: int, ref: str) -> str:
+    """SGQR / PayNow to a UEN, fixed amount, with a reference."""
+    acct = _tlv("00", "SG.PAYNOW") + _tlv("01", "2") + _tlv("02", PAYNOW_UEN) + _tlv("03", "0")
+    s = (_tlv("00", "01") + _tlv("01", "12") + _tlv("26", acct) + _tlv("52", "0000") + _tlv("53", "702")
+         + _tlv("54", f"{cents / 100:.2f}") + _tlv("58", "SG") + _tlv("59", PAYNOW_NAME[:25])
+         + _tlv("60", "Singapore") + _tlv("62", _tlv("01", ref[:25])) + "6304")
+    return s + _crc16(s)
+
+
+def qr_png(text: str) -> bytes | None:
+    try:
+        import io
+        import segno
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    segno.make(text, error="m").save(buf, kind="png", scale=8, border=3)
+    return buf.getvalue()
+
+
+def paynow_qr(v, cents: int) -> dict:
+    """{'sample': bool, 'png': bytes|None, 'ref': str}. Real only for SG with PAYNOW_UEN."""
+    ref = f"V{v['id']}"
+    if PAYNOW_UEN and v["country"] == "SG":
+        return {"sample": False, "png": qr_png(paynow_payload(cents, ref)), "ref": ref}
+    return {"sample": True, "png": qr_png(f"SAMPLE ONLY - NOT A PAYMENT CODE - visit {ref}"), "ref": ref}
+
+
+def data_uri(png: bytes | None) -> str:
+    import base64
+    return "data:image/png;base64," + base64.b64encode(png).decode() if png else ""
+
+
+async def send_paynow_qr(bot, chat_id: int, v) -> None:
+    qr = paynow_qr(v, v["amount_cents"] or 0)
+    cap = (f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
+           f"{money_text(v['amount_cents'] or 0, v['currency'] or 'SGD')} · Reference {qr['ref']}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Customer has paid", callback_data=f"vz:pm:{v['id']}:PAYNOW")],
+                               [InlineKeyboardButton("‹ Back", callback_data=f"vq:b:{v['id']}")]])
+    if qr["png"]:
+        await bot.send_photo(chat_id, qr["png"], caption=cap, reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, cap, reply_markup=kb)
+
+
+async def send_review_qr(bot, chat_id: int) -> None:
+    if not REVIEW_URL:
+        return
+    png = qr_png(REVIEW_URL)
+    cap = "⭐ Show this to the customer: scan to leave us a review."
+    try:
+        if png:
+            await bot.send_photo(chat_id, png, caption=cap)
+        else:
+            await bot.send_message(chat_id, f"{cap}\n{REVIEW_URL}")
+    except Exception as e:
+        log.info("Couldn't send the review QR: %s", e)
+
+
+async def on_paynow_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vq:p:<id> show the PayNow QR · vq:b:<id> back to how they paid."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(raw),))
+    if not v or v["specialist_id"] != query.from_user.id or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return
+    await query.answer()
+    if action == "p":
+        await send_paynow_qr(context.bot, query.from_user.id, v)
+    else:
+        await context.bot.send_message(query.from_user.id, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?",
+                                       reply_markup=pay_method_kb(v["id"]))
+
+
+def pay_method_kb(appt_id: int) -> InlineKeyboardMarkup:
+    """Cash / Other finish straight away; PayNow first shows the QR."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=(f"vq:p:{appt_id}" if k == "PAYNOW"
+                                                                          else f"vz:pm:{appt_id}:{k}"))
+                                  for k, n in PAY_METHODS]])

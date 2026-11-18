@@ -565,6 +565,28 @@ if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
 if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
+# On-Site replacement / payment requests, posted to the SH x Ops chat.
+db.execute("""CREATE TABLE IF NOT EXISTS onsite_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    appt_id     INTEGER NOT NULL,
+    country     TEXT NOT NULL,
+    need        TEXT NOT NULL,       -- REPLACEMENT, PART, OTHER
+    reason      TEXT NOT NULL,
+    warranty    TEXT NOT NULL,       -- IN, OUT
+    price_cents INTEGER,             -- NULL = to confirm
+    currency    TEXT,
+    pays_by     TEXT NOT NULL,       -- LINK, PAYNOW, NONE
+    status      TEXT NOT NULL DEFAULT 'OPEN',   -- OPEN, TAKEN, DONE
+    created_by  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    taken_by    INTEGER,
+    taken_at    TEXT,
+    done_by     INTEGER,
+    done_at     TEXT,
+    note        TEXT,
+    chat_id     INTEGER,
+    msg_id      INTEGER
+)""")
 # Follow-up visits: the visit it follows on from, and how urgent it is.
 _ap_cols = {r[1] for r in db.execute("PRAGMA table_info(appointments)")}
 for _col in ("urgency TEXT", "followup_of INTEGER"):
@@ -3173,6 +3195,7 @@ ADMIN_GROUPS = [
         ("specialists", "On-Site Specialists by country"),
         ("visits", "On-Site visits and follow-ups"),
         ("visitchat", "Post On-Site visit reports in this group"),
+        ("requestchat", "Post On-Site replacement / payment requests in this group"),
         ("request", "Send a special request to Ops"),
         ("requests", "Special requests still open"),
         ("opschat", "Post special requests in this group (Ops)"),
@@ -3262,7 +3285,7 @@ ONLINE_COMMANDS = [
 # not listed is a Livechat tool (the week, slots, hours and pay).
 ADMIN_TEAMS = {
     "onchat": ("ON",), "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
-    "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
+    "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",), "requestchat": ("ONSITE", "SH"),
     "departments": (), "access": (), "roster": (), "pending": (),
     "request": ("SH", "LIVECHAT", "ON", "FS"), "requests": ("OPS",), "opschat": ("OPS",), "opsrounds": ("OPS",),
 }
@@ -4783,6 +4806,23 @@ function todayView(d) {
     h += '<div class="empty">No visits coming up.</div>';
   }
   h += '<h2>' + esc(t.label || 'Today') + '</h2>';
+  h += todayList(t);
+  h += requestsList(d);
+  return h;
+}
+
+const RQ_TAG = { OPEN: ['amber', 'WAITING'], TAKEN: ['blue', 'BEING HANDLED'], DONE: ['green', 'DONE'] };
+function requestsList(d) {
+  const rs = d.myRequests || [];
+  if (!rs.length) return '';
+  return '<h2>Your requests</h2>' + rs.map(r => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+    + esc(r.need) + ' · #' + r.visit + '</span><span class="tag ' + RQ_TAG[r.status][0] + '">' + RQ_TAG[r.status][1] + '</span></div>'
+    + '<div class="meta">' + esc(r.when) + (r.who ? ' · ' + esc(r.who) : '') + ' · ' + esc(r.reason) + '</div>'
+    + (r.note ? '<div class="body">📝 ' + esc(r.note) + '</div>' : '') + '</div>').join('');
+}
+
+function todayList(t) {
+  let h = '';
   if (!t.items.length) h += '<div class="empty">Nothing booked today.</div>';
   for (const it of t.items) {
     const st = it.status === 'COMPLETED' ? 'done' : it.status === 'ONSITE' ? 'on site' : '';
@@ -4830,7 +4870,29 @@ function visitScreen(v) {
     h += '<button class="big" data-leave="' + v.id + '">🏁 Leave</button>';
   }
   if (v.status === 'COMPLETED' && v.report) h += '<div class="case"><div class="body">' + esc(v.report) + '</div></div>';
+  if (v.status === 'COMPLETED' && v.reviewQr) h += '<button class="big ghost" data-rvqr="' + v.id + '">⭐ Show review QR</button><div id="rvbox"></div>';
+  if (v.canRequest) h += VS.rq ? rqForm(v) : '<button class="big ghost" data-rqopen="1">📦 Replacement / payment request</button>';
   return h;
+}
+
+function rqForm(v) {
+  const f = VS.rq;
+  const pick = (k, val, name) => '<button data-rqf="' + k + '" data-v="' + val + '" class="' + (f[k] === val ? 'on' : '') + '">' + name + '</button>';
+  let h = '<h2>Replacement / payment request</h2><div class="note">Goes to the SH x Ops chat. No customer phone or address is posted.</div>';
+  h += '<div class="fld"><label>Visit</label><input value="#' + v.id + ' · ' + esc(v.product || v.type) + '" disabled></div>';
+  h += '<div class="fld"><label>Need</label><div class="pick">' + pick('need', 'REPLACEMENT', 'Replacement unit') + pick('need', 'PART', 'Part') + pick('need', 'OTHER', 'Other') + '</div></div>';
+  h += '<div class="fld"><label>Reason</label><textarea id="rq_reason" rows="2" placeholder="Won’t power on, fault confirmed on site">' + esc(f.reason || '') + '</textarea></div>';
+  h += '<div class="fld"><label>Warranty</label><div class="pick">' + pick('warranty', 'IN', 'In warranty') + pick('warranty', 'OUT', 'Out of warranty') + '</div></div>';
+  h += '<div class="fld"><label>Price (' + esc(v.currency || 'SGD') + ', leave empty if to confirm)</label><input id="rq_price" inputmode="decimal" value="' + esc(f.price || '') + '"></div>';
+  h += '<div class="fld"><label>Customer pays by</label><div class="pick">' + pick('pays_by', 'LINK', 'Payment link') + pick('pays_by', 'PAYNOW', 'PayNow') + pick('pays_by', 'NONE', 'No charge') + '</div></div>';
+  h += '<button class="big" id="rqSend">Send to SH x Ops</button><button class="big ghost" id="rqBack2">Back</button>';
+  return h;
+}
+
+function keepRq() {
+  if (!VS.rq) return;
+  const r = document.getElementById('rq_reason'), p = document.getElementById('rq_price');
+  if (r) VS.rq.reason = r.value; if (p) VS.rq.price = p.value;
 }
 
 function leaveForm(v) {
@@ -4843,6 +4905,7 @@ function leaveForm(v) {
     if (!f.noCharge) {
       h += '<div class="fld"><label>Amount</label><input id="lf_amount" inputmode="decimal" value="' + esc(f.amount || '') + '"></div>';
       h += '<div class="fld"><label>How did the customer pay?</label><div class="pick">' + pick('method', 'CASH', 'Cash') + pick('method', 'PAYNOW', 'PayNow') + pick('method', 'OTHER', 'Other') + '</div></div>';
+      if (f.method === 'PAYNOW') h += '<button class="big ghost" data-pnqr="' + v.id + '">Show PayNow QR</button><div id="pnbox"></div>';
     }
   }
   if (f.outcome === 'RETURN') {
@@ -4873,7 +4936,7 @@ async function loadVisitScreen(d) {
   app.innerHTML = visitScreen(v) + navBar();
   wireVisits(d);
   const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
-  on('[data-vvback]', () => { VS.vv = null; VS.lv = null; loadVisits(); });
+  on('[data-vvback]', () => { VS.vv = null; VS.lv = null; VS.rq = null; loadVisits(); });
   on('[data-arrive]', async el => {
     el.disabled = true;
     const r = await post('/api/visit/arrive', { id: v.id });
@@ -4886,6 +4949,35 @@ async function loadVisitScreen(d) {
     loadVisits();
   });
   on('[data-leave]', () => { VS.lv = { urgency: 'MEDIUM' }; loadVisits(); });
+  const qrImg = (img, sample, caption) => '<div class="case" style="text-align:center">' + (sample ? '<div class="warn">SAMPLE — not a payment code. PayNow isn’t set up yet.</div>' : '')
+    + (img ? '<img src="' + img + '" style="width:240px;max-width:100%;image-rendering:pixelated">' : '') + '<div class="meta">' + esc(caption) + '</div></div>';
+  on('[data-pnqr]', async () => {
+    keepLeave();
+    const r = await post('/api/visit/paynow', { id: v.id, amount: VS.lv.amount });
+    if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
+    document.getElementById('pnbox').innerHTML = qrImg(r.img, r.sample, r.amount + ' · Reference ' + r.ref);
+  });
+  on('[data-rvqr]', async () => {
+    const r = await post('/api/visit/reviewqr', {});
+    if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
+    document.getElementById('rvbox').innerHTML = qrImg(r.img, false, 'Scan to leave us a review');
+  });
+  on('[data-rqopen]', () => { VS.rq = {}; loadVisits(); });
+  on('[data-rqf]', el => { keepRq(); VS.rq[el.dataset.rqf] = el.dataset.v; loadVisits(); });
+  const rb = document.getElementById('rqBack2');
+  if (rb) rb.onclick = () => { VS.rq = null; loadVisits(); };
+  const rs = document.getElementById('rqSend');
+  if (rs) rs.onclick = async () => {
+    keepRq();
+    const f = VS.rq;
+    if (!f.need || !f.warranty || !f.pays_by) { toast('Pick the need, warranty and how they pay.'); return; }
+    if (!f.reason || f.reason.trim().length < 3) { toast('Say why in a few words.'); return; }
+    rs.disabled = true;
+    const r = await post('/api/visit/request', Object.assign({ id: v.id }, f));
+    rs.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
+    VS.rq = null; toast(r.posted ? 'Sent to SH x Ops' : 'Sent to the On-Site admins (no request chat set yet)'); loadVisits();
+  };
   on('[data-lf]', el => { keepLeave(); VS.lv[el.dataset.lf] = el.dataset.v; loadVisits(); });
   const back = document.getElementById('lfBack');
   if (back) back.onclick = () => { VS.lv = null; loadVisits(); };
@@ -4900,7 +4992,7 @@ async function loadVisitScreen(d) {
     const r = await post('/api/visit/leave', Object.assign({ id: v.id }, f, { later: !!f.later, noCharge: !!f.noCharge }));
     save.disabled = false;
     if (!r.ok) { toast(r.error || 'Could not save that.'); return; }
-    VS.lv = null; VS.vv = null;
+    VS.lv = null; if (f.outcome !== 'RESOLVED') VS.vv = null;
     toast(f.outcome === 'RETURN' && !f.later ? 'Done. The next visit is booked and pinned in your chat.' : 'Done. The report has gone to SH.');
     loadVisits();
   };
