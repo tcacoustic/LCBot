@@ -1029,6 +1029,10 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
         "weekLabel": f"{first.strftime('%-d %b')} – {(first + timedelta(days=6)).strftime('%-d %b')}",
         "today": today.isoformat(), "days": days,
         "canTrack": bool(tracker_countries(user_id)),
+        "me": ({"name": display_name_of(user_id, "You"),
+                "teams": [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id)],
+                "country": country, "countryName": COUNTRY_NAMES.get(country, country)}
+               if role == "specialist" else None),
     }
 
 
