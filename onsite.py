@@ -514,6 +514,8 @@ async def on_reschedule_answer(update: Update, context: ContextTypes.DEFAULT_TYP
         disable_web_page_preview=True)
     await tell(context.bot, asker,
                f"{answer} moving {v['customer_name']}'s visit.\n\n" + visit_text(v))
+    if action == "ra" and setting(f"visit_pin:{appt_id}", ""):
+        await pin_next_visit(context.bot, appt_id)
 
 
 def cancel_visit(appt_id: int, user_id: int, reason: str = "") -> tuple:
@@ -532,6 +534,7 @@ async def notify_cancelled(bot, appt_id: int, reason: str = "") -> None:
                              "AND action='cancelled' ORDER BY id DESC LIMIT 1",
                              (appt_id,))["user_id"], "SH")
     await close_handover_msgs(bot, appt_id, "🚫 Cancelled")
+    await unpin_visit(bot, appt_id)
     await tell(bot, v["specialist_id"],
                f"🚫 {who} cancelled a visit" + (f": {reason}" if reason else "")
                + "\n\n" + (visit_text(v) if has_time(appt_id) else handover_text(v, True)))
@@ -929,6 +932,7 @@ def visit_item(v, role: str) -> dict:
         "specialist": display_name_of(v["specialist_id"], ""),
         "bookedBy": booker_name(v["created_by"]) if v["created_by"] else "", "proposed": proposed,
         "canChange": role == "booker" and v["status"] == "SCHEDULED",
+        "followup": URGENCY_NAMES.get(v["urgency"] or "MEDIUM", "") if v["followup_of"] else "",
     }
 
 
@@ -1004,8 +1008,16 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
     else:
         open_rows = q("SELECT * FROM appointments WHERE country=? AND status IN ('WAITING','ARRANGING') "
                       "ORDER BY created_at", (country,))
+    if role == "specialist":
+        fu_rows = q("SELECT * FROM appointments WHERE specialist_id=? AND followup_of IS NOT NULL "
+                    "AND status IN ('SCHEDULED','ARRANGING','ONSITE')", (user_id,))
+    else:
+        fu_rows = q("SELECT * FROM appointments WHERE country=? AND followup_of IS NOT NULL "
+                    "AND status IN ('SCHEDULED','ARRANGING','ONSITE')", (country,))
+    fu_rows = sorted(fu_rows, key=followup_sort)
     return {
-        "open": [open_item(v, user_id, role) for v in open_rows],
+        "followups": [followup_item(v, user_id, role) for v in fu_rows],
+        "open": [open_item(v, user_id, role) for v in open_rows if not v["followup_of"]],
         "myCountry": country if role == "specialist" else "",
         "role": role, "countries": countries, "country": country, "specId": spec_id,
         "types": [{"key": k, "name": n} for k, n in VISIT_TYPES],
@@ -1153,7 +1165,7 @@ def tracker_payload(user_id: int, week: str = "") -> dict:
 # The specialist's day in the bot: /visits, Arrived, Leave, payment, report
 # --------------------------------------------------------------------------
 
-OUTCOMES = [("RESOLVED", "✅ Resolved"), ("RETURN", "🔁 Needs a return visit"),
+OUTCOMES = [("RESOLVED", "✅ Resolved"), ("RETURN", "🔁 Not finished, need to come back"),
             ("REPLACE", "📦 Needs a replacement unit")]
 OUTCOME_NAMES = dict(OUTCOMES)
 PAY_METHODS = [("CASH", "Cash"), ("PAYNOW", "PayNow"), ("OTHER", "Other")]
@@ -1211,6 +1223,15 @@ def report_lines(v) -> str:
         lines.append(f"Paid: {money_text(v['amount_cents'], v['currency'])} by "
                      f"{dict(PAY_METHODS).get(v['pay_method'], v['pay_method'])}"
                      if v["amount_cents"] else "No charge")
+    elif v["outcome"] == "RETURN" and next_visit_of(v["id"]):
+        nxt = next_visit_of(v["id"])
+        lines.append("No charge for this visit.")
+        why = nf_reason_text(v["id"])
+        if why:
+            lines.append(f"Why: {why}")
+        lines.append(f"Next visit: {when_text(nxt)}" if nxt["status"] != "ARRANGING"
+                     else "Next visit: the customer will confirm the date")
+        lines.append(f"Urgency: {URGENCY_NAMES.get(nxt['urgency'] or 'MEDIUM')}")
     elif v["followup_done"]:
         lines.append("Follow-up: done")
     else:
@@ -1238,9 +1259,12 @@ def visits_list(user_id: int) -> tuple:
             rows.append([InlineKeyboardButton(
                 f"⚠️ Follow-up · {v['customer_name']} · {OUTCOME_NAMES[v['outcome']][2:]}"[:60],
                 callback_data=f"vz:v:{v['id']}")])
+    found = sorted(found, key=followup_sort)
     for v in found[:40]:
         s = datetime.fromisoformat(v["starts_at"])
         mark = "📍 " if v["status"] == "ONSITE" else ""
+        if v["followup_of"]:
+            mark += f"🔴 FOLLOW-UP · {URGENCY_NAMES.get(v['urgency'] or 'MEDIUM', '').upper()} · "
         rows.append([InlineKeyboardButton(
             f"{mark}{s.strftime('%a %-d %b %H:%M')} · {v['customer_name']}"[:60],
             callback_data=f"vz:v:{v['id']}")])
@@ -1328,6 +1352,9 @@ async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             run("UPDATE appointments SET outcome=?, left_at=? WHERE id=?",
                 (outcome, now().isoformat(), v["id"]))
         await query.answer()
+        if outcome == "RETURN":
+            await nf_step(query, v["id"], "r")
+            return
         if outcome != "RESOLVED":
             await finish_visit(context.bot, query, v["id"], uid)
             return
@@ -1430,6 +1457,7 @@ async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
             "WHERE id=?", (now().isoformat(), appt_id))
         v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
         log_visit(appt_id, uid, "completed", OUTCOME_NAMES.get(v["outcome"], "")[2:])
+    await unpin_visit(bot, appt_id)
     report = "🏁 Visit completed\n\n" + visit_text(v) + "\n\n" + report_lines(v)
     done = "✅ Done, the report has gone to SH. Thank you!\n\n" + report_lines(v)
     if query is not None:
@@ -1465,3 +1493,302 @@ async def cmd_visitchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     async with write_lock:
         set_setting("visit_report_chat", json.dumps({"chat": chat.id, "thread": thread}))
     await update.message.reply_text("✅ On-Site visit reports will be posted here too.")
+
+
+# --------------------------------------------------------------------------
+# Not finished: no charge, say why, and book the next visit before leaving.
+# The next visit is a new appointment (followup_of = this one) for the same
+# specialist, pinned in their chat with the bot until it's done.
+# --------------------------------------------------------------------------
+
+NF_REASONS = [("PART", "Need a part"), ("TIME", "Out of time"),
+              ("NOTREADY", "Customer not ready"), ("OTHER", "Other")]
+NF_REASON_NAMES = dict(NF_REASONS)
+URGENCY = [("HIGH", "High"), ("MEDIUM", "Medium"), ("LOW", "Low")]
+URGENCY_NAMES = dict(URGENCY)
+URGENCY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+NEXT_TIMES = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00"]
+NEXT_DAYS = 14
+ONS_TEXT, ONS_PHOTO = 290, 291      # typed notes / amounts, and photos, in chat
+
+
+def followup_sort(v) -> tuple:
+    """Follow-ups first, most urgent first, then by date and time."""
+    if not v["followup_of"]:
+        return (1, 9, v["starts_at"])
+    return (0, URGENCY_RANK.get(v["urgency"] or "MEDIUM", 1), v["starts_at"])
+
+
+def next_visit_of(appt_id: int):
+    return q1("SELECT * FROM appointments WHERE followup_of=? AND status!='CANCELLED' "
+              "ORDER BY id DESC LIMIT 1", (appt_id,))
+
+
+def nf_reason_text(appt_id: int) -> str:
+    row = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='not finished' "
+             "ORDER BY id DESC LIMIT 1", (appt_id,))
+    return (row["note"] if row else "") or ""
+
+
+def nf_draft(appt_id: int) -> dict:
+    try:
+        return json.loads(setting(f"nf_draft:{appt_id}", "") or "{}")
+    except ValueError:
+        return {}
+
+
+def save_nf_draft(appt_id: int, d: dict) -> None:
+    set_setting(f"nf_draft:{appt_id}", json.dumps(d))
+
+
+def followup_item(v, user_id: int, role: str) -> dict:
+    tz = COUNTRY_TZ[v["country"]]
+    mine = v["specialist_id"] == user_id
+    item = {
+        "id": v["id"], "of": v["followup_of"], "status": v["status"], "country": v["country"],
+        "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+        "urgency": URGENCY_NAMES.get(v["urgency"] or "MEDIUM", "Medium"),
+        "customer": v["customer_name"], "postal": v["postal"] or "", "product": v["product"] or "",
+        "when": (span_of(v)[0].astimezone(tz).strftime("%a %-d %b, %H:%M")
+                 if v["status"] != "ARRANGING" else "Customer will confirm the date"),
+        "why": nf_reason_text(v["followup_of"]),
+        "specialist": "You" if mine else display_name_of(v["specialist_id"], ""),
+        "canSet": v["status"] == "ARRANGING" and (mine or admin_for(user_id, "ONSITE")),
+    }
+    if role == "booker" or mine:
+        item.update(phone=v["phone"] or "", address=v["address"], map=map_link(v))
+    return item
+
+
+def book_followup(appt_id: int, user_id: int, d: dict) -> tuple:
+    """Close a visit that didn't finish (no charge) and make the next one.
+    d: reason, note, urgency, and date + time, or later=True.
+    Returns (new id, None) or (None, error)."""
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] != "ONSITE" or v["specialist_id"] != user_id:
+        return None, "That visit isn't open on your side any more."
+    reason = str(d.get("reason") or "")
+    if reason not in NF_REASON_NAMES:
+        return None, "Pick why it didn't finish."
+    urgency = str(d.get("urgency") or "MEDIUM")
+    if urgency not in URGENCY_NAMES:
+        urgency = "MEDIUM"
+    note = str(d.get("note") or "").strip()[:300]
+    later = bool(d.get("later"))
+    start = now()
+    if not later:
+        try:
+            start = local_start(v["country"], str(d.get("date", "")), str(d.get("time", "")))
+        except (ValueError, TypeError):
+            return None, "Pick the date and time for the next visit."
+        if start < now():
+            return None, "That time has already passed."
+        busy = clash(user_id, start, start + timedelta(minutes=v["duration_min"]), exclude_id=appt_id)
+        if busy:
+            return None, f"That clashes: you {clash_phrase(busy)}. Pick another time."
+    cur = run(
+        "INSERT INTO appointments (country, specialist_id, visit_type, starts_at, duration_min,"
+        " customer_name, phone, email, address, postal, product, issue, order_no, status,"
+        " created_by, created_at, urgency, followup_of) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (v["country"], user_id, v["visit_type"], start.isoformat(), v["duration_min"],
+         v["customer_name"], v["phone"], v["email"], v["address"], v["postal"], v["product"],
+         v["issue"], v["order_no"], "ARRANGING" if later else "SCHEDULED",
+         v["created_by"] or user_id, now().isoformat(), urgency, appt_id))
+    new_id = cur.lastrowid
+    why = NF_REASON_NAMES[reason] + (f": {note}" if note else "")
+    log_visit(new_id, user_id, "follow-up", f"of #{appt_id} · {why}")
+    if not later:
+        log_visit(new_id, user_id, "booked")
+    run("UPDATE appointments SET outcome='RETURN', left_at=COALESCE(left_at, ?), amount_cents=0, "
+        "currency=NULL, pay_method=NULL, followup_done=1 WHERE id=?", (now().isoformat(), appt_id))
+    log_visit(appt_id, user_id, "not finished", why)
+    set_setting(f"nf_draft:{appt_id}", "")
+    return new_id, None
+
+
+async def pin_next_visit(bot, appt_id: int) -> None:
+    """Pin the next visit at the top of the specialist's chat with the bot."""
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] != "SCHEDULED" or not v["specialist_id"]:
+        return
+    await unpin_visit(bot, appt_id)
+    tz = COUNTRY_TZ[v["country"]]
+    when = span_of(v)[0].astimezone(tz).strftime("%a %-d %b, %H:%M")
+    lines = [f"📌 Next visit #{v['id']} · {when}",
+             f"{COUNTRY_NAMES[v['country']]} · {VISIT_NAMES.get(v['visit_type'], v['visit_type'])}",
+             f"{v['customer_name']}" + (f" · {v['postal']}" if v["postal"] else ""),
+             f"🔴 Follow-up · {URGENCY_NAMES.get(v['urgency'] or 'MEDIUM')}"]
+    if v["product"]:
+        lines.append(f"Product: {v['product']}")
+    why = nf_reason_text(v["followup_of"]) if v["followup_of"] else ""
+    if why:
+        lines.append(f"Last time: {why}")
+    try:
+        m = await bot.send_message(v["specialist_id"], "\n".join(lines),
+                                   reply_markup=visit_buttons(v, v["specialist_id"]),
+                                   disable_web_page_preview=True)
+        await bot.pin_chat_message(v["specialist_id"], m.message_id, disable_notification=True)
+        async with write_lock:
+            set_setting(f"visit_pin:{appt_id}", f"{v['specialist_id']}:{m.message_id}")
+    except Exception as e:
+        log.info("Couldn't pin visit %s: %s", appt_id, e)
+
+
+async def unpin_visit(bot, appt_id: int) -> None:
+    raw = setting(f"visit_pin:{appt_id}", "")
+    if not raw:
+        return
+    try:
+        uid, mid = (int(x) for x in raw.split(":"))
+        await bot.unpin_chat_message(chat_id=uid, message_id=mid)
+    except Exception as e:
+        log.info("Couldn't unpin visit %s: %s", appt_id, e)
+    async with write_lock:
+        set_setting(f"visit_pin:{appt_id}", "")
+
+
+def nf_summary(v, d: dict) -> str:
+    lines = [f"🔁 Not finished · {v['customer_name']} (#{v['id']})", "No charge for this visit."]
+    if d.get("reason"):
+        lines.append(f"Why: {NF_REASON_NAMES[d['reason']]}" + (f" · {d['note']}" if d.get("note") else ""))
+    if d.get("urgency"):
+        lines.append(f"Urgency: {URGENCY_NAMES[d['urgency']]}")
+    if d.get("later"):
+        lines.append("Next visit: the customer will confirm the date")
+    elif d.get("date"):
+        day = date.fromisoformat(d["date"]).strftime("%a %-d %b")
+        lines.append(f"Next visit: {day}" + (f", {d['time']}" if d.get("time") else ""))
+    return "\n".join(lines)
+
+
+def nf_keyboard(v, step: str, d: dict) -> InlineKeyboardMarkup:
+    vid = v["id"]
+    back = {"r": f"vz:lv:{vid}", "u": f"vn:b:{vid}:r", "d": f"vn:b:{vid}:u",
+            "t": f"vn:b:{vid}:d", "k": f"vn:b:{vid}:{'d' if d.get('later') else 't'}"}[step]
+    rows = []
+    if step == "r":
+        rows = [[InlineKeyboardButton(("✅ " if d.get("reason") == k else "") + n,
+                                      callback_data=f"vn:r:{vid}:{k}")] for k, n in NF_REASONS]
+    elif step == "u":
+        rows = [[InlineKeyboardButton(("✅ " if d.get("urgency") == k else "") + n,
+                                      callback_data=f"vn:u:{vid}:{k}") for k, n in URGENCY]]
+        rows.append([InlineKeyboardButton("✏️ Add a note" if not d.get("note") else "✏️ Change the note",
+                                          callback_data=f"vn:n:{vid}")])
+    elif step == "d":
+        today = datetime.now(COUNTRY_TZ[v["country"]]).date()
+        days = [today + timedelta(days=i) for i in range(NEXT_DAYS)]
+        btns = [InlineKeyboardButton(x.strftime("%a %-d %b"), callback_data=f"vn:d:{vid}:{x.strftime('%Y%m%d')}")
+                for x in days]
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        rows.append([InlineKeyboardButton("🕓 Customer will confirm later", callback_data=f"vn:l:{vid}")])
+    elif step == "t":
+        times = NEXT_TIMES
+        day = d.get("date", "")
+        if day == datetime.now(COUNTRY_TZ[v["country"]]).date().isoformat():
+            times = [t for t in NEXT_TIMES if local_start(v["country"], day, t) > now()]
+        btns = [InlineKeyboardButton(t, callback_data=f"vn:t:{vid}:{t.replace(':', '')}") for t in times]
+        rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+    elif step == "k":
+        rows = [[InlineKeyboardButton("✅ Done, close this visit" if d.get("later")
+                                      else "✅ Book the next visit", callback_data=f"vn:k:{vid}")]]
+    rows.append([InlineKeyboardButton("‹ Back", callback_data=back)])
+    return InlineKeyboardMarkup(rows)
+
+
+NF_QUESTIONS = {"r": "Why didn't it finish?", "u": "How urgent is the next visit?",
+                "d": "When is the next visit? Agree it with the customer before you leave.",
+                "t": "What time?", "k": "All good?"}
+
+
+async def nf_step(query, appt_id: int, step: str) -> None:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    d = nf_draft(appt_id)
+    await edit_or_send(query, nf_summary(v, d) + "\n\n" + NF_QUESTIONS[step], nf_keyboard(v, step, d))
+
+
+async def on_nf_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vn:r reason · vn:u urgency · vn:d date · vn:t time · vn:l later ·
+    vn:b back · vn:k book — the not-finished steps in /visits."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, appt_id = parts[1], int(parts[2])
+    uid = query.from_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != uid or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return
+    d = nf_draft(appt_id)
+    nxt = None
+    if action == "r" and parts[3] in NF_REASON_NAMES:
+        d["reason"], nxt = parts[3], "u"
+    elif action == "u" and parts[3] in URGENCY_NAMES:
+        d["urgency"], nxt = parts[3], "d"
+    elif action == "d":
+        d["date"] = f"{parts[3][:4]}-{parts[3][4:6]}-{parts[3][6:]}"
+        d.pop("later", None)
+        nxt = "t"
+    elif action == "t":
+        d["time"] = f"{parts[3][:2]}:{parts[3][2:]}"
+        nxt = "k"
+    elif action == "l":
+        d["later"] = True
+        d.pop("date", None), d.pop("time", None)
+        nxt = "k"
+    elif action == "b":
+        nxt = parts[3]
+    elif action == "k":
+        async with write_lock:
+            new_id, err = book_followup(appt_id, uid, d)
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        await query.answer("Booked" if not d.get("later") else "Done")
+        await finish_visit(context.bot, query, appt_id, uid)
+        await pin_next_visit(context.bot, new_id)
+        return
+    if nxt is None:
+        await query.answer()
+        return
+    async with write_lock:
+        save_nf_draft(appt_id, d)
+    await query.answer()
+    await nf_step(query, appt_id, nxt)
+
+
+async def on_nf_note_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """vn:n:<id> — type a note about why it didn't finish."""
+    query = update.callback_query
+    appt_id = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != query.from_user.id or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "nf_note", "id": appt_id}
+    await edit_or_send(query, "Type the note in one message, e.g. bracket too short, bring the long one."
+                              "\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def on_ons_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Typed text for the On-Site chat steps."""
+    job = context.user_data.pop("ons", None) or {}
+    text = (update.message.text or "").strip()
+    if job.get("kind") == "nf_note":
+        appt_id = job["id"]
+        v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+        if not v or v["status"] != "ONSITE":
+            return ConversationHandler.END
+        async with write_lock:
+            d = nf_draft(appt_id)
+            d["note"] = text[:300]
+            save_nf_draft(appt_id, d)
+        await update.message.reply_text(nf_summary(v, d) + "\n\n" + NF_QUESTIONS["u"],
+                                        reply_markup=nf_keyboard(v, "u", d))
+        return ConversationHandler.END
+    return await ons_text_more(update, context, job, text)
+
+
+async def ons_text_more(update, context, job: dict, text: str) -> int:
+    """Other typed steps (added with later features)."""
+    return ConversationHandler.END
