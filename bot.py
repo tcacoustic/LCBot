@@ -556,6 +556,9 @@ def main() -> None:
                 SR_REASON: [   # /start srx_<id> from ✏️ Other reason under Can't do
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_cant_reason_text)
                 ],
+                ONS_TEXT: [    # /start oqn_<id> from 📝 Note under an On-Site request
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_ons_text)
+                ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
@@ -748,7 +751,8 @@ def main() -> None:
     # On-Site typed steps: a note on a visit that didn't finish (and later more).
     app.add_handler(
         ConversationHandler(
-            entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:\d+$")],
+            entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:\d+$"),
+                          CallbackQueryHandler(on_rq_reason_start, pattern=r"^oq:r:\d+$")],
             states={ONS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ons_text)]},
             fallbacks=[CommandHandler("cancel", cancel)],
             allow_reentry=True,
@@ -756,6 +760,10 @@ def main() -> None:
         )
     )
     app.add_handler(CallbackQueryHandler(on_nf_button, pattern=r"^vn:[rudtlbk]:\d+(:\w+)?$"))
+    app.add_handler(CallbackQueryHandler(on_rq_form, pattern=r"^oq:[npsk]:\d+(:\w+)*$"))
+    app.add_handler(CallbackQueryHandler(on_rq_button, pattern=r"^oq:[td]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_paynow_button, pattern=r"^vq:[pb]:\d+$"))
+    app.add_handler(CommandHandler("requestchat", cmd_requestchat))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))
