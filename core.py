@@ -3820,7 +3820,10 @@ const ICONS = {
   visits: 'M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zM12 8a2 2 0 1 0 0 4a2 2 0 1 0 0-4',
   team: 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6',
   shield: 'M12 3l7 3v5c0 4.5-3 8.3-7 10c-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4',
-  news: 'M3 10v4h3l6 4V6L6 10zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12'
+  news: 'M3 10v4h3l6 4V6L6 10zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12',
+  inbox: 'M4 13l3-8h10l3 8v6H4zM4 13h5l1 3h4l1-3h5',
+  list: 'M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01',
+  user: 'M12 12a4 4 0 1 0 0-8a4 4 0 1 0 0 8zM4 21c0-4 3.6-7 8-7s8 3 8 7'
 };
 function icon(path) {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
@@ -3842,7 +3845,12 @@ function caseTags(c, extra) {
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
               ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'],
-              people: [ICONS.shield, 'People'], updates: [ICONS.news, 'Updates'] };
+              people: [ICONS.shield, 'People'], updates: [ICONS.news, 'Updates'],
+              today: [ICONS.week, 'Today'], hov: [ICONS.inbox, 'Handovers'], oreq: [ICONS.list, 'Requests'],
+              prof: [ICONS.user, 'Me'] };
+// On-Site Specialists get five tabs of their own: Today, Visits, Handovers, Requests, Me.
+const SPEC_VIEWS = ['today', 'hov', 'oreq', 'prof'];
+const isSpecTabs = () => !!(TABS && TABS[0] === 'today');
 let TAB_NAMES = {};
 function navBar() {
   const tabs = ADMIN_MODE ? ADMIN_TABS
@@ -3983,6 +3991,7 @@ async function loadHome() {
 function renderTeamHome(d) {
   const app = document.getElementById('app');
   TABS = d.tabs || null; TAB_NAMES = d.tabNames || {}; CAN_REQUEST = !!d.canRequest;
+  if (isSpecTabs()) { VIEW = 'today'; return loadVisits(); }
   if (d.teamHome === 'ON') ONLINE = true;
   const card = (n, l, wide) => `<div class="card${wide ? ' wide' : ''}"><div class="n">${esc(String(n))}</div><div class="l">${esc(l)}</div></div>`;
   const cards = list => '<div class="cards" style="margin-top:20px">'
@@ -4145,7 +4154,11 @@ function wire() {
     el.onclick = () => { AGENT = Number(el.dataset.agent); START = ''; render(); };
   });
   document.querySelectorAll('.nav-bar div').forEach(el => {
-    el.onclick = () => { VIEW = el.dataset.v; START = ''; AGENT = PERSON = APPROVE = null; render(); };
+    el.onclick = () => {
+      VIEW = el.dataset.v; START = ''; AGENT = PERSON = APPROVE = null;
+      if (isSpecTabs()) { VS.vv = VS.lv = VS.rq = VS.cab = VS.form = null; VS.tv = null; window.scrollTo(0, 0); }
+      render();
+    };
   });
   document.querySelectorAll('.tab').forEach(el => {
     el.onclick = () => { VIEW = el.dataset.v; START = ''; render(); };
@@ -4798,14 +4811,15 @@ const TK_STATUS = { waiting: ['purple', 'Waiting'], arranging: ['teal', 'Arrangi
 
 function trackerSwitch(d) {
   const b = (k, n) => '<button data-vmode="' + k + '" class="' + (VS.mode === k ? 'on' : '') + '">' + n + '</button>';
-  return '<div class="otabs">' + (d && d.role === 'specialist' ? b('today', 'Today') : '') + b('sched', 'Schedule')
+  return '<div class="otabs">' + (d && d.role === 'specialist' && !isSpecTabs() ? b('today', 'Today') : '') + b('sched', 'Schedule')
        + (!d || d.canTrack ? b('track', 'Tracker') : '') + '</div>';
 }
 
 // The specialist's Today: the next visit with Directions and Call, then the day.
 function todayView(d) {
   const t = d.myDay || { items: [] };
-  let h = '<h1>Today</h1><div class="sub">' + esc(t.label || '') + '</div>' + trackerSwitch(d);
+  const five = isSpecTabs();
+  let h = '<h1>Today</h1><div class="sub">' + esc(t.label || '') + '</div>' + (five ? '' : trackerSwitch(d));
   if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
   const n = t.next;
   if (n) {
@@ -4822,7 +4836,7 @@ function todayView(d) {
   }
   h += '<h2>' + esc(t.label || 'Today') + '</h2>';
   h += todayList(t);
-  h += requestsList(d);
+  if (!five) h += requestsList(d);
   return h;
 }
 
@@ -4856,7 +4870,7 @@ function todayList(t) {
 
 // One visit: Arrived, the checklist, photos and Leave.
 function visitScreen(v) {
-  let h = '<div class="back" data-vvback="1">‹ ' + (VS.mode === 'today' ? 'Today' : 'Visits') + '</div>';
+  let h = '<div class="back" data-vvback="1">‹ ' + (isSpecTabs() ? (NAV[VIEW] || NAV.vis)[1] : VS.mode === 'today' ? 'Today' : 'Visits') + '</div>';
   h += '<h1>' + esc(v.customer) + '</h1><div class="sub">' + (REGION_FLAGS[v.country] || '') + ' ' + esc(v.when) + ' · ' + esc(v.type)
      + (v.status === 'ONSITE' ? ' · on site ' + esc(v.onSite) : '') + '</div>';
   h += '<div class="tags" style="margin:6px 0 10px">'
@@ -5135,12 +5149,17 @@ async function loadVisits() {
     wireVisits(d);
     return;
   }
+  if (isSpecTabs()) { VS.mode = VIEW === 'today' ? 'today' : (VS.mode === 'track' ? 'track' : 'sched'); VS.modeSet = true; }
   if (d.role === 'specialist' && !VS.modeSet) { VS.mode = 'today'; VS.modeSet = true; }
   if (!d.canTrack && VS.mode === 'track') VS.mode = 'sched';
   if (d.role !== 'specialist' && VS.mode === 'today') VS.mode = 'sched';
   if (VS.vv) return loadVisitScreen(d);
+  if (isSpecTabs() && VIEW !== 'today' && VIEW !== 'vis') {
+    const view = { hov: handoversView, oreq: requestsView, prof: meView }[VIEW];
+    app.innerHTML = view(d) + navBar(); wireVisits(d); wireSpecTabs(); return;
+  }
   if (VS.mode === 'track') return loadTracker(d);
-  if (VS.mode === 'today') { app.innerHTML = todayView(d) + navBar(); wireVisits(d); return; }
+  if (VS.mode === 'today') { app.innerHTML = todayView(d) + navBar(); wireVisits(d); if (isSpecTabs()) addNewsCard(); return; }
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
   if (d.canTrack || d.role === 'specialist') h += trackerSwitch(d);
   if (d.role === 'booker') {
@@ -5155,13 +5174,15 @@ async function loadVisits() {
     }
     h += '<button class="big" id="bookNew" style="margin:6px 0 4px">Hand over to On-Site</button>';
     h += requestButton();
-  } else {
+  } else if (!isSpecTabs()) {
     h += '<button class="big ghost" id="addOwn" style="margin:6px 0 4px">+ Add appointment</button>';
   }
   if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
   const waiting = d.open.filter(x => x.status === 'waiting'), arranging = d.open.filter(x => x.status === 'arranging');
-  if (waiting.length) h += '<h2>Waiting for a specialist</h2>' + waiting.map(x => openCard(x)).join('');
-  if (arranging.length) h += '<h2>Arranging with the customer</h2>' + arranging.map(x => openCard(x)).join('');
+  if (!isSpecTabs()) {
+    if (waiting.length) h += '<h2>Waiting for a specialist</h2>' + waiting.map(x => openCard(x)).join('');
+    if (arranging.length) h += '<h2>Arranging with the customer</h2>' + arranging.map(x => openCard(x)).join('');
+  }
   if (d.role === 'specialist') h += '<h2>Booked</h2>';
   h += '<div class="otabs small"><button data-vw="' + d.prev + '">◀ Prev</button>'
      + '<button class="on">' + esc(d.weekLabel) + '</button>'
@@ -5172,6 +5193,50 @@ async function loadVisits() {
   }
   app.innerHTML = h + navBar();
   wireVisits(d);
+}
+
+// Handovers tab: new ones in their country, the ones they're arranging, and their own.
+function handoversView(d) {
+  const waiting = d.open.filter(x => x.status === 'waiting'), arranging = d.open.filter(x => x.status === 'arranging');
+  const c = (d.me && d.me.country) || d.country;
+  let h = '<h1>Handovers</h1><div class="sub">' + esc((d.me && d.me.countryName) || ((REGION_FLAGS[c] || '') + ' ' + c)) + '</div>';
+  h += '<button class="big ghost" id="addOwn" style="margin:6px 0 4px">+ Add your own customer</button>';
+  h += '<h2>Waiting for a specialist</h2>';
+  h += waiting.length ? waiting.map(x => openCard(x)).join('') : '<div class="empty">No new handovers right now.</div>';
+  if (arranging.length) h += '<h2>Yours to arrange with the customer</h2>' + arranging.map(x => openCard(x)).join('');
+  return h;
+}
+
+// Requests tab: replacement / payment requests and cab claims, then a visit to start a new one from.
+function requestsView(d) {
+  let h = '<h1>Requests</h1><div class="sub">Replacement / payment requests and cab claims</div>';
+  const list = requestsList(d);
+  h += list || '<div class="empty">Nothing sent yet.</div>';
+  const seen = {}, recent = [];
+  for (const it of (d.myDay ? d.myDay.items : [])) { if (!seen[it.id]) { seen[it.id] = 1; recent.push({ id: it.id, when: it.start, customer: it.customer, type: it.type }); } }
+  for (const day of d.days) for (const it of day.items) {
+    if (it.kind === 'visit' && !seen[it.id]) { seen[it.id] = 1; recent.push({ id: it.id, when: day.label + ' ' + it.start, customer: it.customer, type: it.type }); }
+  }
+  h += '<h2>New request or cab claim</h2><div class="note">Pick the visit, then tap 📦 Replacement / payment request or 🚕 Cab claim.</div>';
+  h += recent.length ? recent.slice(0, 12).map(v => '<div class="case tk-v" data-vv="' + v.id + '"><div class="nm"><span>'
+      + esc(v.when) + ' · ' + esc(v.customer) + '</span></div><div class="meta">#' + v.id + ' · ' + esc(v.type) + ' ›</div></div>').join('')
+    : '<div class="empty">No visits this week.</div>';
+  return h;
+}
+
+// Me tab: who they are, and the Feedback button.
+function meView(d) {
+  const m = d.me || {};
+  let h = '<h1>' + esc(m.name || 'Me') + '</h1><div class="sub">' + esc((m.teams || []).join(' + ') || 'On-Site') + '</div>';
+  h += '<div class="case"><div class="meta">Country</div><div class="nm">' + esc(m.countryName || ((REGION_FLAGS[m.country] || '') + ' ' + (m.country || ''))) + '</div></div>';
+  h += '<button class="big ghost" id="meFb" style="margin-top:14px">🔧 Send feedback</button>';
+  h += '<div class="note">Ideas, problems or questions go straight to the team that runs the bot.</div>';
+  return h;
+}
+
+function wireSpecTabs() {
+  const fb = document.getElementById('meFb');
+  if (fb) fb.onclick = () => { FB.back = VIEW; VIEW = 'fb'; render(); };
 }
 
 function wireVisits(d) {
@@ -5659,7 +5724,8 @@ async function loadRequest() {
 
 // Feedback: a button on every screen, straight to the owner by DM.
 const SCREEN_NAMES = { home: 'Home', week: 'Week', me: 'Hours', ho: 'Handover', vis: 'Visits',
-                       team: 'Team', req: 'Special request' };
+                       team: 'Team', req: 'Special request', today: 'Today', hov: 'Handovers',
+                       oreq: 'Requests', prof: 'Me' };
 let FB = { back: 'home', kind: 'IDEA', text: '' };
 function feedbackButton() {
   if (document.getElementById('fbBtn')) return;
@@ -5922,7 +5988,7 @@ let UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL']
 async function addNewsCard() {
   let d;
   try { d = await getJSON('/api/updates'); } catch (e) { return; }
-  if (VIEW !== 'home' || !d.items.length || document.getElementById('newsCard')) return;
+  if ((VIEW !== 'home' && VIEW !== 'today') || !d.items.length || document.getElementById('newsCard')) return;
   const sub = document.querySelector('#app .sub');
   if (!sub) return;
   const el = document.createElement('div');
@@ -6044,7 +6110,7 @@ async function render() {
     catch (e) { showFatal('The request form would not load', e.message || e); }
     return;
   }
-  if (VIEW === 'vis') {
+  if (VIEW === 'vis' || SPEC_VIEWS.includes(VIEW)) {
     try { await loadVisits(); }
     catch (e) { showFatal('Visits would not load', e.message || e); }
     return;
