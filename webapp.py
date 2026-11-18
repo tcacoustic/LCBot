@@ -205,7 +205,18 @@ LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "l
 LOGO_FILES = {"shopee.png", "lazada.png", "tc.png", "tc-white.png"}
 
 
+# On-Site Specialists (and nothing else) get their own five tabs.
+SPECIALIST_TABS = ["today", "vis", "hov", "oreq", "prof"]
+
+
+def specialist_tabs(user_id: int) -> bool:
+    return (visit_role(user_id) == "specialist" and not is_livechat(user_id)
+            and not online_view(user_id))
+
+
 def app_tabs(user_id: int) -> list:
+    if specialist_tabs(user_id):
+        return list(SPECIALIST_TABS)
     depts, tabs = depts_of(user_id), set()
     if is_livechat(user_id) or team_home_kind(user_id):
         tabs.add("home")
@@ -227,7 +238,7 @@ def tab_names(user_id: int) -> dict:
     names = {}
     if online_view(user_id):
         names["ho"] = "Cases"
-    if visit_role(user_id) == "specialist":
+    if visit_role(user_id) == "specialist" and not specialist_tabs(user_id):
         names["vis"] = "My visits"
     return names
 
