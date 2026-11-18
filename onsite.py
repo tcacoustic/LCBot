@@ -1018,6 +1018,7 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
     return {
         "myDay": today_payload(user_id, country) if role == "specialist" else None,
         "myRequests": my_onsite_requests(user_id) if role == "specialist" else [],
+        "myClaims": my_cab_claims(user_id) if role == "specialist" else [],
         "followups": [followup_item(v, user_id, role) for v in fu_rows],
         "open": [open_item(v, user_id, role) for v in open_rows if not v["followup_of"]],
         "myCountry": country if role == "specialist" else "",
@@ -1201,6 +1202,7 @@ def visit_buttons(v, user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🏁 Leave", callback_data=f"vz:lv:{v['id']}")])
     if mine and v["status"] in ("ONSITE", "COMPLETED"):
         rows.append([InlineKeyboardButton("📦 Replacement / payment request", callback_data=f"oq:n:{v['id']}")])
+        rows.append([InlineKeyboardButton("🚕 Cab claim", callback_data=f"cb:n:{v['id']}")])
     if (v["status"] == "COMPLETED" and v["outcome"] in ("RETURN", "REPLACE")
             and not v["followup_done"] and may_book(user_id)):
         rows.append([InlineKeyboardButton("✅ Follow-up done", callback_data=f"vz:fd:{v['id']}")])
@@ -1901,6 +1903,7 @@ def visit_screen(v, user_id: int) -> dict:
         "mine": v["specialist_id"] == user_id,
         "canRequest": may_request(v, user_id), "reviewQr": bool(REVIEW_URL),
         "paynowReady": bool(PAYNOW_UEN) and v["country"] == "SG",
+        "canClaim": may_claim(v, user_id),
     }
     if v["status"] == "ONSITE":
         suggest = visit_charge(v["country"], max(1, visit_minutes(v)))
@@ -2436,3 +2439,214 @@ def pay_method_kb(appt_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=(f"vq:p:{appt_id}" if k == "PAYNOW"
                                                                           else f"vz:pm:{appt_id}:{k}"))
                                   for k, n in PAY_METHODS]])
+
+
+# --------------------------------------------------------------------------
+# Cab claims: the specialist claims a ride to or from a visit with the amount
+# and a receipt photo; On-Site admins approve or reject with a reason.
+# --------------------------------------------------------------------------
+
+CAB_TRIPS = [("TO", "To the visit"), ("FROM", "From the visit"), ("BOTH", "Both ways")]
+CAB_TRIP_NAMES = dict(CAB_TRIPS)
+CAB_REJECT = [("RECEIPT", "Receipt unclear"), ("LIMIT", "Over the limit"),
+              ("NOTVISIT", "Not for a visit"), ("OTHER", "Other")]
+CAB_REJECT_NAMES = dict(CAB_REJECT)
+CAB_STATUS = {"RECEIPT": "Waiting for the receipt", "PENDING": "Waiting for approval",
+              "APPROVED": "Approved", "REJECTED": "Rejected"}
+
+
+def may_claim(v, user_id: int) -> bool:
+    return bool(v) and v["specialist_id"] == user_id and v["status"] in ("ONSITE", "COMPLETED")
+
+
+def create_cab_claim(user_id: int, appt_id: int, trip: str, amount: str) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not may_claim(v, user_id):
+        return None, "Claim against your own visit, once you've arrived."
+    if trip not in CAB_TRIP_NAMES:
+        return None, "Pick the trip."
+    try:
+        cents = round(float(re.sub(r"^[A-Za-z$ ]+", "", str(amount or "").replace(",", "").strip())) * 100)
+    except ValueError:
+        cents = 0
+    if cents <= 0 or cents > 100_000:
+        return None, "Type the fare, e.g. 18.40."
+    # One claim waits for its receipt at a time: an older one still waiting is dropped.
+    run("DELETE FROM cab_claims WHERE user_id=? AND status='RECEIPT'", (user_id,))
+    cur = run("INSERT INTO cab_claims (appt_id, user_id, trip, amount_cents, currency, created_at) "
+              "VALUES (?,?,?,?,?,?)", (appt_id, user_id, trip, cents, CURRENCY.get(v["country"], "SGD"),
+                                       now().isoformat()))
+    return cur.lastrowid, None
+
+
+def cab_text(c) -> str:
+    v = q1("SELECT * FROM appointments WHERE id=?", (c["appt_id"],))
+    tz = COUNTRY_TZ[v["country"]] if v else TZ
+    day = span_of(v)[0].astimezone(tz).strftime("%a %-d %b") if v else ""
+    flag = COUNTRY_NAMES[v["country"]].split(" ")[0] + " " + v["country"] if v else ""
+    lines = [f"🚕 Cab claim · {flag}", f"From: {display_name_of(c['user_id'], 'a specialist')}",
+             f"Visit #{c['appt_id']} · {day}" + (f" · {v['postal']}" if v and v["postal"] else ""),
+             f"Trip: {CAB_TRIP_NAMES[c['trip']]}", f"Amount: {money_text(c['amount_cents'], c['currency'])}"]
+    if c["status"] == "APPROVED":
+        lines.append(f"\n✅ Approved by {display_name_of(c['decided_by'], 'an admin')}")
+    elif c["status"] == "REJECTED":
+        lines.append(f"\n❌ Rejected by {display_name_of(c['decided_by'], 'an admin')}: {c['reason']}")
+    return "\n".join(lines)
+
+
+def cab_admins() -> list:
+    return onsite_fyi_ids() or list(ADMIN_IDS)
+
+
+def cab_kb(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"cb:a:{cid}"),
+                                  InlineKeyboardButton("❌ Reject", callback_data=f"cb:r:{cid}")]])
+
+
+async def send_cab_to_admins(bot, cid: int) -> None:
+    c = q1("SELECT * FROM cab_claims WHERE id=?", (cid,))
+    sent = []
+    for uid in cab_admins():
+        try:
+            m = await bot.send_photo(uid, c["receipt"], caption=cab_text(c), reply_markup=cab_kb(cid))
+            sent.append([uid, m.message_id])
+        except Exception as e:
+            log.info("Couldn't send cab claim %s to %s: %s", cid, uid, e)
+    async with write_lock:
+        set_setting(f"cab_msgs:{cid}", json.dumps(sent))
+
+
+async def _cab_receipt_photo(update, context) -> bool:
+    """A photo while a cab claim waits for its receipt is that receipt."""
+    uid = update.effective_user.id
+    c = q1("SELECT * FROM cab_claims WHERE user_id=? AND status='RECEIPT' ORDER BY id DESC LIMIT 1", (uid,))
+    if not c:
+        return False
+    async with write_lock:
+        run("UPDATE cab_claims SET receipt=?, status='PENDING' WHERE id=?",
+            (update.message.photo[-1].file_id, c["id"]))
+    await update.message.reply_text(f"✅ Cab claim sent for approval: "
+                                    f"{money_text(c['amount_cents'], c['currency'])}, "
+                                    f"{CAB_TRIP_NAMES[c['trip']].lower()}. You'll hear back here.")
+    await send_cab_to_admins(context.bot, c["id"])
+    return True
+
+
+ONS_PHOTO_HANDLERS.append(_cab_receipt_photo)
+
+
+async def on_cab_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cb:n:<visit> start (pick the trip) in /visits."""
+    query = update.callback_query
+    vid = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_claim(v, query.from_user.id):
+        await query.answer("Claim against your own visit, once you've arrived.", show_alert=True)
+        return
+    await query.answer()
+    rows = [[InlineKeyboardButton(n, callback_data=f"cb:p:{vid}:{k}")] for k, n in CAB_TRIPS]
+    rows.append([InlineKeyboardButton("‹ Back", callback_data=f"vz:v:{vid}")])
+    await edit_or_send(query, f"🚕 Cab claim · visit #{vid} · {v['customer_name']}\n\nWhich trip?",
+                       InlineKeyboardMarkup(rows))
+
+
+async def on_cab_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """cb:p:<visit>:<TRIP> — then type the fare."""
+    query = update.callback_query
+    _, _, raw, trip = query.data.split(":")
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(raw),))
+    if not may_claim(v, query.from_user.id) or trip not in CAB_TRIP_NAMES:
+        await query.answer("That step is already done.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "cab_amount", "id": v["id"], "trip": trip}
+    await edit_or_send(query, f"🚕 {CAB_TRIP_NAMES[trip]} · visit #{v['id']}\n\n"
+                              f"Type the fare in {CURRENCY.get(v['country'], 'SGD')}, e.g. 18.40.\n/cancel to stop",
+                       InlineKeyboardMarkup([[InlineKeyboardButton("‹ Back", callback_data=f"cb:n:{v['id']}")]]))
+    return ONS_TEXT
+
+
+async def _cab_amount_text(update, context, job, text) -> int:
+    uid = update.effective_user.id
+    async with write_lock:
+        cid, err = create_cab_claim(uid, job["id"], job["trip"], text)
+    if err:
+        context.user_data["ons"] = job
+        await update.message.reply_text(err + " Or /cancel.")
+        return ONS_TEXT
+    await update.message.reply_text("📷 Now send a photo of the receipt here.")
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["cab_amount"] = _cab_amount_text
+
+
+async def on_cab_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cb:a:<id> approve · cb:r:<id> reject (pick why) · cb:x:<id>:<KEY> reject
+    with that reason · cb:b:<id> back."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, cid, uid = parts[1], int(parts[2]), query.from_user.id
+    if not admin_for(uid, "ONSITE"):
+        await query.answer("Only On-Site admins approve cab claims.", show_alert=True)
+        return
+    c = q1("SELECT * FROM cab_claims WHERE id=?", (cid,))
+    if not c or c["status"] != "PENDING":
+        await query.answer("Already decided.")
+        return
+    if action == "r":
+        await query.answer()
+        rows = [[InlineKeyboardButton(n, callback_data=f"cb:x:{cid}:{k}")] for k, n in CAB_REJECT]
+        rows.append([InlineKeyboardButton("‹ Back", callback_data=f"cb:b:{cid}")])
+        await query.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+        return
+    if action == "b":
+        await query.answer()
+        await query.edit_message_reply_markup(cab_kb(cid))
+        return
+    if action == "x" and parts[3] in CAB_REJECT_NAMES:
+        status, reason = "REJECTED", CAB_REJECT_NAMES[parts[3]]
+    elif action == "a":
+        status, reason = "APPROVED", None
+    else:
+        await query.answer()
+        return
+    async with write_lock:
+        cur = run("UPDATE cab_claims SET status=?, reason=?, decided_by=?, decided_at=? WHERE id=? AND status='PENDING'",
+                  (status, reason, uid, now().isoformat(), cid))
+    if not cur.rowcount:
+        await query.answer("Already decided.")
+        return
+    await query.answer("Approved" if status == "APPROVED" else "Rejected")
+    c = q1("SELECT * FROM cab_claims WHERE id=?", (cid,))
+    try:
+        sent = json.loads(setting(f"cab_msgs:{cid}", "") or "[]")
+    except ValueError:
+        sent = []
+    for chat_id, mid in sent:
+        try:
+            await context.bot.edit_message_caption(chat_id=chat_id, message_id=mid, caption=cab_text(c), reply_markup=None)
+        except Exception:
+            pass
+    await tell(context.bot, c["user_id"],
+               (f"✅ Your cab claim was approved: {money_text(c['amount_cents'], c['currency'])} "
+                f"for visit #{c['appt_id']}." if status == "APPROVED" else
+                f"❌ Your cab claim of {money_text(c['amount_cents'], c['currency'])} for visit "
+                f"#{c['appt_id']} was rejected: {reason}. Ask {display_name_of(uid, 'the admin')} if unsure."))
+
+
+def my_cab_claims(user_id: int) -> list:
+    return [{"id": c["id"], "visit": c["appt_id"], "trip": CAB_TRIP_NAMES[c["trip"]],
+             "amount": money_text(c["amount_cents"], c["currency"]), "status": c["status"],
+             "statusName": CAB_STATUS[c["status"]], "reason": c["reason"] or "",
+             "when": datetime.fromisoformat(c["created_at"]).astimezone(TZ).strftime("%a %-d %b")}
+            for c in q("SELECT * FROM cab_claims WHERE user_id=? ORDER BY id DESC LIMIT 30", (user_id,))]
+
+
+async def cab_from_app(user_id: int, appt_id: int, trip: str, amount: str) -> dict:
+    async with write_lock:
+        cid, err = create_cab_claim(user_id, appt_id, trip, amount)
+    if err:
+        return {"ok": False, "error": err}
+    await tell(bot_ref(), user_id, f"📷 Send a photo of the receipt here for your cab claim (visit #{appt_id}).")
+    return {"ok": True}
