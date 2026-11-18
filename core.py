@@ -4028,7 +4028,7 @@ function renderTeamHome(d) {
     h += '<div class="p tappable" data-gotovis="1" style="margin-top:14px"><div class="pn">'
        + plural(d.waiting, 'handover') + ' waiting' + (d.arranging ? ' · ' + d.arranging + ' you’re arranging' : '')
        + '</div><div class="t">Take one in My visits</div></div>';
-    h += '<div class="note">At the visit, send /visits to the bot to tap 🚗 Arrived and 🏁 Leave.</div>';
+    h += '<div class="note">At the visit, open it in My visits to tap 🚗 Arrived and 🏁 Leave (or send /visits).</div>';
   } else if (d.teamHome === 'ON') {
     h += hero('Open on your channels', plural(d.open, 'case'),
               d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
