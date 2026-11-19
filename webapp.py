@@ -862,6 +862,9 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         if err:
             return {"ok": False, "error": err}
         posted = on_bot_loop(post_onsite_request(bot_ref(), rid), timeout=15)
+        if b.get("pays_by") == "LINK":
+            on_bot_loop(post_finance_link(bot_ref(), rid, str(b.get("cust_name") or ""),
+                                          str(b.get("cust_email") or "")), timeout=15)
         return {"ok": True, "posted": bool(posted)}
     if path == "/api/visit/paynow":
         v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))

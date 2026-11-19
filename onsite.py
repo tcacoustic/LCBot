@@ -2078,7 +2078,8 @@ async def photo_for_other(update, context) -> bool:
 
 RQ_NEEDS = [("REPLACEMENT", "Replacement unit"), ("PART", "Part"), ("OTHER", "Other")]
 RQ_WARRANTY = [("IN", "In warranty"), ("OUT", "Out of warranty")]
-RQ_PAYS = [("LINK", "Payment link"), ("PAYNOW", "PayNow"), ("NONE", "No charge")]
+RQ_PAYS = [("NONE", "No charge"), ("PAYNOW", "PayNow"), ("LINK", "Payment link")]
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 RQ_NEED_NAMES, RQ_WARRANTY_NAMES, RQ_PAYS_NAMES = dict(RQ_NEEDS), dict(RQ_WARRANTY), dict(RQ_PAYS)
 
 
@@ -2109,6 +2110,13 @@ def create_onsite_request(user_id: int, appt_id: int, f: dict) -> tuple:
             return None, "Type the price as a number, or leave it empty (to confirm)."
         if price < 0 or price > 10_000_000:
             return None, "That price doesn't look right."
+    if pays in ("PAYNOW", "LINK") and not price:
+        return None, "Type the price the customer pays."
+    if pays == "LINK":
+        if len(str(f.get("cust_name") or "").strip()) < 2:
+            return None, "Type the customer's name for the payment link."
+        if not EMAIL_RE.match(str(f.get("cust_email") or "").strip()):
+            return None, "Type the customer's email for the payment link."
     cur = run("INSERT INTO onsite_requests (appt_id, country, need, reason, warranty, price_cents, "
               "currency, pays_by, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
               (appt_id, v["country"], need, reason, warranty, price, CURRENCY.get(v["country"], "SGD"),
@@ -2175,6 +2183,92 @@ async def post_onsite_request(bot, rid: int) -> bool:
         except Exception:
             pass
     return False
+
+
+# Payment link: Finance gets the customer's name and email in their own chat
+# (set with /financechat) and emails the link. The name and email are only in
+# that message, never saved in the bot's database.
+def finance_text(r, name: str, email: str) -> str:
+    v = q1("SELECT * FROM appointments WHERE id=?", (r["appt_id"],))
+    flag = COUNTRY_NAMES[r["country"]].split(" ")[0]
+    return "\n".join([
+        f"💳 <b>Payment link needed</b> · {flag} {r['country']}",
+        f"Request #{r['id']} · visit #{r['appt_id']}",
+        f"Customer: {esc(name)}", f"Email: {esc(email)}",
+        f"Amount: {money_text(r['price_cents'] or 0, r['currency'] or 'SGD')}",
+        f"For: {RQ_NEED_NAMES[r['need']]}" + (f" · {esc(v['product'])}" if v and v["product"] else ""),
+        f"Reason: {esc(r['reason'])}",
+        f"From: {esc(display_name_of(r['created_by'], 'the specialist'))}"])
+
+
+async def post_finance_link(bot, rid: int, name: str, email: str) -> bool:
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+    text = finance_text(r, name.strip()[:80], email.strip()[:120])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🙋 I'll send it", callback_data=f"fl:t:{rid}")]])
+    where = setting("finance_chat", "")
+    if where:
+        try:
+            target = json.loads(where)
+            kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
+            await bot.send_message(target["chat"], text, parse_mode=constants.ParseMode.HTML, reply_markup=kb, **kw)
+            return True
+        except Exception as e:
+            log.info("Couldn't post payment link request %s: %s", rid, e)
+    for uid in list(ADMIN_IDS):
+        try:
+            await bot.send_message(uid, text + "\n\n<i>No Finance chat is set yet: send /financechat in it.</i>",
+                                   parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+    return False
+
+
+async def on_finance_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """fl:t:<id> I'll send it · fl:d:<id> Link sent — in the Finance chat."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    uid = query.from_user.id
+    if agent_status(uid) != "active" and not is_owner(uid):
+        await query.answer("Only SH Bot members can do this.", show_alert=True)
+        return
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (int(raw),))
+    if not r:
+        await query.answer("That request is gone.", show_alert=True)
+        return
+    who = esc(display_name_of(uid, "Someone"))
+    base = (query.message.text_html or "").split("\n\n🙋")[0].split("\n\n✅")[0]
+    if action == "t":
+        text, kb = base + f"\n\n🙋 {who} is sending it", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Link sent", callback_data=f"fl:d:{r['id']}")]])
+        tell_msg = f"💳 {who} from Finance is sending the payment link for request #{r['id']} (visit #{r['appt_id']})."
+    else:
+        text, kb = base + f"\n\n✅ Link sent by {who}", None
+        tell_msg = f"✅ The payment link for request #{r['id']} (visit #{r['appt_id']}) has been sent to the customer."
+    await query.answer()
+    try:
+        await query.edit_message_text(text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+    except BadRequest:
+        pass
+    await tell(context.bot, r["created_by"], tell_msg)
+
+
+async def cmd_financechat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/financechat (admins, inside a group) — payment link requests go here."""
+    if not admin_for(update.effective_user.id, "ONSITE", "SH"):
+        return
+    chat = update.effective_chat
+    if context.args and context.args[0].lower() == "off":
+        async with write_lock:
+            set_setting("finance_chat", "")
+        await update.message.reply_text("Payment link requests now go to the owner by DM.")
+        return
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        await update.message.reply_text("Send this inside the Finance chat where payment link requests should go.")
+        return
+    thread = update.message.message_thread_id if update.message.is_topic_message else None
+    async with write_lock:
+        set_setting("finance_chat", json.dumps({"chat": chat.id, "thread": thread}))
+    await update.message.reply_text("✅ Payment link requests will be posted here. Only people in this chat see the customer's name and email.")
 
 
 async def refresh_onsite_request(bot, rid: int) -> None:
@@ -2300,7 +2394,9 @@ def rq_chat_view(v, d: dict, step: int) -> tuple:
             head.append(f"{label}: {names[k][d[k]]}")
     if d.get("reason"):
         head.append(f"Reason: {d['reason']}")
-    head.append("Price: to confirm")
+    head.append(f"Price: {d['price']}" if d.get("price") else "Price: to confirm")
+    if d.get("pays_by") == "LINK" and d.get("cust_email"):
+        head.append(f"Payment link to: {d.get('cust_name', '')} · {d['cust_email']}")
     vid = v["id"]
     back = f"oq:s:{vid}:{step - 1}" if step > 0 else f"vz:v:{vid}"
     if step < 3:
@@ -2315,8 +2411,23 @@ def rq_chat_view(v, d: dict, step: int) -> tuple:
             rows.append([InlineKeyboardButton("Next ›", callback_data=f"oq:s:{vid}:4")])
         text = "\n".join(head) + "\n\nWhy is it needed? One line, e.g. won't power on, fault confirmed on site."
     else:
-        rows = [[InlineKeyboardButton("✅ Send to SH x Ops", callback_data=f"oq:k:{vid}")]]
-        text = "\n".join(head) + "\n\nSend it?"
+        rows, missing = [], []
+        if d.get("pays_by") in ("PAYNOW", "LINK"):
+            rows.append([InlineKeyboardButton("✏️ Type the price" if not d.get("price") else "✏️ Change the price",
+                                              callback_data=f"oq:m:{vid}")])
+            if not d.get("price"):
+                missing.append("the price")
+        if d.get("pays_by") == "LINK":
+            rows.append([InlineKeyboardButton("✏️ Customer name and email" if not d.get("cust_email")
+                                              else "✏️ Change name and email", callback_data=f"oq:c:{vid}")])
+            if not d.get("cust_email"):
+                missing.append("the customer's name and email")
+        if missing:
+            text = "\n".join(head) + "\n\nAdd " + " and ".join(missing) + "."
+        else:
+            rows.append([InlineKeyboardButton("✅ Send to SH x Ops", callback_data=f"oq:k:{vid}")])
+            text = "\n".join(head) + "\n\nSend it?" + ("\nFinance gets the name and email to send the link."
+                                                       if d.get("pays_by") == "LINK" else "")
     rows.append([InlineKeyboardButton("‹ Back", callback_data=back)])
     return text, InlineKeyboardMarkup(rows)
 
@@ -2351,6 +2462,11 @@ async def on_rq_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         await query.answer("Sent")
         posted = await post_onsite_request(context.bot, rid)
+        if d.get("pays_by") == "LINK":
+            await post_finance_link(context.bot, rid, d.get("cust_name", ""), d.get("cust_email", ""))
+        if d.get("pays_by") == "PAYNOW":
+            r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+            await send_request_paynow(context.bot, uid, v, r["price_cents"] or 0)
         await edit_or_send(query, ("✅ Sent to SH x Ops. You'll get a message when someone picks it up."
                                    if posted else "✅ Sent to the On-Site admins (no request chat is set yet)."),
                            InlineKeyboardMarkup([[InlineKeyboardButton("◀️ All visits", callback_data="vz:lst")]]))
@@ -2391,6 +2507,74 @@ async def _rq_reason_text(update, context, job, text) -> int:
 
 
 ONS_TEXT_HANDLERS["rq_reason"] = _rq_reason_text
+
+
+async def on_rq_extra_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """oq:m:<visit> type the price · oq:c:<visit> type the customer's name and email."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    vid = int(raw)
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_request(v, query.from_user.id):
+        await query.answer("That's not open for a request.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "rq_price" if action == "m" else "rq_contact", "id": vid}
+    await edit_or_send(query, (f"Type the price in {CURRENCY.get(v['country'], 'SGD')}, e.g. 120 or 99.50."
+                               if action == "m" else
+                               "Type the customer's name and email in one message, e.g. James, james@example.com."
+                               "\nOnly Finance sees these, to email the payment link.") + "\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def _rq_extra_text(update, context, job, text) -> int:
+    uid = update.effective_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (job["id"],))
+    if not may_request(v, uid):
+        return ConversationHandler.END
+    d = rq_draft(v["id"], uid)
+    if job["kind"] == "rq_price":
+        try:
+            val = float(re.sub(r"^[A-Za-z$ ]+", "", text.replace(",", "").strip()))
+            assert 0 < val < 100000
+        except (ValueError, AssertionError):
+            context.user_data["ons"] = job
+            await update.message.reply_text("Type the price as a number, e.g. 120 or 99.50.\n/cancel to stop")
+            return ONS_TEXT
+        d["price"] = f"{val:.2f}"
+    else:
+        m = re.search(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+", text)
+        name = re.sub(r"[,;\s]+$", "", text[:m.start()].strip()) if m else ""
+        if not m or len(name) < 2:
+            context.user_data["ons"] = job
+            await update.message.reply_text("Type the name, then the email, e.g. James, james@example.com.\n/cancel to stop")
+            return ONS_TEXT
+        d["cust_name"], d["cust_email"] = name[:80], m.group(0)[:120]
+    async with write_lock:
+        set_setting(rq_draft_key(v["id"], uid), json.dumps(d))
+    t, kb = rq_chat_view(v, d, 4)
+    await update.message.reply_text(t, reply_markup=kb)
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["rq_price"] = _rq_extra_text
+ONS_TEXT_HANDLERS["rq_contact"] = _rq_extra_text
+
+
+async def send_request_paynow(bot, chat_id: int, v, cents: int) -> None:
+    """The PayNow QR for a replacement / payment request, to show the customer."""
+    if cents <= 0:
+        return
+    qr = paynow_qr(v, cents)
+    cap = (f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
+           f"{money_text(cents, CURRENCY.get(v['country'], 'SGD'))} · Reference {qr['ref']}")
+    try:
+        if qr["png"]:
+            await bot.send_photo(chat_id, qr["png"], caption=cap)
+        else:
+            await bot.send_message(chat_id, cap)
+    except Exception as e:
+        log.info("Couldn't send the request PayNow QR: %s", e)
 
 
 def my_onsite_requests(user_id: int) -> list:
