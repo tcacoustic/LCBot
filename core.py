@@ -3721,6 +3721,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:6px; padding:10px 12px; font-size:16px; background:var(--card); color:var(--ink); }
   .fld textarea { min-height:110px; resize:vertical; }
   .fld .note { margin-top:4px; }
+  .phn { user-select:all; -webkit-user-select:all; font-weight:700; }
   /* Dates and times are typed straight through (see typedDates) */
   .tdt-row { display:flex; gap:6px; align-items:stretch; }
   .tdt { flex:1; width:100%; min-height:48px; border:2px solid #8A9099; border-radius:6px; padding:10px 12px;
@@ -4815,7 +4816,7 @@ function visitCard(it, d) {
       : 'Asked to move to ' + esc(it.proposed) + '. Answer in your chat with the bot.') + '</div>';
   if (VS.open[it.id]) {
     let b = '';
-    if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+    if (it.phone) b += 'Phone: <span class="phn">' + esc(it.phone) + '</span><br>';
     if (it.email) b += 'Email: ' + esc(it.email) + '<br>';
     b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '<br>';
     if (it.product) b += 'Product: ' + esc(it.product) + '<br>';
@@ -4887,7 +4888,7 @@ function followupCard(it) {
   let b = '';
   if (it.why) b += 'Last time: ' + esc(it.why) + '<br>';
   if (it.product) b += 'Product: ' + esc(it.product) + '<br>';
-  if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+  if (it.phone) b += 'Phone: <span class="phn">' + esc(it.phone) + '</span><br>';
   if (it.address) b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '');
   if (b) h += '<div class="body" style="white-space:normal">' + b + '</div>';
   if (it.map) h += '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div>';
@@ -4907,7 +4908,7 @@ function openCard(it) {
   let b = '';
   if (it.issue) b += 'Issue: ' + esc(it.issue) + '<br>';
   if (it.note) b += 'Note: ' + esc(it.note) + '<br>';
-  if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+  if (it.phone) b += 'Phone: <span class="phn">' + esc(it.phone) + '</span><br>';
   if (it.address) b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '<br>';
   if (it.order) b += 'Order: ' + esc(it.order);
   if (b) h += '<div class="body" style="white-space:normal">' + b + '</div>';
@@ -4946,7 +4947,6 @@ function todayView(d) {
        + '<div class="meta">' + (REGION_FLAGS[n.country] || '') + ' ' + esc(n.customer) + (n.postal ? ' · ' + esc(n.postal) : '') + '</div>'
        + (n.product ? '<div class="meta">' + esc(n.product) + '</div>' : '')
        + '<div class="acts"><button data-map="' + esc(n.map) + '">Directions</button>'
-       + (n.phone ? '<a class="btnlink" href="tel:' + esc(n.phone) + '">Call</a>' : '')
        + '<button class="soft" data-vv="' + n.id + '">Open</button></div></div>';
   } else {
     h += '<div class="empty">No visits coming up.</div>';
@@ -4999,12 +4999,12 @@ function visitScreen(v) {
   if (v.issue) b += 'Issue: ' + esc(v.issue) + '<br>';
   if (v.why) b += 'Last time: ' + esc(v.why) + '<br>';
   if (v.note) b += 'Note: ' + esc(v.note) + '<br>';
-  if (v.phone) b += 'Phone: <a href="tel:' + esc(v.phone) + '">' + esc(v.phone) + '</a><br>';
+  if (v.phone) b += 'Phone: <span class="phn">' + esc(v.phone) + '</span><br>';
   b += 'Address: ' + esc(v.address) + (v.postal ? ' ' + esc(v.postal) : '');
   if (v.order) b += '<br>Order: ' + esc(v.order);
   h += '<div class="case"><div class="body" style="white-space:normal">' + b + '</div>'
      + '<div class="acts"><button data-map="' + esc(v.map) + '">Directions</button>'
-     + (v.phone ? '<a class="btnlink" href="tel:' + esc(v.phone) + '">Call</a>' : '') + '</div></div>';
+     + '</div></div>';
   if (v.status === 'SCHEDULED') h += '<button class="big" data-arrive="' + v.id + '">🚗 Arrived</button>';
   if (v.status === 'ONSITE') {
     if (VS.lv) return h + leaveForm(v);
@@ -5194,7 +5194,7 @@ function trackerVisit(it) {
       h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
          + '<div class="note" style="margin-top:8px">Phone and address are with whoever booked it and the specialist doing it.</div></div>';
     } else {
-      if (it.phone) c += '<b>Phone</b><span><a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a></span>';
+      if (it.phone) c += '<b>Phone</b><span><span class="phn">' + esc(it.phone) + '</span></span>';
       if (it.email) c += '<b>Email</b><span>' + esc(it.email) + '</span>';
       c += '<b>Address</b><span>' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '</span>';
       h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
