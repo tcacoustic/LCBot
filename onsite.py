@@ -272,9 +272,15 @@ def span_of(v) -> tuple:
     return start, start + timedelta(minutes=v["duration_min"])
 
 
+def day_time(dt, sep: str = ", ") -> str:
+    """'Mon 23 Nov, 2:30pm'; the year is added when it isn't this year."""
+    day = dt.strftime("%a %-d %b") + (dt.strftime(" %Y") if dt.year != now().astimezone(dt.tzinfo).year else "")
+    return day + sep + t12(dt.strftime("%H:%M"))
+
+
 def when_text(v) -> str:
     start, end = span_of(v)
-    return start.strftime('%a %-d %b, %H:%M')
+    return day_time(start)
 
 
 def clash_phrase(busy: str) -> str:
@@ -1101,7 +1107,7 @@ def tracker_item(v, user_id: int, all_countries: bool) -> dict:
     item = {
         "id": v["id"], "country": v["country"], "date": start.date().isoformat(),
         "start": start.strftime("%H:%M") if timed else "",
-        "when": start.strftime("%a %-d %b · %H:%M") if timed else "Not booked yet",
+        "when": day_time(start, " · ") if timed else "Not booked yet",
         "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
         "status": tracker_status(v),
         "outcome": OUTCOME_NAMES.get(v["outcome"], "")[2:] if v["outcome"] else "",
@@ -1594,7 +1600,7 @@ def followup_item(v, user_id: int, role: str) -> dict:
         "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
         "urgency": URGENCY_NAMES.get(v["urgency"] or "MEDIUM", "Medium"),
         "customer": v["customer_name"], "postal": v["postal"] or "", "product": v["product"] or "",
-        "when": (span_of(v)[0].astimezone(tz).strftime("%a %-d %b, %H:%M")
+        "when": (day_time(span_of(v)[0].astimezone(tz))
                  if v["status"] != "ARRANGING" else "Customer will confirm the date"),
         "why": nf_reason_text(v["followup_of"]),
         "specialist": "You" if mine else display_name_of(v["specialist_id"], ""),
@@ -1953,7 +1959,7 @@ def visit_screen(v, user_id: int) -> dict:
     item = {
         "id": v["id"], "status": v["status"], "country": v["country"],
         "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
-        "when": start.strftime("%a %-d %b, %H:%M"), "start": start.strftime("%H:%M"),
+        "when": day_time(start), "start": start.strftime("%H:%M"),
         "customer": v["customer_name"], "phone": v["phone"] or "", "email": v["email"] or "",
         "address": v["address"], "postal": v["postal"] or "", "product": v["product"] or "",
         "issue": v["issue"] or "", "order": v["order_no"] or "", "map": map_link(v),
