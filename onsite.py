@@ -2896,10 +2896,59 @@ def my_cab_claims(user_id: int) -> list:
             for c in q("SELECT * FROM cab_claims WHERE user_id=? ORDER BY id DESC LIMIT 30", (user_id,))]
 
 
-async def cab_from_app(user_id: int, appt_id: int, trip: str, amount: str) -> dict:
+def photo_bytes(data: str) -> bytes | None:
+    """A photo from the App (a data: URL or base64), or None if it isn't one."""
+    import base64
+    raw = str(data or "")
+    if "," in raw[:80]:
+        raw = raw.split(",", 1)[1]
+    try:
+        out = base64.b64decode(raw, validate=True)
+    except Exception:
+        return None
+    return out if 100 < len(out) <= 8_000_000 and out[:3] in (b"\xff\xd8\xff", b"\x89PN") else None
+
+
+async def upload_photo(bot, user_id: int, data: bytes, caption: str) -> str | None:
+    """Telegram keeps photos by file id, so an App photo goes to the person's own
+    chat with the bot (a record for them too) and its file id is kept."""
+    try:
+        m = await bot.send_photo(user_id, data, caption=caption)
+        return m.photo[-1].file_id
+    except Exception as e:
+        log.info("Couldn't upload a photo for %s: %s", user_id, e)
+        return None
+
+
+async def cab_from_app(user_id: int, appt_id: int, trip: str, amount: str, photo: str = "") -> dict:
+    img = photo_bytes(photo) if photo else None
+    if photo and not img:
+        return {"ok": False, "error": "That photo didn't come through. Try again."}
     async with write_lock:
         cid, err = create_cab_claim(user_id, appt_id, trip, amount)
     if err:
         return {"ok": False, "error": err}
+    if img:
+        fid = await upload_photo(bot_ref(), user_id, img, f"🧾 Receipt for your cab claim (visit #{appt_id})")
+        if fid:
+            async with write_lock:
+                run("UPDATE cab_claims SET receipt=?, status='PENDING' WHERE id=?", (fid, cid))
+            await send_cab_to_admins(bot_ref(), cid)
+            return {"ok": True, "sent": True}
     await tell(bot_ref(), user_id, f"📷 Send a photo of the receipt here for your cab claim (visit #{appt_id}).")
-    return {"ok": True}
+    return {"ok": True, "sent": False}
+
+
+async def visit_photo_from_app(user_id: int, appt_id: int, photo: str) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "Photos can be added while you're on site."}
+    img = photo_bytes(photo)
+    if not img:
+        return {"ok": False, "error": "That photo didn't come through. Try again."}
+    fid = await upload_photo(bot_ref(), user_id, img, f"📷 Added to visit #{appt_id}")
+    if not fid:
+        return {"ok": False, "error": "Couldn't save the photo just now."}
+    async with write_lock:
+        log_visit(appt_id, user_id, "photo", fid)
+    return {"ok": True, "photos": photos_of(appt_id)}

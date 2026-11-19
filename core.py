@@ -3822,6 +3822,20 @@ let TABS = null;
 let CS_Q = '';   // what the case search box holds; '' = the normal lists
 let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '', mode: 'sched', tw: '', tc: '', ts: '', tv: null };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// A photo picked in the App, made smaller (longest side 1600px, JPEG) before it's sent.
+function shrinkPhoto(file) {
+  return new Promise(res => {
+    if (!file) return res(null);
+    const rd = new FileReader();
+    rd.onerror = () => res(null);
+    rd.onload = () => { const im = new Image(); im.onerror = () => res(null); im.onload = () => {
+      const k = Math.min(1, 1600 / Math.max(im.width, im.height)), cv = document.createElement('canvas');
+      cv.width = Math.round(im.width * k); cv.height = Math.round(im.height * k);
+      cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+      res(cv.toDataURL('image/jpeg', 0.82)); }; im.src = rd.result; };
+    rd.readAsDataURL(file);
+  });
+}
 
 // Dates and times are typed straight through instead of the phone's segment pickers:
 // 23112026 -> 23/11/2026, 230 + PM -> 2:30 PM. The original date/time input stays
@@ -5015,7 +5029,7 @@ function visitScreen(v) {
       return '<div class="top" style="padding:6px 0;border-bottom:1px solid var(--line)" data-tick="' + i + '" data-on="' + (on ? 1 : 0) + '">'
         + '<div class="tick' + (on ? ' on' : '') + '">' + (on ? '✓' : '') + '</div><div style="padding-top:3px">' + esc(x) + '</div></div>';
     }).join('') + '</div>';
-    h += '<h2>Photos (optional)</h2><div class="note">Send photos to SH Bot in your chat while you’re on site and they’re added here. '
+    h += '<h2>Photos (optional)</h2><label class="big ghost" style="display:block;text-align:center">📷 Add a photo<input type="file" accept="image/*" data-vphoto="1" hidden></label><div class="note">'
        + (v.photos ? v.photos + ' added so far.' : 'None yet.') + '</div>';
     h += '<div class="more" data-map="' + esc(v.formUrl) + '">📝 Open the customer sign-off form</div>';
     h += '<button class="big" data-leave="' + v.id + '">🏁 Leave</button>';
@@ -5051,7 +5065,7 @@ function cabForm(v) {
   const pick = (val, name) => '<button data-cabt="' + val + '" class="' + (f.trip === val ? 'on' : '') + '">' + name + '</button>';
   return '<h2>Cab claim</h2><div class="fld"><label>Trip</label><div class="pick">' + pick('TO', 'To the visit') + pick('FROM', 'From the visit') + pick('BOTH', 'Both ways') + '</div></div>'
     + '<div class="fld"><label>Fare (' + esc(v.currency || 'SGD') + ')</label><input id="cab_amount" inputmode="decimal" placeholder="18.40" value="' + esc(f.amount || '') + '"></div>'
-    + '<div class="note">Next, send a photo of the receipt to SH Bot in your chat. It goes for approval once the photo is in.</div>'
+    + '<div class="fld"><label>Receipt photo</label><label class="big ghost" style="display:block;text-align:center;margin:0">' + (f.photo ? '✅ Receipt added · change' : '🧾 Add the receipt photo') + '<input type="file" accept="image/*" data-cabphoto="1" hidden></label></div>'
     + '<button class="big" id="cabSend">Send claim</button><button class="big ghost" id="cabBack">Back</button>';
 }
 
@@ -5145,12 +5159,27 @@ async function loadVisitScreen(d) {
   if (cs) cs.onclick = async () => {
     VS.cab.amount = document.getElementById('cab_amount').value;
     if (!VS.cab.trip || !VS.cab.amount) { toast('Pick the trip and type the fare.'); return; }
-    cs.disabled = true;
-    const r = await post('/api/visit/cab', { id: v.id, trip: VS.cab.trip, amount: VS.cab.amount });
-    cs.disabled = false;
+    if (!VS.cab.photo) { toast('Add the receipt photo.'); return; }
+    cs.disabled = true; cs.textContent = 'Sending…';
+    const r = await post('/api/visit/cab', { id: v.id, trip: VS.cab.trip, amount: VS.cab.amount, photo: VS.cab.photo });
+    cs.disabled = false; cs.textContent = 'Send claim';
     if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
-    VS.cab = null; toast('Now send the receipt photo to SH Bot in your chat.'); loadVisits();
+    VS.cab = null; toast(r.sent ? 'Cab claim sent for approval.' : 'Now send the receipt photo to SH Bot in your chat.'); loadVisits();
   };
+  document.querySelectorAll('[data-cabphoto]').forEach(el => el.onchange = async () => {
+    const a = document.getElementById('cab_amount'); if (a) VS.cab.amount = a.value;
+    const img = await shrinkPhoto(el.files && el.files[0]);
+    if (!img) { toast('That photo couldn’t be read. Try another.'); return; }
+    VS.cab.photo = img; loadVisits();
+  });
+  document.querySelectorAll('[data-vphoto]').forEach(el => el.onchange = async () => {
+    const img = await shrinkPhoto(el.files && el.files[0]);
+    if (!img) { toast('That photo couldn’t be read. Try another.'); return; }
+    toast('Adding the photo…');
+    const r = await post('/api/visit/photo', { id: v.id, photo: img });
+    if (!r.ok) { toast(r.error || 'Could not add the photo.'); return; }
+    toast('Photo added (' + r.photos + ' so far)'); loadVisits();
+  });
   on('[data-rqf]', el => { keepRq(); VS.rq[el.dataset.rqf] = el.dataset.v; loadVisits(); });
   const rb = document.getElementById('rqBack2');
   if (rb) rb.onclick = () => { VS.rq = null; loadVisits(); };
