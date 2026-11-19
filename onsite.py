@@ -1525,7 +1525,34 @@ NF_REASON_NAMES = dict(NF_REASONS)
 URGENCY = [("HIGH", "High"), ("MEDIUM", "Medium"), ("LOW", "Low")]
 URGENCY_NAMES = dict(URGENCY)
 URGENCY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-NEXT_TIMES = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00"]
+# Quick picks for the next visit's time; ✏️ Type a time takes anything else.
+NEXT_TIMES = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
+
+
+def t12(hm: str) -> str:
+    """'14:00' -> '2pm', '10:30' -> '10:30am'."""
+    h, m = int(hm[:2]), hm[3:5]
+    return f"{h % 12 or 12}{'' if m == '00' else ':' + m}{'am' if h < 12 else 'pm'}"
+
+
+def read_any_time(text: str) -> str | None:
+    """Whatever someone types for a time -> 'HH:MM', or None. '7.15pm', '1930',
+    '230', '2:30', '10' all work. With no am/pm, 10-11 is morning and 12 or
+    1-9 is afternoon/evening (visits run from about 10am to 6pm)."""
+    t = text.strip().lower().replace(" ", "").replace(".", ":")
+    m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?(am|pm|a|p)?", t)
+    if not m:
+        return None
+    h, mins, mer = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "")[:1]
+    if mins > 59 or h > 23:
+        return None
+    if mer:
+        if h < 1 or h > 12:
+            return None
+        h = (h % 12) + (12 if mer == "p" else 0)
+    elif 1 <= h <= 9:
+        h += 12
+    return f"{h:02d}:{mins:02d}"
 NEXT_DAYS = 14
 ONS_TEXT, ONS_PHOTO = 290, 291      # typed notes / amounts, and photos, in chat
 
@@ -1675,7 +1702,7 @@ def nf_summary(v, d: dict) -> str:
         lines.append("Next visit: the customer will confirm the date")
     elif d.get("date"):
         day = date.fromisoformat(d["date"]).strftime("%a %-d %b")
-        lines.append(f"Next visit: {day}" + (f", {d['time']}" if d.get("time") else ""))
+        lines.append(f"Next visit: {day}" + (f", {t12(d['time'])}" if d.get("time") else ""))
     return "\n".join(lines)
 
 
@@ -1704,8 +1731,9 @@ def nf_keyboard(v, step: str, d: dict) -> InlineKeyboardMarkup:
         day = d.get("date", "")
         if day == datetime.now(COUNTRY_TZ[v["country"]]).date().isoformat():
             times = [t for t in NEXT_TIMES if local_start(v["country"], day, t) > now()]
-        btns = [InlineKeyboardButton(t, callback_data=f"vn:t:{vid}:{t.replace(':', '')}") for t in times]
-        rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+        btns = [InlineKeyboardButton(t12(t), callback_data=f"vn:t:{vid}:{t.replace(':', '')}") for t in times]
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        rows.append([InlineKeyboardButton("✏️ Type a time", callback_data=f"vn:x:{vid}")])
     elif step == "k":
         rows = [[InlineKeyboardButton("✅ Done, close this visit" if d.get("later")
                                       else "✅ Book the next visit", callback_data=f"vn:k:{vid}")]]
@@ -1788,10 +1816,41 @@ async def on_nf_note_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ONS_TEXT
 
 
+async def on_nf_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """vn:x:<id> — type any time for the next visit."""
+    query = update.callback_query
+    appt_id = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != query.from_user.id or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "nf_time", "id": appt_id}
+    await edit_or_send(query, "Type the time, e.g. 7pm, 9:30am or 1930.\n/cancel to stop")
+    return ONS_TEXT
+
+
 async def on_ons_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Typed text for the On-Site chat steps."""
     job = context.user_data.pop("ons", None) or {}
     text = (update.message.text or "").strip()
+    if job.get("kind") == "nf_time":
+        appt_id = job["id"]
+        v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+        if not v or v["status"] != "ONSITE":
+            return ConversationHandler.END
+        hm = read_any_time(text)
+        if not hm:
+            context.user_data["ons"] = job
+            await update.message.reply_text("I couldn't read that time. Try e.g. 7pm, 9:30am or 1930.\n/cancel to stop")
+            return ONS_TEXT
+        async with write_lock:
+            d = nf_draft(appt_id)
+            d["time"] = hm
+            save_nf_draft(appt_id, d)
+        await update.message.reply_text(nf_summary(v, d) + "\n\n" + NF_QUESTIONS["k"],
+                                        reply_markup=nf_keyboard(v, "k", d))
+        return ConversationHandler.END
     if job.get("kind") == "nf_note":
         appt_id = job["id"]
         v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
