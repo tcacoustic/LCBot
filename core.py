@@ -4939,8 +4939,10 @@ function todayView(d) {
   const n = t.next;
   if (n) {
     h += '<h2>' + (n.status === 'ONSITE' ? 'On site now' : 'Next visit') + '</h2>';
-    h += '<div class="case' + (n.followup ? ' fu' : '') + '" style="border-color:var(--accent);box-shadow:inset 6px 0 0 var(--accent);padding-left:18px">'
+    // Plain card for a normal visit; red (with the tag) only for a follow-up or revisit.
+    h += '<div class="case' + (n.followup ? ' fu' : '') + '">'
        + '<div class="nm">' + esc(n.when) + ' · ' + esc(n.type) + '</div>'
+       + (n.followup ? '<div><span class="tag red">FOLLOW-UP · ' + esc(String(n.followup).toUpperCase()) + '</span></div>' : '')
        + '<div class="meta">' + (REGION_FLAGS[n.country] || '') + ' ' + esc(n.customer) + (n.postal ? ' · ' + esc(n.postal) : '') + '</div>'
        + (n.product ? '<div class="meta">' + esc(n.product) + '</div>' : '')
        + '<div class="acts"><button data-map="' + esc(n.map) + '">Directions</button>'
