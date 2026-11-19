@@ -1406,6 +1406,9 @@ async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await finish_visit(context.bot, query, v["id"], uid)
         return
     if action == "pm" and v["status"] == "ONSITE" and parts[3] in dict(PAY_METHODS):
+        if parts[3] == "PAYNOW" and not payment_photo_of(v["id"]):
+            await query.answer("Send a photo of the customer's PayNow payment here first.", show_alert=True)
+            return
         async with write_lock:
             run("UPDATE appointments SET pay_method=? WHERE id=?", (parts[3], v["id"]))
         await query.answer()
@@ -1489,12 +1492,22 @@ async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
     if v["outcome"] == "RESOLVED":
         await send_review_qr(bot, uid)
     await tell(bot, v["created_by"], report)
+    pay = payment_photo_of(appt_id)
+    cap = f"📷 PayNow payment · visit #{appt_id}" + (
+        f" · {money_text(v['amount_cents'], v['currency'])}" if v["amount_cents"] else "")
+    if pay:
+        try:
+            await bot.send_photo(v["created_by"], pay, caption=cap)
+        except Exception as e:
+            log.info("Couldn't send the payment photo: %s", e)
     where = setting("visit_report_chat", "")
     if where:
         try:
             target = json.loads(where)
             kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
             await bot.send_message(target["chat"], report, disable_web_page_preview=True, **kw)
+            if pay:
+                await bot.send_photo(target["chat"], pay, caption=cap, **kw)
         except Exception as e:
             log.info("Couldn't post the visit report: %s", e)
 
@@ -1972,6 +1985,7 @@ def visit_screen(v, user_id: int) -> dict:
         "mine": v["specialist_id"] == user_id,
         "canRequest": may_request(v, user_id), "reviewQr": bool(REVIEW_URL),
         "paynowReady": bool(PAYNOW_UEN) and v["country"] == "SG",
+        "payPhoto": bool(payment_photo_of(v["id"])),
         "canClaim": may_claim(v, user_id),
     }
     if v["status"] == "ONSITE":
@@ -2034,6 +2048,8 @@ async def leave_from_app(appt_id: int, user_id: int, b: dict) -> dict:
         method = str(b.get("method") or "")
         if method not in dict(PAY_METHODS):
             return {"ok": False, "error": "Pick how the customer paid."}
+        if method == "PAYNOW" and not payment_photo_of(appt_id):
+            return {"ok": False, "error": "Add a photo of the customer's PayNow payment first."}
         cur = CURRENCY.get(v["country"], "SGD")
     async with write_lock:
         run("UPDATE appointments SET outcome=?, left_at=?, amount_cents=?, currency=?, pay_method=? "
@@ -2110,7 +2126,7 @@ def create_onsite_request(user_id: int, appt_id: int, f: dict) -> tuple:
             return None, "Type the price as a number, or leave it empty (to confirm)."
         if price < 0 or price > 10_000_000:
             return None, "That price doesn't look right."
-    if pays in ("PAYNOW", "LINK") and not price:
+    if pays == "LINK" and not price:
         return None, "Type the price the customer pays."
     if pays == "LINK":
         if len(str(f.get("cust_name") or "").strip()) < 2:
@@ -2412,7 +2428,7 @@ def rq_chat_view(v, d: dict, step: int) -> tuple:
         text = "\n".join(head) + "\n\nWhy is it needed? One line, e.g. won't power on, fault confirmed on site."
     else:
         rows, missing = [], []
-        if d.get("pays_by") in ("PAYNOW", "LINK"):
+        if d.get("pays_by") == "LINK" or (d.get("pays_by") == "PAYNOW" and not static_qr_id()):
             rows.append([InlineKeyboardButton("✏️ Type the price" if not d.get("price") else "✏️ Change the price",
                                               callback_data=f"oq:m:{vid}")])
             if not d.get("price"):
@@ -2563,11 +2579,13 @@ ONS_TEXT_HANDLERS["rq_contact"] = _rq_extra_text
 
 async def send_request_paynow(bot, chat_id: int, v, cents: int) -> None:
     """The PayNow QR for a replacement / payment request, to show the customer."""
-    if cents <= 0:
+    if cents <= 0 and not static_qr_id():
         return
-    qr = paynow_qr(v, cents)
-    cap = (f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
-           f"{money_text(cents, CURRENCY.get(v['country'], 'SGD'))} · Reference {qr['ref']}")
+    qr = await qr_for(bot, v, cents)
+    amt = money_text(cents, CURRENCY.get(v['country'], 'SGD')) if cents > 0 else "the amount"
+    cap = (f"Scan to pay TC Acoustic with PayNow. The customer keys in {amt}." if qr.get("static") else
+           f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
+           f"{amt} · Reference {qr['ref']}")
     try:
         if qr["png"]:
             await bot.send_photo(chat_id, qr["png"], caption=cap)
@@ -2632,6 +2650,108 @@ def qr_png(text: str) -> bytes | None:
     return buf.getvalue()
 
 
+# TC's own PayNow QR: an admin sends the image once with /paynowqr. The customer
+# keys in the amount, and the specialist takes a photo of the payment.
+_static_qr = {}
+
+
+def static_qr_id() -> str:
+    return setting("paynow_qr_file", "")
+
+
+async def static_qr_png(bot) -> bytes | None:
+    fid = static_qr_id()
+    if not fid:
+        return None
+    if fid not in _static_qr:
+        try:
+            f = await bot.get_file(fid)
+            _static_qr.clear()
+            _static_qr[fid] = bytes(await f.download_as_bytearray())
+        except Exception as e:
+            log.info("Couldn't load the PayNow QR: %s", e)
+            return None
+    return _static_qr[fid]
+
+
+def payment_photo_of(appt_id: int) -> str:
+    r = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='payphoto' ORDER BY id DESC LIMIT 1",
+           (appt_id,))
+    return r["note"] if r else ""
+
+
+async def cmd_paynowqr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/paynowqr (admins, in a DM) — send TC's PayNow QR image next. /paynowqr off — remove it."""
+    uid = update.effective_user.id
+    if not admin_for(uid, "ONSITE", "SH") or update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if context.args and context.args[0].lower() == "off":
+        async with write_lock:
+            set_setting("paynow_qr_file", "")
+        await update.message.reply_text("PayNow QR removed.")
+        return
+    async with write_lock:
+        set_setting(f"paynow_qr_wait:{uid}", "1")
+    await update.message.reply_text("Send TC's PayNow QR image now (as a photo). Use the official one from Finance.")
+
+
+async def _paynow_qr_photo(update, context) -> bool:
+    uid = update.effective_user.id
+    if not setting(f"paynow_qr_wait:{uid}", ""):
+        return False
+    async with write_lock:
+        set_setting(f"paynow_qr_wait:{uid}", "")
+        set_setting("paynow_qr_file", update.message.photo[-1].file_id)
+    await update.message.reply_text("✅ Saved. Specialists now show this QR for PayNow.")
+    return True
+
+
+async def _payment_photo(update, context) -> bool:
+    """After the PayNow QR is shown in chat, the next photo is the payment."""
+    uid = update.effective_user.id
+    raw = setting(f"payphoto_wait:{uid}", "")
+    if not raw:
+        return False
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(raw),))
+    async with write_lock:
+        set_setting(f"payphoto_wait:{uid}", "")
+        if v and v["specialist_id"] == uid:
+            log_visit(v["id"], uid, "payphoto", update.message.photo[-1].file_id)
+    if not v:
+        return False
+    await update.message.reply_text("📷 Payment photo saved. Tap when they've paid:",
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                                        "✅ Customer has paid", callback_data=f"vz:pm:{v['id']}:PAYNOW")]]))
+    return True
+
+
+ONS_PHOTO_HANDLERS.insert(0, _payment_photo)
+ONS_PHOTO_HANDLERS.insert(0, _paynow_qr_photo)
+
+
+async def payment_photo_from_app(user_id: int, appt_id: int, photo: str) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "That visit isn't open on your side any more."}
+    img = photo_bytes(photo)
+    if not img:
+        return {"ok": False, "error": "That photo didn't come through. Try again."}
+    fid = await upload_photo(bot_ref(), user_id, img, f"📷 PayNow payment for visit #{appt_id}")
+    if not fid:
+        return {"ok": False, "error": "Couldn't save the photo just now."}
+    async with write_lock:
+        log_visit(appt_id, user_id, "payphoto", fid)
+    return {"ok": True}
+
+
+async def qr_for(bot, v, cents: int) -> dict:
+    """What to show for PayNow: TC's own QR if set, else a generated one."""
+    png = await static_qr_png(bot)
+    if png:
+        return {"sample": False, "static": True, "png": png, "ref": f"V{v['id']}"}
+    return dict(paynow_qr(v, cents), static=False)
+
+
 def paynow_qr(v, cents: int) -> dict:
     """{'sample': bool, 'png': bytes|None, 'ref': str}. Real only for SG with PAYNOW_UEN."""
     ref = f"V{v['id']}"
@@ -2642,13 +2762,23 @@ def paynow_qr(v, cents: int) -> dict:
 
 def data_uri(png: bytes | None) -> str:
     import base64
-    return "data:image/png;base64," + base64.b64encode(png).decode() if png else ""
+    kind = "jpeg" if png and png[:2] == b"\xff\xd8" else "png"
+    return f"data:image/{kind};base64," + base64.b64encode(png).decode() if png else ""
 
 
 async def send_paynow_qr(bot, chat_id: int, v) -> None:
-    qr = paynow_qr(v, v["amount_cents"] or 0)
-    cap = (f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
-           f"{money_text(v['amount_cents'] or 0, v['currency'] or 'SGD')} · Reference {qr['ref']}")
+    qr = await qr_for(bot, v, v["amount_cents"] or 0)
+    amt = money_text(v['amount_cents'] or 0, v['currency'] or 'SGD')
+    if qr.get("static"):
+        cap = (f"Scan to pay TC Acoustic with PayNow. The customer keys in {amt}.\n"
+               f"📷 Then send a photo of their payment screen here.")
+        async with write_lock:
+            set_setting(f"payphoto_wait:{chat_id}", str(v["id"]))
+    else:
+        cap = (f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
+               f"{amt} · Reference {qr['ref']}\n📷 Then send a photo of their payment screen here.")
+        async with write_lock:
+            set_setting(f"payphoto_wait:{chat_id}", str(v["id"]))
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Customer has paid", callback_data=f"vz:pm:{v['id']}:PAYNOW")],
                                [InlineKeyboardButton("‹ Back", callback_data=f"vq:b:{v['id']}")]])
     if qr["png"]:
