@@ -768,6 +768,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_paynow_button, pattern=r"^vq:[pb]:\d+$"))
     app.add_handler(CommandHandler("requestchat", cmd_requestchat))
     app.add_handler(CommandHandler("financechat", cmd_financechat))
+    app.add_handler(CommandHandler("paynowqr", cmd_paynowqr))
     app.add_handler(CallbackQueryHandler(on_finance_button, pattern=r"^fl:[td]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_cab_form, pattern=r"^cb:n:\d+$"))
     app.add_handler(CallbackQueryHandler(on_cab_decision, pattern=r"^cb:[arbx]:\d+(:[A-Z]+)?$"))

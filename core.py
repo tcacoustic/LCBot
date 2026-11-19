@@ -5050,7 +5050,7 @@ function rqForm(v) {
   h += '<div class="fld"><label>Reason</label><textarea id="rq_reason" rows="2" placeholder="Won’t power on, fault confirmed on site">' + esc(f.reason || '') + '</textarea></div>';
   h += '<div class="fld"><label>Warranty</label><div class="pick">' + pick('warranty', 'IN', 'In warranty') + pick('warranty', 'OUT', 'Out of warranty') + '</div></div>';
   h += '<div class="fld"><label>Customer pays by</label><div class="pick">' + pick('pays_by', 'NONE', 'No charge') + pick('pays_by', 'PAYNOW', 'PayNow') + pick('pays_by', 'LINK', 'Payment link') + '</div></div>';
-  const paid = f.pays_by === 'PAYNOW' || f.pays_by === 'LINK';
+  const paid = f.pays_by === 'LINK';
   h += '<div class="fld"><label>Price (' + esc(v.currency || 'SGD') + (paid ? ')' : ', leave empty if to confirm)') + '</label><input id="rq_price" inputmode="decimal" placeholder="120.00" value="' + esc(f.price || '') + '"></div>';
   if (f.pays_by === 'PAYNOW') h += '<button class="big ghost" data-rqpn="1">Show PayNow QR</button><div id="rqpnbox"></div>';
   if (f.pays_by === 'LINK') h += '<div class="fld"><label>Customer name</label><input id="rq_cname" autocomplete="off" value="' + esc(f.cust_name || '') + '"></div>'
@@ -5087,7 +5087,9 @@ function leaveForm(v) {
     if (!f.noCharge) {
       h += '<div class="fld"><label>Amount</label><input id="lf_amount" inputmode="decimal" value="' + esc(f.amount || '') + '"></div>';
       h += '<div class="fld"><label>How did the customer pay?</label><div class="pick">' + pick('method', 'CASH', 'Cash') + pick('method', 'PAYNOW', 'PayNow') + pick('method', 'OTHER', 'Other') + '</div></div>';
-      if (f.method === 'PAYNOW') h += '<button class="big ghost" data-pnqr="' + v.id + '">Show PayNow QR</button><div id="pnbox"></div>';
+      if (f.method === 'PAYNOW') h += '<button class="big ghost" data-pnqr="' + v.id + '">Show PayNow QR</button><div id="pnbox"></div>'
+        + '<label class="big ghost" style="display:block;text-align:center">' + (v.payPhoto ? '✅ Payment photo added · change' : '📷 Photo of the payment') + '<input type="file" accept="image/*" data-payphoto="1" hidden></label>'
+        + '<div class="note">Take a photo of the customer’s PayNow confirmation screen.</div>';
     }
   }
   if (f.outcome === 'RETURN') {
@@ -5137,7 +5139,16 @@ async function loadVisitScreen(d) {
     keepLeave();
     const r = await post('/api/visit/paynow', { id: v.id, amount: VS.lv.amount });
     if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
-    document.getElementById('pnbox').innerHTML = qrImg(r.img, r.sample, r.amount + ' · Reference ' + r.ref);
+    document.getElementById('pnbox').innerHTML = qrImg(r.img, r.sample, r.static ? 'Scan to pay TC Acoustic' + (r.amount ? ' · customer keys in ' + r.amount : '') : r.amount + ' · Reference ' + r.ref);
+  });
+  document.querySelectorAll('[data-payphoto]').forEach(el => el.onchange = async () => {
+    keepLeave();
+    const img = await shrinkPhoto(el.files && el.files[0]);
+    if (!img) { toast('That photo couldn’t be read. Try another.'); return; }
+    toast('Saving the photo…');
+    const r = await post('/api/visit/payphoto', { id: v.id, photo: img });
+    if (!r.ok) { toast(r.error || 'Could not save the photo.'); return; }
+    toast('Payment photo added'); loadVisits();
   });
   on('[data-rvqr]', async () => {
     const r = await post('/api/visit/reviewqr', {});
@@ -5148,7 +5159,7 @@ async function loadVisitScreen(d) {
     keepRq();
     const r = await post('/api/visit/paynow', { id: v.id, amount: VS.rq.price });
     if (!r.ok) { toast(r.error || 'Type the price first.'); return; }
-    document.getElementById('rqpnbox').innerHTML = qrImg(r.img, r.sample, r.amount + ' · Reference ' + r.ref);
+    document.getElementById('rqpnbox').innerHTML = qrImg(r.img, r.sample, r.static ? 'Scan to pay TC Acoustic' + (r.amount ? ' · customer keys in ' + r.amount : '') : r.amount + ' · Reference ' + r.ref);
   });
   on('[data-rqopen]', () => { VS.rq = {}; loadVisits(); });
   on('[data-cabopen]', () => { VS.cab = {}; loadVisits(); });
@@ -5189,7 +5200,7 @@ async function loadVisitScreen(d) {
     const f = VS.rq;
     if (!f.need || !f.warranty || !f.pays_by) { toast('Pick the need, warranty and how they pay.'); return; }
     if (!f.reason || f.reason.trim().length < 3) { toast('Say why in a few words.'); return; }
-    if ((f.pays_by === 'PAYNOW' || f.pays_by === 'LINK') && !(parseFloat(f.price) > 0)) { toast('Type the price the customer pays.'); return; }
+    if (f.pays_by === 'LINK' && !(parseFloat(f.price) > 0)) { toast('Type the price the customer pays.'); return; }
     if (f.pays_by === 'LINK' && (!(f.cust_name || '').trim() || !/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test((f.cust_email || '').trim()))) { toast('Type the customer’s name and email.'); return; }
     rs.disabled = true;
     const r = await post('/api/visit/request', Object.assign({ id: v.id }, f));
@@ -5207,6 +5218,7 @@ async function loadVisitScreen(d) {
     if (f.outcome === 'RETURN' && !f.reason) { toast('Pick why it didn’t finish.'); return; }
     if (f.outcome === 'RETURN' && !f.later && (!f.date || !f.time)) { toast('Pick the date and time, or Customer will confirm later.'); return; }
     if (f.outcome === 'RESOLVED' && !f.noCharge && (!f.amount || !f.method)) { toast('Type the amount and pick how they paid.'); return; }
+    if (f.outcome === 'RESOLVED' && !f.noCharge && f.method === 'PAYNOW' && !v.payPhoto) { toast('Add a photo of the customer’s PayNow payment.'); return; }
     save.disabled = true;
     const r = await post('/api/visit/leave', Object.assign({ id: v.id }, f, { later: !!f.later, noCharge: !!f.noCharge }));
     save.disabled = false;
