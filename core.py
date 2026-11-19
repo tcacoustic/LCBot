@@ -3721,6 +3721,13 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:6px; padding:10px 12px; font-size:16px; background:var(--card); color:var(--ink); }
   .fld textarea { min-height:110px; resize:vertical; }
   .fld .note { margin-top:4px; }
+  .mestats { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; }
+  .mest { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:10px 12px; }
+  .mest .n { font-size:26px; font-weight:800; } .mest .l { font-size:12px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); }
+  .mest:first-child { grid-column:1 / -1; }
+  .lab-m { font-size:12px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin:14px 0 6px; }
+  .pd { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  .pd:last-child { border-bottom:0; } .pd span { color:var(--muted); } .pd b { text-align:right; }
   .phn { user-select:all; -webkit-user-select:all; font-weight:700; }
   /* Dates and times are typed straight through (see typedDates) */
   .tdt-row { display:flex; gap:6px; align-items:stretch; }
@@ -5444,14 +5451,47 @@ function meView(d) {
   const m = d.me || {};
   let h = '<h1>' + esc(m.name || 'Me') + '</h1><div class="sub">' + esc((m.teams || []).join(' + ') || 'On-Site') + '</div>';
   h += '<div class="case"><div class="meta">Country</div><div class="nm">' + esc(m.countryName || ((REGION_FLAGS[m.country] || '') + ' ' + (m.country || ''))) + '</div></div>';
+  const st = m.stats || {};
+  const stat = (n, l) => '<div class="mest"><div class="n">' + (n || 0) + '</div><div class="l">' + l + '</div></div>';
+  h += '<h2>Your visits</h2><div class="mestats">' + stat(st.month, 'This month') + stat(st.total, 'All time')
+     + stat(st.firstTime, 'Resolved first visit') + stat(st.followups, 'Needed a return') + stat(st.replacements, 'Needed a replacement') + '</div>';
+  const past = m.past || [];
+  h += '<h2>Past visits</h2>';
+  if (!past.length) h += '<div class="empty">Finished visits show here.</div>';
+  let mon = '';
+  past.forEach(p => {
+    if (p.month !== mon) { mon = p.month; h += '<div class="lab-m">' + esc(mon) + '</div>'; }
+    const tag = p.outcome === 'RESOLVED' ? 'green' : p.outcome === 'RETURN' ? 'red' : 'amber';
+    h += '<div class="case" data-past="' + p.id + '" style="cursor:pointer"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+       + esc(p.when) + ' · ' + esc(p.name) + '</span><span class="tag ' + tag + '">' + esc(p.outcomeName.toUpperCase()) + '</span></div>'
+       + '<div class="meta">' + esc(p.type) + (p.product ? ' · ' + esc(p.product) : '') + (p.postal ? ' · ' + esc(p.postal) : '') + (p.followup ? ' · follow-up' : '') + '</div></div>';
+  });
   h += '<button class="big ghost" id="meFb" style="margin-top:14px">🔧 Send feedback</button>';
   h += '<div class="note">Ideas, problems or questions go straight to the team that runs the bot.</div>';
+  return h;
+}
+
+function pastDetail(p) {
+  const row = (k, v) => v ? '<div class="pd"><span>' + k + '</span><b>' + esc(v) + '</b></div>' : '';
+  let h = '<div class="more" id="pastBack">‹ Me</div><h1>Visit #' + p.id + '</h1><div class="sub">' + esc(p.when) + '</div>';
+  h += '<div class="case">' + row('Customer', p.name) + row('Area', p.postal) + row('Type', p.type) + row('Product', p.product)
+     + row('Issue', p.issue) + row('Outcome', p.outcomeName) + row('Time on site', p.onSite) + row('Charge', p.charge)
+     + row('Why it didn’t finish', p.why) + row('Next visit', p.next) + row('Signed off by', p.signed)
+     + row('Photos', p.photos ? String(p.photos) : '') + row('Payment photo', p.payPhoto ? 'Yes' : '') + row('Follow-up visit', p.wasFollowup ? 'Yes' : '') + '</div>';
+  if ((p.done || []).length) h += '<h2>Done</h2><div class="case">' + p.done.map(x => '<div class="meta" style="font-size:14px;padding:3px 0">✓ ' + esc(x) + '</div>').join('') + '</div>';
   return h;
 }
 
 function wireSpecTabs() {
   const fb = document.getElementById('meFb');
   if (fb) fb.onclick = () => { FB.back = VIEW; VIEW = 'fb'; render(); };
+  document.querySelectorAll('[data-past]').forEach(el => el.onclick = async () => {
+    const r = await post('/api/visit/past', { id: Number(el.dataset.past) });
+    if (!r.ok) { toast(r.error || 'Could not open that.'); return; }
+    document.getElementById('app').innerHTML = pastDetail(r.visit) + navBar();
+    wire(); window.scrollTo(0, 0);
+    document.getElementById('pastBack').onclick = () => render();
+  });
 }
 
 function wireVisits(d) {
