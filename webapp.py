@@ -783,7 +783,7 @@ VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visi
                "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime",
                "/api/visit/arrive", "/api/visit/check", "/api/visit/leave", "/api/visit/one",
                "/api/visit/request", "/api/visit/paynow", "/api/visit/reviewqr", "/api/visit/cab",
-               "/api/visit/photo"}
+               "/api/visit/photo", "/api/visit/payphoto"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -875,11 +875,17 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
             cents = round(float(str(b.get("amount") or "0").replace(",", "")) * 100)
         except ValueError:
             cents = 0
-        if cents <= 0:
+        if cents <= 0 and not static_qr_id():
             return {"ok": False, "error": "Type the amount first."}
-        qr = paynow_qr(v, cents)
-        return {"ok": True, "sample": qr["sample"], "img": data_uri(qr["png"]), "ref": qr["ref"],
-                "amount": money_text(cents, CURRENCY.get(v["country"], "SGD"))}
+        qr = on_bot_loop(qr_for(bot_ref(), v, cents), timeout=20)
+        if not qr:
+            return {"ok": False, "error": "Couldn't load the QR just now."}
+        amt = money_text(cents, CURRENCY.get(v["country"], "SGD")) if cents > 0 else ""
+        return {"ok": True, "sample": qr["sample"], "static": qr.get("static", False), "img": data_uri(qr["png"]),
+                "ref": qr["ref"], "amount": amt}
+    if path == "/api/visit/payphoto":
+        return on_bot_loop(payment_photo_from_app(user_id, num("id"), str(b.get("photo") or "")),
+                           timeout=30) or {"ok": False, "error": "Couldn't save the photo just now."}
     if path == "/api/visit/cab":
         return on_bot_loop(cab_from_app(user_id, num("id"), str(b.get("trip") or ""), str(b.get("amount") or ""),
                                         str(b.get("photo") or "")),
