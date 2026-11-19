@@ -783,7 +783,7 @@ VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visi
                "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime",
                "/api/visit/arrive", "/api/visit/check", "/api/visit/leave", "/api/visit/one",
                "/api/visit/request", "/api/visit/paynow", "/api/visit/reviewqr", "/api/visit/cab",
-               "/api/visit/photo", "/api/visit/payphoto"}
+               "/api/visit/photo", "/api/visit/payphoto", "/api/visit/signoff"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -883,6 +883,10 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         amt = money_text(cents, CURRENCY.get(v["country"], "SGD")) if cents > 0 else ""
         return {"ok": True, "sample": qr["sample"], "static": qr.get("static", False), "img": data_uri(qr["png"]),
                 "ref": qr["ref"], "amount": amt}
+    if path == "/api/visit/signoff":
+        return on_bot_loop(signoff_from_app(user_id, num("id"), str(b.get("name") or ""), bool(b.get("consent")),
+                                            str(b.get("sig") or "")),
+                           timeout=30) or {"ok": False, "error": "Couldn't save the sign-off just now."}
     if path == "/api/visit/payphoto":
         return on_bot_loop(payment_photo_from_app(user_id, num("id"), str(b.get("photo") or "")),
                            timeout=30) or {"ok": False, "error": "Couldn't save the photo just now."}
