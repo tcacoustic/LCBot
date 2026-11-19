@@ -752,6 +752,7 @@ def main() -> None:
     app.add_handler(
         ConversationHandler(
             entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:\d+$"),
+                          CallbackQueryHandler(on_nf_time_start, pattern=r"^vn:x:\d+$"),
                           CallbackQueryHandler(on_rq_reason_start, pattern=r"^oq:r:\d+$"),
                           CallbackQueryHandler(on_cab_trip, pattern=r"^cb:p:\d+:[A-Z]+$")],
             states={ONS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ons_text)]},

@@ -3901,7 +3901,7 @@ function typedDates(root) {
         const m = v.match(/^(\d{2}):(\d{2})$/);
         let h = m ? +m[1] : (v.length >= 2 ? +v.slice(0, 2) : NaN);
         if (h > 12 && h < 24) { box.value = String(h - 12).padStart(2, '0') + v.slice(2); h -= 12; ap = 'PM'; apPicked = true; }
-        if (!apPicked && h >= 1 && h <= 12) ap = (h >= 8 && h <= 11) ? 'AM' : 'PM';   // shop hours
+        if (!apPicked && h >= 1 && h <= 12) ap = (h === 10 || h === 11) ? 'AM' : 'PM';   // visits run ~10am-6pm; tap to change
         showAp();
         if (!m) { set(''); say(''); return; }
         const mm = +m[2];
