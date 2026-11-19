@@ -1037,7 +1037,8 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
         "canTrack": bool(tracker_countries(user_id)),
         "me": ({"name": display_name_of(user_id, "You"),
                 "teams": [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id)],
-                "country": country, "countryName": COUNTRY_NAMES.get(country, country)}
+                "country": country, "countryName": COUNTRY_NAMES.get(country, country),
+                **my_history(user_id)}
                if role == "specialist" else None),
     }
 
@@ -1585,6 +1586,56 @@ def followup_sort(v) -> tuple:
     if not v["followup_of"]:
         return (1, 9, v["starts_at"])
     return (0, URGENCY_RANK.get(v["urgency"] or "MEDIUM", 1), v["starts_at"])
+
+
+# The specialist's own numbers and past visits on the Me tab. Only their own,
+# no comparisons. Past visits show first name, area and product only: once a
+# visit is done the phone number and full address aren't needed on their phone.
+def my_history(user_id: int) -> dict:
+    rows = q("SELECT * FROM appointments WHERE specialist_id=? AND status='COMPLETED' "
+             "ORDER BY COALESCE(left_at, starts_at) DESC", (user_id,))
+    month = now().astimezone(TZ).strftime("%Y-%m")
+    done_at = lambda v: datetime.fromisoformat(v["left_at"] or v["starts_at"]).astimezone(COUNTRY_TZ[v["country"]])
+    past = []
+    for v in rows[:60]:
+        at = done_at(v)
+        past.append({"id": v["id"], "month": at.strftime("%B %Y"), "when": at.strftime("%a %-d %b"),
+                     "name": (v["customer_name"] or "").split(" ")[0], "postal": v["postal"] or "",
+                     "product": v["product"] or "", "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+                     "outcome": v["outcome"] or "", "outcomeName": OUTCOME_NAMES.get(v["outcome"], "Completed")[2:],
+                     "followup": bool(v["followup_of"])})
+    return {"stats": {
+                "month": sum(1 for v in rows if done_at(v).strftime("%Y-%m") == month),
+                "total": len(rows),
+                "firstTime": sum(1 for v in rows if v["outcome"] == "RESOLVED" and not v["followup_of"]),
+                "followups": sum(1 for v in rows if v["outcome"] == "RETURN"),
+                "replacements": sum(1 for v in rows if v["outcome"] == "REPLACE")},
+            "past": past}
+
+
+def past_visit(user_id: int, appt_id: int) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "COMPLETED":
+        return {"ok": False, "error": "That visit isn't in your past visits."}
+    tz = COUNTRY_TZ[v["country"]]
+    ticks = ticks_of(v["id"])
+    nxt = next_visit_of(v["id"])
+    signed = signoff_of(v["id"])
+    out = {"id": v["id"], "country": v["country"], "when": day_time(span_of(v)[0].astimezone(tz)),
+           "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+           "name": (v["customer_name"] or "").split(" ")[0], "postal": v["postal"] or "",
+           "product": v["product"] or "", "issue": v["issue"] or "",
+           "outcomeName": OUTCOME_NAMES.get(v["outcome"], "Completed")[2:],
+           "onSite": mins_text(visit_minutes(v)) if v["arrived_at"] and v["left_at"] else "",
+           "done": [x for i, x in enumerate(checklist_of(v)) if i in ticks],
+           "charge": (money_text(v["amount_cents"], v["currency"]) + " by "
+                      + dict(PAY_METHODS).get(v["pay_method"], v["pay_method"] or "")) if v["amount_cents"] else "No charge",
+           "signed": signed.get("name", ""), "photos": photos_of(v["id"]),
+           "payPhoto": bool(payment_photo_of(v["id"])),
+           "why": nf_reason_text(v["id"]) if v["outcome"] == "RETURN" else "",
+           "next": (when_text(nxt) if nxt["status"] != "ARRANGING" else "Customer will confirm") if nxt else "",
+           "wasFollowup": bool(v["followup_of"])}
+    return {"ok": True, "visit": out}
 
 
 def next_visit_of(appt_id: int):
