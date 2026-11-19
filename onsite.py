@@ -1474,7 +1474,9 @@ async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
         v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
         log_visit(appt_id, uid, "completed", OUTCOME_NAMES.get(v["outcome"], "")[2:])
     await unpin_visit(bot, appt_id)
-    report = "🏁 Visit completed\n\n" + visit_text(v) + "\n\n" + report_lines(v)
+    signed = signoff_of(appt_id)
+    report = ("🏁 Visit completed\n\n" + visit_text(v) + "\n\n" + report_lines(v)
+              + (f"\n✍️ Signed off by {signed['name']}" if signed.get("name") else ""))
     done = "✅ Done, the report has gone to SH. Thank you!\n\n" + report_lines(v)
     kb = None
     if v["outcome"] == "REPLACE":
@@ -1506,6 +1508,8 @@ async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
             target = json.loads(where)
             kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
             await bot.send_message(target["chat"], report, disable_web_page_preview=True, **kw)
+            if signed.get("file"):
+                await bot.send_photo(target["chat"], signed["file"], caption=f"✍️ Sign-off · visit #{appt_id}", **kw)
             if pay:
                 await bot.send_photo(target["chat"], pay, caption=cap, **kw)
         except Exception as e:
@@ -1986,6 +1990,7 @@ def visit_screen(v, user_id: int) -> dict:
         "canRequest": may_request(v, user_id), "reviewQr": bool(REVIEW_URL),
         "paynowReady": bool(PAYNOW_UEN) and v["country"] == "SG",
         "payPhoto": bool(payment_photo_of(v["id"])),
+        "signed": signoff_of(v["id"]).get("name", ""), "signText": SIGNOFF_TEXT, "signDraft": SIGNOFF_DRAFT,
         "canClaim": may_claim(v, user_id),
     }
     if v["status"] == "ONSITE":
@@ -2727,6 +2732,58 @@ async def _payment_photo(update, context) -> bool:
 
 ONS_PHOTO_HANDLERS.insert(0, _payment_photo)
 ONS_PHOTO_HANDLERS.insert(0, _paynow_qr_photo)
+
+
+# Customer sign-off in the App, instead of the Zoho form: the customer reads what
+# was done, types their name, ticks the consent and signs with a finger. The
+# signature image goes to SH (whoever booked the visit) as the record, and its
+# file id, name and time go in the visit's log. SIGNOFF_TEXT is DRAFT wording
+# until TC confirms it.
+SIGNOFF_DRAFT = True
+SIGNOFF_TEXT = ("I confirm the work above was done and my product was working when the specialist left. "
+                "I agree to TC Acoustic keeping this record of the visit.")
+
+
+def signoff_of(appt_id: int) -> dict:
+    r = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='signoff' ORDER BY id DESC LIMIT 1",
+           (appt_id,))
+    try:
+        return json.loads(r["note"]) if r else {}
+    except ValueError:
+        return {}
+
+
+def signoff_summary(v, name: str) -> str:
+    tz = COUNTRY_TZ[v["country"]]
+    ticks = ticks_of(v["id"])
+    done = [x for i, x in enumerate(checklist_of(v)) if i in ticks]
+    lines = [f"✍️ Customer sign-off · visit #{v['id']}",
+             f"{VISIT_NAMES.get(v['visit_type'], v['visit_type'])} · {v['product'] or ''}".rstrip(" ·"),
+             f"Signed by {name} · {now().astimezone(tz).strftime('%a %-d %b, ')}{t12(now().astimezone(tz).strftime('%H:%M'))}"]
+    if done:
+        lines.append("Done: " + "; ".join(done))
+    return "\n".join(lines)[:1000]
+
+
+async def signoff_from_app(user_id: int, appt_id: int, name: str, consent: bool, sig: str) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "The customer signs while you're on site."}
+    name = " ".join(str(name or "").split())[:80]
+    if len(name) < 2:
+        return {"ok": False, "error": "Ask the customer to type their name."}
+    if not consent:
+        return {"ok": False, "error": "The customer needs to tick the box."}
+    img = photo_bytes(sig)
+    if not img:
+        return {"ok": False, "error": "The signature didn't come through. Try again."}
+    cap = signoff_summary(v, name)
+    fid = await upload_photo(bot_ref(), v["created_by"], img, cap) or await upload_photo(bot_ref(), user_id, img, cap)
+    if not fid:
+        return {"ok": False, "error": "Couldn't save the sign-off just now."}
+    async with write_lock:
+        log_visit(appt_id, user_id, "signoff", json.dumps({"file": fid, "name": name, "at": now().isoformat()}))
+    return {"ok": True, "name": name}
 
 
 async def payment_photo_from_app(user_id: int, appt_id: int, photo: str) -> dict:

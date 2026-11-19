@@ -5031,7 +5031,8 @@ function visitScreen(v) {
     }).join('') + '</div>';
     h += '<h2>Photos (optional)</h2><label class="big ghost" style="display:block;text-align:center">📷 Add a photo<input type="file" accept="image/*" data-vphoto="1" hidden></label><div class="note">'
        + (v.photos ? v.photos + ' added so far.' : 'None yet.') + '</div>';
-    h += '<div class="more" data-map="' + esc(v.formUrl) + '">📝 Open the customer sign-off form</div>';
+    h += '<h2>Customer sign-off</h2>' + (v.signed ? '<div class="case"><div class="nm">✅ Signed by ' + esc(v.signed) + '</div><div class="meta">Sent to SH with the visit.</div></div>'
+       : (VS.sign ? signForm(v) : '<button class="big ghost" data-signopen="1">✍️ Customer signs here</button>'));
     h += '<button class="big" data-leave="' + v.id + '">🏁 Leave</button>';
   }
   if (v.status === 'COMPLETED' && v.report) h += '<div class="case"><div class="body">' + esc(v.report) + '</div></div>';
@@ -5058,6 +5059,19 @@ function rqForm(v) {
     + '<div class="note">Finance gets these in their chat and emails the customer a payment link. They aren’t posted in SH x Ops.</div></div>';
   h += '<button class="big" id="rqSend">Send to SH x Ops</button><button class="big ghost" id="rqBack2">Back</button>';
   return h;
+}
+
+// The customer signs on the specialist's phone: what was done, their name, the consent tick and a signature.
+function signForm(v) {
+  const f = VS.sign, done = (v.checklist || []).filter((x, i) => (v.ticks || []).includes(i));
+  return '<div class="case"><div class="nm">Visit #' + v.id + ' · ' + esc(v.type) + (v.product ? ' · ' + esc(v.product) : '') + '</div>'
+    + (done.length ? '<div class="meta" style="margin-top:6px">Done: ' + done.map(esc).join('; ') + '</div>' : '') + '</div>'
+    + '<div class="fld"><label>Your name</label><input id="sg_name" autocomplete="off" value="' + esc(f.name || '') + '"></div>'
+    + '<div class="top" data-sgok="1" style="padding:6px 0;cursor:pointer"><div class="tick' + (f.consent ? ' on' : '') + '">' + (f.consent ? '✓' : '') + '</div><div style="padding-top:3px">' + esc(v.signText) + '</div></div>'
+    + (v.signDraft ? '<div class="note">Draft wording until TC confirms it.</div>' : '')
+    + '<div class="fld"><label>Sign here</label><canvas id="sg_pad" style="width:100%;height:180px;background:#fff;border:2px solid #8A9099;border-radius:6px;touch-action:none"></canvas>'
+    + '<button class="big ghost" id="sgClear" style="margin-top:6px">Clear</button></div>'
+    + '<button class="big" id="sgSave">Confirm sign-off</button><button class="big ghost" id="sgBack">Back</button>';
 }
 
 function cabForm(v) {
@@ -5141,6 +5155,34 @@ async function loadVisitScreen(d) {
     if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
     document.getElementById('pnbox').innerHTML = qrImg(r.img, r.sample, r.static ? 'Scan to pay TC Acoustic' + (r.amount ? ' · customer keys in ' + r.amount : '') : r.amount + ' · Reference ' + r.ref);
   });
+  on('[data-signopen]', () => { VS.sign = {}; loadVisits(); });
+  const pad = document.getElementById('sg_pad');
+  if (pad) {
+    const r0 = pad.getBoundingClientRect(), k = window.devicePixelRatio || 1;
+    pad.width = r0.width * k; pad.height = r0.height * k;
+    const g = pad.getContext('2d'); g.scale(k, k); g.lineWidth = 2.5; g.lineCap = 'round'; g.lineJoin = 'round'; g.strokeStyle = '#101418';
+    let drawing = false, inked = false;
+    const at = e => { const r = pad.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    pad.onpointerdown = e => { drawing = true; pad.setPointerCapture(e.pointerId); const [x, y] = at(e); g.beginPath(); g.moveTo(x, y); };
+    pad.onpointermove = e => { if (!drawing) return; const [x, y] = at(e); g.lineTo(x, y); g.stroke(); inked = true; };
+    pad.onpointerup = pad.onpointercancel = () => { drawing = false; };
+    document.getElementById('sgClear').onclick = () => { g.clearRect(0, 0, pad.width, pad.height); inked = false; };
+    const keepSign = () => { const n = document.getElementById('sg_name'); if (n) VS.sign.name = n.value; };
+    on('[data-sgok]', () => { keepSign(); VS.sign.consent = !VS.sign.consent; const t = document.querySelector('[data-sgok] .tick'); t.classList.toggle('on', VS.sign.consent); t.textContent = VS.sign.consent ? '✓' : ''; });
+    document.getElementById('sgBack').onclick = () => { VS.sign = null; loadVisits(); };
+    const sv = document.getElementById('sgSave');
+    sv.onclick = async () => {
+      keepSign();
+      if (!(VS.sign.name || '').trim()) { toast('Ask the customer to type their name.'); return; }
+      if (!VS.sign.consent) { toast('The customer needs to tick the box.'); return; }
+      if (!inked) { toast('Ask the customer to sign.'); return; }
+      sv.disabled = true; sv.textContent = 'Saving…';
+      const r = await post('/api/visit/signoff', { id: v.id, name: VS.sign.name, consent: true, sig: pad.toDataURL('image/png') });
+      sv.disabled = false; sv.textContent = 'Confirm sign-off';
+      if (!r.ok) { toast(r.error || 'Could not save the sign-off.'); return; }
+      VS.sign = null; toast('Signed. Thank you!'); loadVisits();
+    };
+  }
   document.querySelectorAll('[data-payphoto]').forEach(el => el.onchange = async () => {
     keepLeave();
     const img = await shrinkPhoto(el.files && el.files[0]);
