@@ -5035,8 +5035,13 @@ function rqForm(v) {
   h += '<div class="fld"><label>Need</label><div class="pick">' + pick('need', 'REPLACEMENT', 'Replacement unit') + pick('need', 'PART', 'Part') + pick('need', 'OTHER', 'Other') + '</div></div>';
   h += '<div class="fld"><label>Reason</label><textarea id="rq_reason" rows="2" placeholder="Won’t power on, fault confirmed on site">' + esc(f.reason || '') + '</textarea></div>';
   h += '<div class="fld"><label>Warranty</label><div class="pick">' + pick('warranty', 'IN', 'In warranty') + pick('warranty', 'OUT', 'Out of warranty') + '</div></div>';
-  h += '<div class="fld"><label>Price (' + esc(v.currency || 'SGD') + ', leave empty if to confirm)</label><input id="rq_price" inputmode="decimal" value="' + esc(f.price || '') + '"></div>';
-  h += '<div class="fld"><label>Customer pays by</label><div class="pick">' + pick('pays_by', 'LINK', 'Payment link') + pick('pays_by', 'PAYNOW', 'PayNow') + pick('pays_by', 'NONE', 'No charge') + '</div></div>';
+  h += '<div class="fld"><label>Customer pays by</label><div class="pick">' + pick('pays_by', 'NONE', 'No charge') + pick('pays_by', 'PAYNOW', 'PayNow') + pick('pays_by', 'LINK', 'Payment link') + '</div></div>';
+  const paid = f.pays_by === 'PAYNOW' || f.pays_by === 'LINK';
+  h += '<div class="fld"><label>Price (' + esc(v.currency || 'SGD') + (paid ? ')' : ', leave empty if to confirm)') + '</label><input id="rq_price" inputmode="decimal" placeholder="120.00" value="' + esc(f.price || '') + '"></div>';
+  if (f.pays_by === 'PAYNOW') h += '<button class="big ghost" data-rqpn="1">Show PayNow QR</button><div id="rqpnbox"></div>';
+  if (f.pays_by === 'LINK') h += '<div class="fld"><label>Customer name</label><input id="rq_cname" autocomplete="off" value="' + esc(f.cust_name || '') + '"></div>'
+    + '<div class="fld"><label>Customer email</label><input id="rq_cemail" type="email" autocomplete="off" placeholder="name@example.com" value="' + esc(f.cust_email || '') + '">'
+    + '<div class="note">Finance gets these in their chat and emails the customer a payment link. They aren’t posted in SH x Ops.</div></div>';
   h += '<button class="big" id="rqSend">Send to SH x Ops</button><button class="big ghost" id="rqBack2">Back</button>';
   return h;
 }
@@ -5054,6 +5059,8 @@ function keepRq() {
   if (!VS.rq) return;
   const r = document.getElementById('rq_reason'), p = document.getElementById('rq_price');
   if (r) VS.rq.reason = r.value; if (p) VS.rq.price = p.value;
+  const cn = document.getElementById('rq_cname'), ce = document.getElementById('rq_cemail');
+  if (cn) VS.rq.cust_name = cn.value; if (ce) VS.rq.cust_email = ce.value;
 }
 
 function leaveForm(v) {
@@ -5123,6 +5130,12 @@ async function loadVisitScreen(d) {
     if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
     document.getElementById('rvbox').innerHTML = qrImg(r.img, false, 'Scan to leave us a review');
   });
+  on('[data-rqpn]', async () => {
+    keepRq();
+    const r = await post('/api/visit/paynow', { id: v.id, amount: VS.rq.price });
+    if (!r.ok) { toast(r.error || 'Type the price first.'); return; }
+    document.getElementById('rqpnbox').innerHTML = qrImg(r.img, r.sample, r.amount + ' · Reference ' + r.ref);
+  });
   on('[data-rqopen]', () => { VS.rq = {}; loadVisits(); });
   on('[data-cabopen]', () => { VS.cab = {}; loadVisits(); });
   on('[data-cabt]', el => { const a = document.getElementById('cab_amount'); if (a) VS.cab.amount = a.value; VS.cab.trip = el.dataset.cabt; loadVisits(); });
@@ -5147,11 +5160,13 @@ async function loadVisitScreen(d) {
     const f = VS.rq;
     if (!f.need || !f.warranty || !f.pays_by) { toast('Pick the need, warranty and how they pay.'); return; }
     if (!f.reason || f.reason.trim().length < 3) { toast('Say why in a few words.'); return; }
+    if ((f.pays_by === 'PAYNOW' || f.pays_by === 'LINK') && !(parseFloat(f.price) > 0)) { toast('Type the price the customer pays.'); return; }
+    if (f.pays_by === 'LINK' && (!(f.cust_name || '').trim() || !/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test((f.cust_email || '').trim()))) { toast('Type the customer’s name and email.'); return; }
     rs.disabled = true;
     const r = await post('/api/visit/request', Object.assign({ id: v.id }, f));
     rs.disabled = false;
     if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
-    VS.rq = null; toast(r.posted ? 'Sent to SH x Ops' : 'Sent to the On-Site admins (no request chat set yet)'); loadVisits();
+    VS.rq = null; toast((r.posted ? 'Sent to SH x Ops' : 'Sent to the On-Site admins (no request chat set yet)') + (f.pays_by === 'LINK' ? '. Finance will email the payment link.' : '')); loadVisits();
   };
   on('[data-lf]', el => { keepLeave(); VS.lv[el.dataset.lf] = el.dataset.v; loadVisits(); });
   const back = document.getElementById('lfBack');

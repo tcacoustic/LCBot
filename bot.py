@@ -754,6 +754,7 @@ def main() -> None:
             entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:\d+$"),
                           CallbackQueryHandler(on_nf_time_start, pattern=r"^vn:x:\d+$"),
                           CallbackQueryHandler(on_rq_reason_start, pattern=r"^oq:r:\d+$"),
+                          CallbackQueryHandler(on_rq_extra_start, pattern=r"^oq:[mc]:\d+$"),
                           CallbackQueryHandler(on_cab_trip, pattern=r"^cb:p:\d+:[A-Z]+$")],
             states={ONS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ons_text)]},
             fallbacks=[CommandHandler("cancel", cancel)],
@@ -766,6 +767,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_rq_button, pattern=r"^oq:[td]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_paynow_button, pattern=r"^vq:[pb]:\d+$"))
     app.add_handler(CommandHandler("requestchat", cmd_requestchat))
+    app.add_handler(CommandHandler("financechat", cmd_financechat))
+    app.add_handler(CallbackQueryHandler(on_finance_button, pattern=r"^fl:[td]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_cab_form, pattern=r"^cb:n:\d+$"))
     app.add_handler(CallbackQueryHandler(on_cab_decision, pattern=r"^cb:[arbx]:\d+(:[A-Z]+)?$"))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
