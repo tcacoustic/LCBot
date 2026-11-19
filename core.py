@@ -3721,6 +3721,16 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:6px; padding:10px 12px; font-size:16px; background:var(--card); color:var(--ink); }
   .fld textarea { min-height:110px; resize:vertical; }
   .fld .note { margin-top:4px; }
+  /* Dates and times are typed straight through (see typedDates) */
+  .tdt-row { display:flex; gap:6px; align-items:stretch; }
+  .tdt { flex:1; width:100%; min-height:48px; border:2px solid #8A9099; border-radius:6px; padding:10px 12px;
+    font-size:16px; background:var(--card); color:var(--ink); font-variant-numeric:tabular-nums; letter-spacing:.04em; }
+  .tdt-ap { display:flex; gap:4px; }
+  .tdt-ap button { min-width:52px; min-height:48px; border:2px solid #8A9099; background:var(--card); color:var(--ink);
+    border-radius:6px; font-size:14px; font-weight:800; cursor:pointer; }
+  .tdt-ap button.on { background:var(--ink); border-color:var(--ink); color:#fff; }
+  .tdt-hint { font-size:13px; color:#5A6068; margin-top:4px; }
+  .tdt-hint.bad { color:#B42318; font-weight:700; }
   .pick { display:flex; gap:6px; flex-wrap:wrap; }
   .pick button { flex:1 1 auto; min-height:48px; border:2px solid var(--line); background:var(--card);
     border-radius:6px; padding:8px 12px; font-size:14px; font-weight:800; cursor:pointer; color:var(--ink); }
@@ -3811,6 +3821,111 @@ let TABS = null;
 let CS_Q = '';   // what the case search box holds; '' = the normal lists
 let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '', mode: 'sched', tw: '', tc: '', ts: '', tv: null };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+// Dates and times are typed straight through instead of the phone's segment pickers:
+// 23112026 -> 23/11/2026, 230 + PM -> 2:30 PM. The original date/time input stays
+// (hidden) under the same id with an ISO value, so the code that reads it is unchanged.
+const TD_DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const TD_MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function tdDigits(raw) {
+  const segs = raw.replace(/[^\d/:]/g, '').split(/[\/:]/);
+  return segs.map((p, i) => (i < segs.length - 1 && p.length === 1 ? '0' + p : p)).join('');
+}
+function tdMaskDate(raw, del) {
+  let d = tdDigits(raw);
+  if (d.length >= 1 && +d[0] > 3) d = '0' + d;                          // day 4-9
+  if (d.length >= 3 && +d[2] > 1) d = d.slice(0, 2) + '0' + d.slice(2);  // month 2-9
+  d = d.slice(0, 8);
+  let out = d.slice(0, 2);
+  if (d.length > 2 || (d.length === 2 && !del)) out += '/';
+  out += d.slice(2, 4);
+  if (d.length > 4 || (d.length === 4 && !del)) out += '/';
+  return out + d.slice(4, 8);
+}
+function tdMaskTime(raw, del) {
+  let d = tdDigits(raw);
+  if (d.length >= 1 && +d[0] > 1) d = '0' + d;                          // hour 2-9
+  d = d.slice(0, 4);
+  let out = d.slice(0, 2);
+  if (d.length > 2 || (d.length === 2 && !del)) out += ':';
+  return out + d.slice(2, 4);
+}
+function typedDates(root) {
+  root.querySelectorAll('input[type=date]:not([data-typed]), input[type=time]:not([data-typed])').forEach(inp => {
+    inp.dataset.typed = '1';
+    const isDate = inp.type === 'date';
+    const wrap = document.createElement('div');
+    wrap.className = 'tdt-row';
+    wrap.style.cssText = inp.style.cssText;
+    const box = document.createElement('input');
+    box.type = 'text'; box.className = 'tdt'; box.inputMode = 'numeric'; box.autocomplete = 'off';
+    box.placeholder = isDate ? 'DD/MM/YYYY' : 'HH:MM';
+    box.setAttribute('aria-label', isDate ? 'Date, day then month then year' : 'Time');
+    wrap.appendChild(box);
+    const hint = document.createElement('div');
+    hint.className = 'tdt-hint';
+    let ap = '', apPicked = false, apBox = null;
+    const showAp = () => apBox && apBox.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.ap === ap));
+    if (!isDate) {
+      apBox = document.createElement('div');
+      apBox.className = 'tdt-ap';
+      apBox.innerHTML = '<button type="button" data-ap="AM">AM</button><button type="button" data-ap="PM">PM</button>';
+      apBox.querySelectorAll('button').forEach(b => b.onclick = () => { ap = b.dataset.ap; apPicked = true; showAp(); update(false); });
+      wrap.appendChild(apBox);
+    }
+    inp.style.display = 'none';
+    inp.parentNode.insertBefore(wrap, inp);
+    inp.parentNode.insertBefore(hint, inp);
+    const set = v => {
+      if (inp.value === v) return;
+      inp.value = v;
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const say = (t, bad) => { hint.textContent = t || ''; hint.classList.toggle('bad', !!bad); };
+    function update(typing) {
+      const v = box.value;
+      if (isDate) {
+        const m = v.match(/^(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/);
+        if (!m || (m[3].length === 2 && typing)) { set(''); say(''); return; }
+        const y = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+        const dt = new Date(y, +m[2] - 1, +m[1]);
+        if (dt.getMonth() !== +m[2] - 1 || dt.getDate() !== +m[1]) { set(''); say('That date doesn’t exist', true); return; }
+        const iso = y + '-' + m[2] + '-' + m[1];
+        if (inp.min && iso < inp.min) { set(''); say('Pick a date from today on', true); return; }
+        if (m[3].length === 2) box.value = m[1] + '/' + m[2] + '/' + y;
+        say(TD_DOW[dt.getDay()] + ' ' + dt.getDate() + ' ' + TD_MON[dt.getMonth()] + ' ' + y);
+        set(iso);
+        if (typing) { const all = [...document.querySelectorAll('.tdt')], nx = all[all.indexOf(box) + 1]; if (nx && !nx.value) nx.focus(); }
+      } else {
+        const m = v.match(/^(\d{2}):(\d{2})$/);
+        let h = m ? +m[1] : (v.length >= 2 ? +v.slice(0, 2) : NaN);
+        if (h > 12 && h < 24) { box.value = String(h - 12).padStart(2, '0') + v.slice(2); h -= 12; ap = 'PM'; apPicked = true; }
+        if (!apPicked && h >= 1 && h <= 12) ap = (h >= 8 && h <= 11) ? 'AM' : 'PM';   // shop hours
+        showAp();
+        if (!m) { set(''); say(''); return; }
+        const mm = +m[2];
+        if (h < 1 || h > 12 || mm > 59) { set(''); say('That time doesn’t exist', true); return; }
+        const h24 = (h % 12) + (ap === 'PM' ? 12 : 0);
+        say('');
+        set(String(h24).padStart(2, '0') + ':' + m[2]);
+      }
+    }
+    if (inp.value) {                                   // show a value that's already there
+      if (isDate) { const p = inp.value.split('-'); box.value = p[2] + '/' + p[1] + '/' + p[0]; }
+      else { const [H, M] = inp.value.split(':'); const h = +H; ap = h >= 12 ? 'PM' : 'AM'; apPicked = true;
+             box.value = String(h % 12 || 12).padStart(2, '0') + ':' + M; showAp(); }
+      update(false);
+    }
+    box.addEventListener('input', e => {
+      const del = (e.inputType || '').startsWith('delete');
+      box.value = isDate ? tdMaskDate(box.value, del) : tdMaskTime(box.value, del);
+      update(true);
+    });
+    box.addEventListener('blur', () => update(false));
+  });
+}
+new MutationObserver(() => typedDates(document)).observe(document.documentElement, { childList: true, subtree: true });
 
 const ICONS = {
   home: 'M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z',
