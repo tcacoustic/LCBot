@@ -3782,6 +3782,11 @@ MINIAPP_HTML = """<!DOCTYPE html>
   body.admin-mode #app > :first-child { border-top:6px solid var(--accent); }
   #app > .back + .eyebrow { padding-top:4px; }
   .p.wait { border-color:var(--accent); }
+  .paycard { background:var(--ink); border-color:var(--ink); color:#fff; margin-top:12px; }
+  .paycard .k { font-size:12px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--headmuted); }
+  .paycard .v { font-size:26px; font-weight:800; margin-top:2px; }
+  .paycard .t { color:var(--headmuted); }
+  #teamKind { margin-bottom:8px; }
   .duo { display:flex; gap:8px; margin-top:10px; }
   .duo button { flex:1; min-height:44px; border-radius:6px; font-size:14px; font-weight:800; cursor:pointer; }
   .duo .ok { background:var(--green); color:#fff; border:2px solid var(--green); }
@@ -3982,7 +3987,7 @@ function caseTags(c, extra) {
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
               ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'],
-              people: [ICONS.shield, 'People'], updates: [ICONS.news, 'Updates'],
+              people: [ICONS.shield, 'People'], pay: [ICONS.hours, 'Pay'], updates: [ICONS.news, 'Updates'],
               today: [ICONS.week, 'Today'], hov: [ICONS.inbox, 'Handovers'], oreq: [ICONS.list, 'Requests'],
               prof: [ICONS.user, 'Me'] };
 // On-Site Specialists get five tabs of their own: Today, Visits, Handovers, Requests, Me.
@@ -4169,6 +4174,10 @@ function renderTeamHome(d) {
     h += d.next ? hero('Next visit · ' + d.next.day + ' ' + d.next.start, d.next.customer,
                        [d.next.type, d.next.address].filter(Boolean).join(' · '), true)
                 : hero('Next visit', 'Nothing booked', '');
+    if (d.pay) h += '<div class="p tappable paycard" data-gopay="1"><div class="ptop"><div>'
+       + `<div class="k">${esc(d.pay.label)}</div><div class="v">${esc(d.pay.total || plural(d.pay.count, 'visit'))}</div></div>`
+       + '<div class="t">›</div></div>'
+       + `<div class="t">${esc(plural(d.pay.count, 'visit'))} · see Pay</div></div>`;
     h += cards([[d.todayVisits.length, 'Visits today'], [d.weekVisits, 'This week']]);
     if (d.todayVisits.length) h += '<h2>Today</h2>' + d.todayVisits.map(v => visitRow({ ...v, specialist: '' })).join('');
     h += '<div class="p tappable" data-gotovis="1" style="margin-top:14px"><div class="pn">'
@@ -4210,6 +4219,7 @@ function renderTeamHome(d) {
   wire();
   wireRequestButton();
   document.querySelectorAll('[data-gotovis]').forEach(el => { el.onclick = () => { VIEW = 'vis'; render(); }; });
+  document.querySelectorAll('[data-gopay]').forEach(el => { el.onclick = () => { VIEW = 'pay'; PAY_MONTH = ''; render(); }; });
   document.querySelectorAll('[data-hcase]').forEach(el => {
     el.onclick = () => {
       if (d.teamHome === 'ON') { ON_GROUP = CH_GROUP[el.dataset.hch] || ON_GROUP; ON_REGION = ''; }
@@ -5451,7 +5461,10 @@ function meView(d) {
   const m = d.me || {};
   let h = '<h1>' + esc(m.name || 'Me') + '</h1><div class="sub">' + esc((m.teams || []).join(' + ') || 'On-Site') + '</div>';
   h += '<div class="case"><div class="meta">Country</div><div class="nm">' + esc(m.countryName || ((REGION_FLAGS[m.country] || '') + ' ' + (m.country || ''))) + '</div></div>';
-  const st = m.stats || {};
+  const st = m.stats || {}, pay = m.pay;
+  if (pay) h += '<div class="p tappable paycard" data-gopay="1" style="cursor:pointer"><div class="ptop"><div>'
+     + '<div class="k">' + esc(pay.label) + '</div><div class="v">' + esc(pay.total || 'Rate not set') + '</div></div><div class="t">›</div></div>'
+     + '<div class="t">' + pay.count + ' visit' + (pay.count === 1 ? '' : 's') + ' · tap for details</div></div>';
   const stat = (n, l) => '<div class="mest"><div class="n">' + (n || 0) + '</div><div class="l">' + l + '</div></div>';
   h += '<h2>Your visits</h2><div class="mestats">' + stat(st.month, 'This month') + stat(st.total, 'All time')
      + stat(st.firstTime, 'Resolved first visit') + stat(st.followups, 'Needed a return') + stat(st.replacements, 'Needed a replacement') + '</div>';
@@ -5485,13 +5498,18 @@ function pastDetail(p) {
 function wireSpecTabs() {
   const fb = document.getElementById('meFb');
   if (fb) fb.onclick = () => { FB.back = VIEW; VIEW = 'fb'; render(); };
-  document.querySelectorAll('[data-past]').forEach(el => el.onclick = async () => {
-    const r = await post('/api/visit/past', { id: Number(el.dataset.past) });
-    if (!r.ok) { toast(r.error || 'Could not open that.'); return; }
-    document.getElementById('app').innerHTML = pastDetail(r.visit) + navBar();
-    wire(); window.scrollTo(0, 0);
-    document.getElementById('pastBack').onclick = () => render();
-  });
+  document.querySelectorAll('[data-past]').forEach(el => el.onclick = () => openPast(Number(el.dataset.past), 'Me', () => render()));
+  document.querySelectorAll('[data-gopay]').forEach(el => el.onclick = () => { VIEW = 'pay'; PAY_MONTH = ''; render(); });
+}
+
+// A finished visit's details (from Me or Pay), with a Back link to where it came from.
+async function openPast(id, backName, back) {
+  const r = await post('/api/visit/past', { id });
+  if (!r.ok) { toast(r.error || 'Could not open that.'); return; }
+  document.getElementById('app').innerHTML = pastDetail(r.visit) + navBar();
+  wire(); window.scrollTo(0, 0);
+  const b = document.getElementById('pastBack');
+  b.textContent = '‹ ' + backName; b.onclick = back;
 }
 
 function wireVisits(d) {
@@ -5798,7 +5816,7 @@ async function loadTeam() {
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
 
-  let h = adminHead() + '<h1>Team</h1><div class="seg">'
+  let h = adminHead() + '<h1>Team</h1>' + teamKindSeg() + '<div class="seg">'
     + `<div data-p="week" class="${MODE === 'week' ? 'on' : ''}">Week</div>`
     + `<div data-p="month" class="${MODE === 'month' ? 'on' : ''}">Month</div>`
     + '</div>';
@@ -5845,6 +5863,7 @@ async function loadTeam() {
   }
   app.innerHTML = h + navBar();
   wire();
+  wireTeamKind();
 }
 
 // Special request to Ops: the same steps as /request in the bot, on one screen.
@@ -6023,6 +6042,74 @@ function loadFeedback() {
   };
 }
 
+// On-Site specialists are paid per visit: the Pay tab, and Admin → Team → On-Site.
+let PAY_MONTH = '', TEAM_KIND = '', TEAM_KINDS = [];
+function monthNav(d) {
+  return '<div class="nav">'
+    + `<button id="mPrev" data-m="${d.prev}">‹</button><div class="m">${esc(d.label)}</div>`
+    + `<button id="mNext" data-m="${d.next}" ${d.hasNext ? '' : 'disabled'}>›</button></div>`;
+}
+function wireMonthNav(go) {
+  const p = document.getElementById('mPrev'), n = document.getElementById('mNext');
+  if (p) p.onclick = () => go(p.dataset.m);
+  if (n) n.onclick = () => go(n.dataset.m);
+}
+async function loadPay() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/pay' + (PAY_MONTH ? '?month=' + PAY_MONTH : ''));
+  const TAG = { RESOLVED: 'green', RETURN: 'red', REPLACE: 'amber', CANCELLED: 'grey' };
+  const row = (v, counts) => `<div class="case${counts ? '' : ' gone'}"${counts ? ` data-pvisit="${v.id}" style="cursor:pointer"` : ''}>`
+    + `<div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>${esc(v.day)} · ${esc(v.customer)}</span>`
+    + `<span class="tag ${TAG[v.key] || 'grey'}">${esc(String(v.outcome).toUpperCase())}</span></div>`
+    + `<div class="meta">${esc(v.type)}${v.product ? ' · ' + esc(v.product) : ''}${v.postal ? ' · ' + esc(v.postal) : ''}</div></div>`;
+  let h = (isSpecTabs() ? '<div class="more" id="payBack">‹ Me</div>' : '') + '<h1>Pay</h1><div class="sub">Your pay by month</div>' + monthNav(d);
+  h += '<div class="cards">'
+    + `<div class="card pay wide"><div class="n">${esc(d.total || (d.count + ' visit' + (d.count === 1 ? '' : 's')))}</div>`
+    + `<div class="l">${d.total ? 'Total pay' : 'Rate not set: ask an admin'}</div></div>`
+    + `<div class="card"><div class="n">${d.count}</div><div class="l">Visits</div></div>`
+    + `<div class="card"><div class="n">${d.resolved}</div><div class="l">Resolved</div></div></div>`;
+  h += d.counted.length ? '<h2>Visits that count</h2>' + d.counted.map(v => row(v, true)).join('')
+                        : '<div class="empty">No finished visits this month yet.</div>';
+  if (d.notCounted.length) h += '<h2>Not counted</h2>' + d.notCounted.map(v => row(v, false)).join('');
+  h += '<div class="note">A visit counts once you tap 🏁 Leave. Wrong? Tap 🔧 and tell us which visit.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  wireMonthNav(m => { PAY_MONTH = m; loadPay(); });
+  const pb = document.getElementById('payBack');
+  if (pb) pb.onclick = () => { VIEW = 'prof'; render(); };
+  document.querySelectorAll('[data-pvisit]').forEach(el => el.onclick = () => openPast(Number(el.dataset.pvisit), 'Pay', () => loadPay()));
+}
+async function loadTeamOnsite() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/team/onsite' + (PAY_MONTH ? '?month=' + PAY_MONTH : ''));
+  let h = adminHead() + '<h1>Team</h1>' + teamKindSeg() + monthNav(d);
+  h += '<div class="cards">'
+    + `<div class="card"><div class="n">${d.done}</div><div class="l">Visits done</div></div>`
+    + `<div class="card"><div class="n">${d.people.length}</div><div class="l">Specialists</div></div></div>`;
+  h += d.people.length ? '<h2>By specialist</h2>' + d.people.map(p =>
+      `<div class="p"><div class="ptop"><div class="pn">${esc(p.flag)} ${esc(p.name)}</div><div class="pp">${esc(p.pay)}</div></div>`
+      + `<div class="t">${p.count} visit${p.count === 1 ? '' : 's'}</div></div>`).join('')
+    : '<div class="empty">No On-Site specialists yet.</div>';
+  if (d.people.length) h += '<div class="p" style="background:var(--ink);color:#fff;border-color:var(--ink)"><div class="ptop"><div class="pn">Total</div><div class="pp">' + esc(d.total || 'Rate not set') + '</div></div>'
+    + '<div class="t" style="color:var(--headmuted)">' + d.done + ' visit' + (d.done === 1 ? '' : 's') + '</div></div>';
+  h += '<div class="note">Each country is paid in its own currency.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  wireTeamKind();
+  wireMonthNav(m => { PAY_MONTH = m; loadTeamOnsite(); });
+}
+function teamKindSeg() {
+  if (TEAM_KINDS.length < 2) return '';
+  return '<div class="seg" id="teamKind">'
+    + `<div data-tk="lc" class="${TEAM_KIND === 'lc' ? 'on' : ''}">Livechat</div>`
+    + `<div data-tk="onsite" class="${TEAM_KIND === 'onsite' ? 'on' : ''}">On-Site</div></div>`;
+}
+function wireTeamKind() {
+  document.querySelectorAll('[data-tk]').forEach(el => el.onclick = () => {
+    TEAM_KIND = el.dataset.tk; START = ''; PAY_MONTH = ''; AGENT = null; render();
+  });
+}
+
 // 🛡 Admin: admins flip between their own App and the admin side (People, Team).
 let ADMIN_TABS = null, ADMIN_MODE = false;
 let PEOPLE = null, PERSON = null, APPROVE = null, P_TEAM = 'ALL', P_FIND = '';
@@ -6030,7 +6117,10 @@ let AP = { teams: [], channels: [], country: '' };
 async function adminButton() {
   if (ADMIN_TABS === null) {
     ADMIN_TABS = [];
-    try { ADMIN_TABS = (await getJSON('/api/admin')).tabs || []; } catch (e) {}
+    try {
+      const a = await getJSON('/api/admin');
+      ADMIN_TABS = a.tabs || []; TEAM_KINDS = a.teamKinds || []; TEAM_KIND = TEAM_KINDS[0] || '';
+    } catch (e) {}
   }
   let b = document.getElementById('admBtn');
   if (!ADMIN_TABS.length) { if (b) b.remove(); document.body.classList.remove('has-adm'); return; }
@@ -6371,8 +6461,13 @@ async function render() {
     return;
   }
   if (VIEW === 'team') {
-    try { AGENT ? await loadAgent() : await loadTeam(); }
+    try { TEAM_KIND === 'onsite' ? await loadTeamOnsite() : AGENT ? await loadAgent() : await loadTeam(); }
     catch (e) { showFatal('The team view would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'pay') {
+    try { await loadPay(); }
+    catch (e) { showFatal('Pay would not load', e.message || e); }
     return;
   }
   if (VIEW === 'people') {
