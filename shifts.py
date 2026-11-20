@@ -1123,7 +1123,7 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not context.args:
-        fixed = data.rows("fixed_slots")
+        fixed = data.all_rows("fixed_slots")
         rows = sorted(({"user_id": u, "name": display_name_of(u, str(u))} for u in {f["user_id"] for f in fixed}),
                       key=lambda r: r["name"].lower())
         lines = ["<b>Fixed weekly rosters</b>", ""]

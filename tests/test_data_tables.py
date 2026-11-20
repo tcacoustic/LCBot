@@ -81,3 +81,12 @@ class TablesTest(LiveTestCase):
         self.assertIsNotNone(first)
         self.assertIsNone(again)
         self.assertEqual(self.data.rows("signups")[0]["ts"], "2026-11-20T10:00:00+08:00")
+
+    def test_a_row_by_the_short_ref_people_type(self):
+        e = self.data.add("time_entries", {"agent_id": 990000001, "the_date": "2026-11-23",
+                                           "clock_in": "2026-11-23T09:00:00+08:00"})
+        self.assertEqual(self.data.by_ref("time_entries", "#" + e["id"][:8])["id"], e["id"])
+        self.assertEqual(self.data.by_ref("time_entries", e["id"])["id"], e["id"])
+        sql("update lc_bot_dev.time_entries set legacy_id = 123")
+        self.assertEqual(self.data.by_ref("time_entries", "123")["id"], e["id"])
+        self.assertIsNone(self.data.by_ref("time_entries", "zzz"))

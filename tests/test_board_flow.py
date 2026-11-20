@@ -20,6 +20,7 @@ class BoardFlowTest(LiveTestCase):
         self.data._changed()
         self.data._settings = None
         self.data._boards.clear()
+        self.data._small.clear()
         for tg, name in ((990000001, "Ann Tan"), (990000002, "Ben Lim")):
             self.data.add_member(self.person(tg, name))
             core.set_depts(tg, ["LIVECHAT"])
@@ -75,3 +76,25 @@ class BoardFlowTest(LiveTestCase):
         core.set_depts(990000002, ["ON"])
         self.assertFalse(self.data.agent(990000002)["on_avails"])
         self.assertEqual(core.display_name_of(990000002), "Ben Lim")
+
+
+@unittest.skipIf(core is None, "needs LCBOT_LIVE_DB=1 and the bot's packages")
+class TimeclockFlowTest(BoardFlowTest):
+    def test_rates_their_own_else_the_teams_by_date(self):
+        now = core.now().isoformat()
+        self.data.add("pay_rates", [
+            {"agent_id": None, "cents": 1000, "effective_from": "2026-01-01", "created_at": now},
+            {"agent_id": 990000001, "cents": 1500, "effective_from": "2026-11-01", "created_at": now}])
+        self.assertEqual(core.rate_for(990000001, core.date(2026, 11, 23)), 1500)
+        self.assertEqual(core.rate_for(990000001, core.date(2026, 10, 1)), 1000)
+        self.assertEqual(core.rate_for(990000002, core.date(2026, 11, 23)), 1000)
+
+    def test_a_timesheet_pays_a_rostered_block(self):
+        core.give_slot(self.slots[0]["id"], 990000001)
+        self.data.add("time_entries", {"agent_id": 990000001, "slot_id": self.slots[0]["id"],
+                                       "the_date": "2026-11-23", "clock_in": "2026-11-23T10:03:00+08:00",
+                                       "clock_out": "2026-11-23T12:00:00+08:00", "status": "closed"})
+        t = core.timesheet(990000001, core.date(2026, 11, 1), core.date(2026, 11, 30))
+        self.assertEqual(len(t["shifts"]), 1)
+        self.assertEqual(t["shifts"][0]["minutes"], 120)
+        self.assertFalse(core.data.row("time_entries", clock_out=None))

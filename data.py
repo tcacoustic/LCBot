@@ -67,6 +67,7 @@ TABLES: dict[str, tuple[str, dict[str, str], set[str]]] = {
                  {"agent_id", "closed_by", "sh_closed_by", "on_closed_by"}),
 }
 # Columns that were 0/1 integers in SQLite and are booleans now.
+SMALL_TABLES = {"pay_rates", "fixed_slots", "presets"}   # read whole and kept until written
 BOARD_TABLES = {"weeks", "days", "slots", "signups", "confirmations"}
 BOOLEANS = {"closed", "sh_closed", "on_closed", "chat_posted", "handed_back", "pm_notified", "opening_posted",
             "followup_done", "after_cutoff", "urgent", "sheet_dirty"}
@@ -147,6 +148,14 @@ class _Tables:
     def _board_changed(self, table):
         if table in BOARD_TABLES:
             self._boards.clear()
+        self._small.pop(table, None)
+
+    def all_rows(self, table: str) -> list[dict]:
+        """A small table whole (pay rates, fixed rosters, presets), kept until this module writes to it."""
+        assert table in SMALL_TABLES, table
+        if table not in self._small:
+            self._small[table] = self.rows(table)
+        return self._small[table]
 
     def board(self, week_id) -> dict | None:
         """A week whole, in four reads, kept until the next write to the board:
@@ -212,6 +221,21 @@ class _Tables:
         rows = self.rows(table, order=order, limit=1, **filters)
         return rows[0] if rows else None
 
+    def by_ref(self, table: str, ref: str) -> dict | None:
+        """A row by the short reference people see and type (#1a2b3c4d: the first 8 of its uuid), or by a
+        whole uuid, or by an old SQLite number (#123, kept as legacy_id)."""
+        ref = ref.strip().lstrip("#").lower()
+        if len(ref) == 36:
+            return self.row(table, id=ref)
+        if len(ref) == 8 and all(c in "0123456789abcdef" for c in ref):
+            rows = self.rows(table, id=(("gte", f"{ref}-0000-0000-0000-000000000000"),
+                                        ("lte", f"{ref}-ffff-ffff-ffff-ffffffffffff")), limit=2)
+            if len(rows) == 1:
+                return rows[0]
+        if ref.isdigit():
+            return self.row(table, legacy_id=int(ref))
+        return None
+
     def count(self, table: str, **filters) -> int:
         return len(self.db.select(self._spec(table)[0], select=self._count_col(table), **self._filters(table, filters)))
 
@@ -258,6 +282,7 @@ class Data(_Tables):
         self._cache: tuple[float, dict] | None = None
         self._settings: tuple[float, dict] | None = None
         self._boards: dict = {}
+        self._small: dict = {}
 
     # ------------------------------------------------------------------ identity
     def _people(self, **filters) -> list[dict]:

@@ -942,19 +942,12 @@ def rate_for(agent_id: int, on: date) -> int:
     """Hourly rate in cents that applied on a given day."""
     if is_salaried(agent_id):
         return 0
-    row = q1(
-        "SELECT cents FROM pay_rates WHERE agent_id=? AND effective_from<=? "
-        "ORDER BY effective_from DESC, id DESC LIMIT 1",
-        (agent_id, on.isoformat()),
-    )
-    if row:
-        return row["cents"]
-    row = q1(
-        "SELECT cents FROM pay_rates WHERE agent_id IS NULL AND effective_from<=? "
-        "ORDER BY effective_from DESC, id DESC LIMIT 1",
-        (on.isoformat(),),
-    )
-    return row["cents"] if row else DEFAULT_RATE_CENTS
+    day = on.isoformat()
+    for who in (agent_id, None):      # their own rate, else the team's
+        rates = [r for r in data.all_rows("pay_rates") if r["agent_id"] == who and r["effective_from"] <= day]
+        if rates:
+            return max(rates, key=lambda r: (r["effective_from"], r["created_at"]))["cents"]
+    return DEFAULT_RATE_CENTS
 
 
 def money(cents: int) -> str:
@@ -1058,11 +1051,8 @@ def month_bounds(d: date) -> tuple[date, date]:
 
 
 def timesheet(agent_id: int, first: date, last: date) -> dict:
-    rows = q(
-        "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
-        "ORDER BY the_date, clock_in",
-        (agent_id, first.isoformat(), last.isoformat()),
-    )
+    rows = data.rows("time_entries", agent_id=agent_id,
+                     the_date=(("gte", first.isoformat()), ("lte", last.isoformat())), order="the_date,clock_in")
     shifts, minutes, cents, open_count = [], 0, 0, 0
     # A rostered block is paid once, however many times someone clocked into it.
     credited: set = set()
@@ -1129,10 +1119,7 @@ def agent_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
     Shows Clock out while they're on shift, Clock in otherwise.
     """
-    on_shift = bool(q1(
-        "SELECT 1 FROM time_entries WHERE agent_id=? AND clock_out IS NULL",
-        (user_id,),
-    ))
+    on_shift = bool(data.row("time_entries", agent_id=user_id, clock_out=None))
     rows = [
         [KeyboardButton(BTN_OUT if on_shift else BTN_IN)],
         [KeyboardButton(BTN_HOURS), KeyboardButton(BTN_SHIFTS)],
@@ -1358,7 +1345,7 @@ def apply_fixed_slots(week_id: int) -> int:
     filled = 0
     active = {a["user_id"] for a in data.agents(status="active")}
     b = data.board(week_id)
-    for r in data.rows("fixed_slots"):
+    for r in data.all_rows("fixed_slots"):
         if r["user_id"] not in active:
             continue
         slot = next((s for s in b["slot"].values()
@@ -1388,6 +1375,28 @@ def week_stats(week_id: int) -> dict:
         ],
         "total_slots": len(gaps),
     }
+
+
+def ref(row_id) -> str:
+    """The short reference shown for a row (#1a2b3c4d), which data.by_ref finds again."""
+    return str(row_id)[:8]
+
+
+def named(rows, key: str = "agent_id") -> list[dict]:
+    """Rows with "name" (the person's shown name) added from a person column, as the old joins did."""
+    return [{**r, "name": display_name_of(r[key], str(r[key]))} for r in rows]
+
+
+def signups_between(first: str, last: str) -> list[dict]:
+    """Every signup on the days from first to last, across weeks, with slot and day, by date then start."""
+    out = []
+    for d in data.rows("days", the_date=(("gte", first), ("lte", last))):
+        b = data.board(d["week_id"])
+        for s in b["slots"][d["id"]]:
+            for h in b["signups"][s["id"]]:
+                out.append({**h, "id": s["id"], "label": s["label"], "start_min": s["start_min"],
+                            "day_name": d["name"], "the_date": d["the_date"], "slot_id": s["id"]})
+    return sorted(out, key=lambda r: (r["the_date"], r["start_min"]))
 
 
 def week_slots(week_id, since: str | None = None, held_by: int | None = None) -> list[dict]:
@@ -2786,8 +2795,7 @@ def render_case(c: dict) -> str:
 def shift_start(user_id: int) -> datetime:
     """When this person's shift began: their latest clock-in if it was within
     the last 16 hours, else the start of today."""
-    row = q1("SELECT clock_in FROM time_entries WHERE agent_id=? ORDER BY id DESC LIMIT 1",
-             (user_id,))
+    row = data.row("time_entries", agent_id=user_id, order="-clock_in")
     if row:
         started = datetime.fromisoformat(row["clock_in"])
         if started > now() - timedelta(hours=16):
@@ -2909,11 +2917,8 @@ PICKER_HELP = (
 
 
 def reviews_for(agent_id: int, first: date, last: date) -> list:
-    return q(
-        "SELECT * FROM reviews WHERE agent_id=? AND the_date BETWEEN ? AND ? "
-        "ORDER BY the_date",
-        (agent_id, first.isoformat(), last.isoformat()),
-    )
+    return data.rows("reviews", agent_id=agent_id,
+                     the_date=(("gte", first.isoformat()), ("lte", last.isoformat())), order="the_date")
 
 
 async def flag_to_admins(bot, text: str) -> None:
