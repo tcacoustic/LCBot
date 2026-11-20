@@ -161,7 +161,8 @@ class _Tables:
                 o[old] = v
             if table == "signups":             # the name on the board is the person's, as it is now
                 o["name"] = self._shown(o["user_id"])
-            out.append(o)
+            hook = getattr(self, "row_hooks", {}).get(table)
+            out.append(hook(o) if hook else o)
         return out
 
     def _board_changed(self, table):
@@ -329,6 +330,7 @@ class Data(_Tables):
         self._settings: tuple[float, dict] | None = None
         self._boards: dict = {}
         self._small: dict = {}
+        self.row_hooks: dict = {}         # table -> fn(row) -> row, for feature code's own shaping
 
     # ------------------------------------------------------------------ identity
     def _people(self, **filters) -> list[dict]:
