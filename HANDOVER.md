@@ -88,7 +88,7 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 |---|---|---|
 | **On-Site App** (PR #81, combines #67–#77 and #80) | Built, on the test bot | Follow [docs/ONSITE-LAUNCH.md](https://github.com/tcacoustic/LCBot/blob/onsite-app/docs/ONSITE-LAUNCH.md): AI lead DB review, real checklists, sign-off wording, Finance (QR, cab rules, chat), Ops chat, MY/HK/TH rates, dry run, ship, SG first |
 | Make Zoe an admin with Admin for = On-Site (live) | Not done | People in the App. Needed for booked FYIs, cab claims, 11am nudge |
-| PR #48 (old Pay tab) and #67–#80 (stacked parts) | Replaced by #81 | Close them once #81 is reviewed |
+| PR #48 (old Pay tab) and #67–#80 (stacked parts) | History, not separate work. #67–#77 and #80 are all inside #81; #48 was rebuilt as #80; #78 is closed (went live as #79) | Keep open until #81 is reviewed, then close each with the comment "Included in #81". Closing doesn't delete: they stay readable on GitHub as a record of why each piece was built |
 | Supabase move (LCBot #60 + warehouse #63) | Draft | AI lead / Wilson decide; dev bot first, then live |
 | MY / HK / TH sheets for Ops requests | Parked | SG sheet only today |
 | RMA app (Service Concierge replacement) | AppSheet trial planned | Waiting on IT |
