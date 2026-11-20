@@ -198,14 +198,25 @@ def team_payload(first: date, mode: str = "month") -> dict:
 
 # The App's bottom bar: every team brings its tabs, shown once each and always
 # in this order. Someone in two teams (SH who also do Livechat) gets both sets.
-TAB_ORDER = ["home", "week", "me", "ho", "vis", "team"]
+TAB_ORDER = ["home", "week", "me", "ho", "vis", "pay", "team"]
 
 # The platform logos on the Online team's tabs (assets/logos).
 LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logos")
 LOGO_FILES = {"shopee.png", "lazada.png", "tc.png", "tc-white.png"}
 
 
+# On-Site Specialists (and nothing else) get their own five tabs.
+SPECIALIST_TABS = ["today", "vis", "hov", "oreq", "prof"]
+
+
+def specialist_tabs(user_id: int) -> bool:
+    return (visit_role(user_id) == "specialist" and not is_livechat(user_id)
+            and not online_view(user_id))
+
+
 def app_tabs(user_id: int) -> list:
+    if specialist_tabs(user_id):
+        return list(SPECIALIST_TABS)
     depts, tabs = depts_of(user_id), set()
     if is_livechat(user_id) or team_home_kind(user_id):
         tabs.add("home")
@@ -219,6 +230,8 @@ def app_tabs(user_id: int) -> list:
         tabs.add("vis")
     if admin_for(user_id, "SH", "FS", "ONSITE"):
         tabs.add("vis")
+    if is_specialist(user_id):
+        tabs.add("pay")     # paid per visit
     return [t for t in TAB_ORDER if t in tabs]   # Team is in 🛡 Admin (admin_tabs)
 
 
@@ -227,7 +240,7 @@ def tab_names(user_id: int) -> dict:
     names = {}
     if online_view(user_id):
         names["ho"] = "Cases"
-    if visit_role(user_id) == "specialist":
+    if visit_role(user_id) == "specialist" and not specialist_tabs(user_id):
         names["vis"] = "My visits"
     return names
 
@@ -293,6 +306,9 @@ def team_home_payload(user_id: int) -> dict:
             weekVisits=len(rows),
             waiting=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='WAITING' AND country=?",
                        ((me["country"] if me else "") or "SG",))["n"],
+            pay={**{k: v for k, v in pay_summary(user_id, today.replace(day=1)).items()
+                    if k in ("count", "total")},
+                 "label": today.strftime("%B") + " so far"},
             arranging=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='ARRANGING' AND specialist_id=?",
                          (user_id,))["n"])
     elif kind == "ON":
@@ -769,7 +785,10 @@ def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
 
 
 VISIT_POSTS = {"/api/request", "/api/visit", "/api/visit/reschedule", "/api/visit/cancel",
-               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime"}
+               "/api/visit/handover", "/api/visit/take", "/api/visit/giveback", "/api/visit/settime",
+               "/api/visit/arrive", "/api/visit/check", "/api/visit/leave", "/api/visit/one",
+               "/api/visit/request", "/api/visit/paynow", "/api/visit/reviewqr", "/api/visit/cab",
+               "/api/visit/photo", "/api/visit/payphoto", "/api/visit/signoff", "/api/visit/past"}
 
 
 def web_visit_post(user_id: int, path: str, b: dict) -> dict:
@@ -817,7 +836,78 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         if not ok:
             return {"ok": False, "error": err}
         on_bot_loop(notify_booked_fyi(bot_ref(), num("id")))
+        v = q1("SELECT followup_of FROM appointments WHERE id=?", (num("id"),))
+        if v and v["followup_of"]:
+            on_bot_loop(pin_next_visit(bot_ref(), num("id")))
         return {"ok": True}
+    if path == "/api/visit/one":
+        v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))
+        if not v or v["specialist_id"] != user_id:
+            return {"ok": False, "error": "That's not your visit."}
+        return {"ok": True, "visit": visit_screen(v, user_id)}
+    if path == "/api/visit/arrive":
+        async def _arrive():
+            async with write_lock:
+                return arrive(num("id"), user_id)
+        ok, err = on_bot_loop(_arrive(), timeout=10) or (False, "Couldn't save that just now.")
+        return {"ok": ok, "error": err} if not ok else {"ok": True}
+    if path == "/api/visit/check":
+        async def _tick():
+            async with write_lock:
+                return set_tick(num("id"), user_id, num("i"), bool(b.get("on")))
+        ok, err = on_bot_loop(_tick(), timeout=10) or (False, "Couldn't save that just now.")
+        return {"ok": ok, "error": err} if not ok else {"ok": True}
+    if path == "/api/visit/leave":
+        return on_bot_loop(leave_from_app(num("id"), user_id, b), timeout=20) or \
+            {"ok": False, "error": "Couldn't save that just now. Try again."}
+    if path == "/api/visit/request":
+        async def _rq():
+            async with write_lock:
+                return create_onsite_request(user_id, num("id"), b)
+        rid, err = on_bot_loop(_rq(), timeout=10) or (None, "Couldn't send that just now.")
+        if err:
+            return {"ok": False, "error": err}
+        posted = on_bot_loop(post_onsite_request(bot_ref(), rid), timeout=15)
+        if b.get("pays_by") == "LINK":
+            on_bot_loop(post_finance_link(bot_ref(), rid, str(b.get("cust_name") or ""),
+                                          str(b.get("cust_email") or "")), timeout=15)
+        return {"ok": True, "posted": bool(posted)}
+    if path == "/api/visit/paynow":
+        v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))
+        if not v or v["specialist_id"] != user_id:
+            return {"ok": False, "error": "That's not your visit."}
+        try:
+            cents = round(float(str(b.get("amount") or "0").replace(",", "")) * 100)
+        except ValueError:
+            cents = 0
+        if cents <= 0 and not static_qr_id():
+            return {"ok": False, "error": "Type the amount first."}
+        qr = on_bot_loop(qr_for(bot_ref(), v, cents), timeout=20)
+        if not qr:
+            return {"ok": False, "error": "Couldn't load the QR just now."}
+        amt = money_text(cents, CURRENCY.get(v["country"], "SGD")) if cents > 0 else ""
+        return {"ok": True, "sample": qr["sample"], "static": qr.get("static", False), "img": data_uri(qr["png"]),
+                "ref": qr["ref"], "amount": amt}
+    if path == "/api/visit/past":
+        return past_visit(user_id, num("id"))
+    if path == "/api/visit/signoff":
+        return on_bot_loop(signoff_from_app(user_id, num("id"), str(b.get("name") or ""), bool(b.get("consent")),
+                                            str(b.get("sig") or "")),
+                           timeout=30) or {"ok": False, "error": "Couldn't save the sign-off just now."}
+    if path == "/api/visit/payphoto":
+        return on_bot_loop(payment_photo_from_app(user_id, num("id"), str(b.get("photo") or "")),
+                           timeout=30) or {"ok": False, "error": "Couldn't save the photo just now."}
+    if path == "/api/visit/cab":
+        return on_bot_loop(cab_from_app(user_id, num("id"), str(b.get("trip") or ""), str(b.get("amount") or ""),
+                                        str(b.get("photo") or "")),
+                           timeout=30) or {"ok": False, "error": "Couldn't send that just now."}
+    if path == "/api/visit/photo":
+        return on_bot_loop(visit_photo_from_app(user_id, num("id"), str(b.get("photo") or "")),
+                           timeout=30) or {"ok": False, "error": "Couldn't save the photo just now."}
+    if path == "/api/visit/reviewqr":
+        if not REVIEW_URL:
+            return {"ok": False, "error": "No review link is set up yet."}
+        return {"ok": True, "img": data_uri(qr_png(REVIEW_URL))}
     if path == "/api/visit/reschedule":
         if role != "booker":
             return {"ok": False, "error": "Only SH, FS and admins move visits."}
@@ -1165,7 +1255,7 @@ def web_admin_update(user_id: int, body: dict) -> dict:
 def admin_tabs(user_id: int) -> list:
     if not is_admin(user_id):
         return []
-    return (["people"] + (["team"] if admin_for(user_id, "LIVECHAT") else [])
+    return (["people"] + (["team"] if admin_for(user_id, "LIVECHAT", "ONSITE") else [])
             + (["updates"] if may_post_updates(user_id) else []))
 
 
@@ -1449,7 +1539,8 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                                                      "/api/visits", "/api/visits/tracker",
                                                      "/api/cases/search",
                                                      "/api/requests", "/api/admin",
-                                                     "/api/admin/people", "/api/updates"):
+                                                     "/api/admin/people", "/api/pay",
+                                                     "/api/team/onsite", "/api/updates"):
             # The Online team's app is the handover view only: no week, pay or team.
             user = verify_init_data(self.headers.get("X-Init-Data", ""))
             if user and "id" in user and not is_livechat(int(user["id"])):
@@ -1674,6 +1765,30 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return
+        if path in ("/api/pay", "/api/team/onsite"):
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                month = (qs.get("month") or [""])[0]
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                elif path == "/api/pay" and is_specialist(uid):
+                    self._send(200, json.dumps(pay_payload(uid, month)).encode())
+                elif path == "/api/team/onsite" and admin_for(uid, "ONSITE"):
+                    self._send(200, json.dumps(onsite_team_payload(month)).encode())
+                else:
+                    self._send(403, b'{"error":"not allowed"}')
+            except Exception as e:
+                log.warning("Pay view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
         if path == "/api/updates":
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
@@ -1703,7 +1818,9 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     self._send(403, b'{"error":"no access"}')
                     return
                 if path == "/api/admin":
-                    self._send(200, json.dumps({"tabs": admin_tabs(uid)}).encode())
+                    kinds = [k for k, d in (("lc", "LIVECHAT"), ("onsite", "ONSITE"))
+                             if admin_tabs(uid) and admin_for(uid, d)]
+                    self._send(200, json.dumps({"tabs": admin_tabs(uid), "teamKinds": kinds}).encode())
                 elif not is_admin(uid):
                     self._send(403, b'{"error":"admins only"}')
                 else:

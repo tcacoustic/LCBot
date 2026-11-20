@@ -46,6 +46,12 @@ PRICING = {"SG": (10000, 8000, "SGD")}
 GRACE_MIN = 10
 
 
+# What a specialist is paid per visit, by their country: (cents, currency).
+# A visit counts once they tap 🏁 Leave, whatever the outcome; cancelled ones
+# don't. Countries not here: the visits are counted, with no amount yet.
+VISIT_PAY = {"SG": (5000, "SGD")}
+
+
 def visit_charge(country: str, minutes: int):
     """(cents, currency) the bot suggests for a resolved visit, or None."""
     if country not in PRICING or minutes <= 0:
@@ -272,9 +278,15 @@ def span_of(v) -> tuple:
     return start, start + timedelta(minutes=v["duration_min"])
 
 
+def day_time(dt, sep: str = ", ") -> str:
+    """'Mon 23 Nov, 2:30pm'; the year is added when it isn't this year."""
+    day = dt.strftime("%a %-d %b") + (dt.strftime(" %Y") if dt.year != now().astimezone(dt.tzinfo).year else "")
+    return day + sep + t12(dt.strftime("%H:%M"))
+
+
 def when_text(v) -> str:
     start, end = span_of(v)
-    return start.strftime('%a %-d %b, %H:%M')
+    return day_time(start)
 
 
 def clash_phrase(busy: str) -> str:
@@ -514,6 +526,8 @@ async def on_reschedule_answer(update: Update, context: ContextTypes.DEFAULT_TYP
         disable_web_page_preview=True)
     await tell(context.bot, asker,
                f"{answer} moving {v['customer_name']}'s visit.\n\n" + visit_text(v))
+    if action == "ra" and setting(f"visit_pin:{appt_id}", ""):
+        await pin_next_visit(context.bot, appt_id)
 
 
 def cancel_visit(appt_id: int, user_id: int, reason: str = "") -> tuple:
@@ -532,6 +546,7 @@ async def notify_cancelled(bot, appt_id: int, reason: str = "") -> None:
                              "AND action='cancelled' ORDER BY id DESC LIMIT 1",
                              (appt_id,))["user_id"], "SH")
     await close_handover_msgs(bot, appt_id, "🚫 Cancelled")
+    await unpin_visit(bot, appt_id)
     await tell(bot, v["specialist_id"],
                f"🚫 {who} cancelled a visit" + (f": {reason}" if reason else "")
                + "\n\n" + (visit_text(v) if has_time(appt_id) else handover_text(v, True)))
@@ -929,6 +944,7 @@ def visit_item(v, role: str) -> dict:
         "specialist": display_name_of(v["specialist_id"], ""),
         "bookedBy": booker_name(v["created_by"]) if v["created_by"] else "", "proposed": proposed,
         "canChange": role == "booker" and v["status"] == "SCHEDULED",
+        "followup": URGENCY_NAMES.get(v["urgency"] or "MEDIUM", "") if v["followup_of"] else "",
     }
 
 
@@ -1004,8 +1020,19 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
     else:
         open_rows = q("SELECT * FROM appointments WHERE country=? AND status IN ('WAITING','ARRANGING') "
                       "ORDER BY created_at", (country,))
+    if role == "specialist":
+        fu_rows = q("SELECT * FROM appointments WHERE specialist_id=? AND followup_of IS NOT NULL "
+                    "AND status IN ('SCHEDULED','ARRANGING','ONSITE')", (user_id,))
+    else:
+        fu_rows = q("SELECT * FROM appointments WHERE country=? AND followup_of IS NOT NULL "
+                    "AND status IN ('SCHEDULED','ARRANGING','ONSITE')", (country,))
+    fu_rows = sorted(fu_rows, key=followup_sort)
     return {
-        "open": [open_item(v, user_id, role) for v in open_rows],
+        "myDay": today_payload(user_id, country) if role == "specialist" else None,
+        "myRequests": my_onsite_requests(user_id) if role == "specialist" else [],
+        "myClaims": my_cab_claims(user_id) if role == "specialist" else [],
+        "followups": [followup_item(v, user_id, role) for v in fu_rows],
+        "open": [open_item(v, user_id, role) for v in open_rows if not v["followup_of"]],
         "myCountry": country if role == "specialist" else "",
         "role": role, "countries": countries, "country": country, "specId": spec_id,
         "types": [{"key": k, "name": n} for k, n in VISIT_TYPES],
@@ -1014,6 +1041,11 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
         "weekLabel": f"{first.strftime('%-d %b')} – {(first + timedelta(days=6)).strftime('%-d %b')}",
         "today": today.isoformat(), "days": days,
         "canTrack": bool(tracker_countries(user_id)),
+        "me": ({"name": display_name_of(user_id, "You"),
+                "teams": [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id)],
+                "country": country, "countryName": COUNTRY_NAMES.get(country, country),
+                **my_history(user_id)}
+               if role == "specialist" else None),
     }
 
 
@@ -1082,7 +1114,7 @@ def tracker_item(v, user_id: int, all_countries: bool) -> dict:
     item = {
         "id": v["id"], "country": v["country"], "date": start.date().isoformat(),
         "start": start.strftime("%H:%M") if timed else "",
-        "when": start.strftime("%a %-d %b · %H:%M") if timed else "Not booked yet",
+        "when": day_time(start, " · ") if timed else "Not booked yet",
         "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
         "status": tracker_status(v),
         "outcome": OUTCOME_NAMES.get(v["outcome"], "")[2:] if v["outcome"] else "",
@@ -1153,7 +1185,7 @@ def tracker_payload(user_id: int, week: str = "") -> dict:
 # The specialist's day in the bot: /visits, Arrived, Leave, payment, report
 # --------------------------------------------------------------------------
 
-OUTCOMES = [("RESOLVED", "✅ Resolved"), ("RETURN", "🔁 Needs a return visit"),
+OUTCOMES = [("RESOLVED", "✅ Resolved"), ("RETURN", "🔁 Not finished, need to come back"),
             ("REPLACE", "📦 Needs a replacement unit")]
 OUTCOME_NAMES = dict(OUTCOMES)
 PAY_METHODS = [("CASH", "Cash"), ("PAYNOW", "PayNow"), ("OTHER", "Other")]
@@ -1185,6 +1217,9 @@ def visit_buttons(v, user_id: int) -> InlineKeyboardMarkup:
     if mine and v["status"] == "ONSITE":
         rows.append([InlineKeyboardButton("📝 Open the visit form", url=VISIT_FORM_URL)])
         rows.append([InlineKeyboardButton("🏁 Leave", callback_data=f"vz:lv:{v['id']}")])
+    if mine and v["status"] in ("ONSITE", "COMPLETED"):
+        rows.append([InlineKeyboardButton("📦 Replacement / payment request", callback_data=f"oq:n:{v['id']}")])
+        rows.append([InlineKeyboardButton("🚕 Cab claim", callback_data=f"cb:n:{v['id']}")])
     if (v["status"] == "COMPLETED" and v["outcome"] in ("RETURN", "REPLACE")
             and not v["followup_done"] and may_book(user_id)):
         rows.append([InlineKeyboardButton("✅ Follow-up done", callback_data=f"vz:fd:{v['id']}")])
@@ -1211,6 +1246,15 @@ def report_lines(v) -> str:
         lines.append(f"Paid: {money_text(v['amount_cents'], v['currency'])} by "
                      f"{dict(PAY_METHODS).get(v['pay_method'], v['pay_method'])}"
                      if v["amount_cents"] else "No charge")
+    elif v["outcome"] == "RETURN" and next_visit_of(v["id"]):
+        nxt = next_visit_of(v["id"])
+        lines.append("No charge for this visit.")
+        why = nf_reason_text(v["id"])
+        if why:
+            lines.append(f"Why: {why}")
+        lines.append(f"Next visit: {when_text(nxt)}" if nxt["status"] != "ARRANGING"
+                     else "Next visit: the customer will confirm the date")
+        lines.append(f"Urgency: {URGENCY_NAMES.get(nxt['urgency'] or 'MEDIUM')}")
     elif v["followup_done"]:
         lines.append("Follow-up: done")
     else:
@@ -1238,9 +1282,12 @@ def visits_list(user_id: int) -> tuple:
             rows.append([InlineKeyboardButton(
                 f"⚠️ Follow-up · {v['customer_name']} · {OUTCOME_NAMES[v['outcome']][2:]}"[:60],
                 callback_data=f"vz:v:{v['id']}")])
+    found = sorted(found, key=followup_sort)
     for v in found[:40]:
         s = datetime.fromisoformat(v["starts_at"])
         mark = "📍 " if v["status"] == "ONSITE" else ""
+        if v["followup_of"]:
+            mark += f"🔴 FOLLOW-UP · {URGENCY_NAMES.get(v['urgency'] or 'MEDIUM', '').upper()} · "
         rows.append([InlineKeyboardButton(
             f"{mark}{s.strftime('%a %-d %b %H:%M')} · {v['customer_name']}"[:60],
             callback_data=f"vz:v:{v['id']}")])
@@ -1328,6 +1375,9 @@ async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             run("UPDATE appointments SET outcome=?, left_at=? WHERE id=?",
                 (outcome, now().isoformat(), v["id"]))
         await query.answer()
+        if outcome == "RETURN":
+            await nf_step(query, v["id"], "r")
+            return
         if outcome != "RESOLVED":
             await finish_visit(context.bot, query, v["id"], uid)
             return
@@ -1363,6 +1413,9 @@ async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await finish_visit(context.bot, query, v["id"], uid)
         return
     if action == "pm" and v["status"] == "ONSITE" and parts[3] in dict(PAY_METHODS):
+        if parts[3] == "PAYNOW" and not payment_photo_of(v["id"]):
+            await query.answer("Send a photo of the customer's PayNow payment here first.", show_alert=True)
+            return
         async with write_lock:
             run("UPDATE appointments SET pay_method=? WHERE id=?", (parts[3], v["id"]))
         await query.answer()
@@ -1374,9 +1427,7 @@ async def on_visit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def ask_method(query, appt_id: int) -> None:
     v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
     await edit_or_send(
-        query, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?",
-        InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=f"vz:pm:{appt_id}:{k}")
-                               for k, n in PAY_METHODS]]))
+        query, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?", pay_method_kb(appt_id))
 
 
 async def on_amount_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1417,8 +1468,7 @@ async def on_amount_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
     await update.message.reply_text(
         f"How did they pay {money_text(cents, cur)}?",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            n, callback_data=f"vz:pm:{appt_id}:{k}") for k, n in PAY_METHODS]]))
+        reply_markup=pay_method_kb(appt_id))
     return ConversationHandler.END
 
 
@@ -1430,19 +1480,45 @@ async def finish_visit(bot, query, appt_id: int, uid: int) -> None:
             "WHERE id=?", (now().isoformat(), appt_id))
         v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
         log_visit(appt_id, uid, "completed", OUTCOME_NAMES.get(v["outcome"], "")[2:])
-    report = "🏁 Visit completed\n\n" + visit_text(v) + "\n\n" + report_lines(v)
+    await unpin_visit(bot, appt_id)
+    signed = signoff_of(appt_id)
+    report = ("🏁 Visit completed\n\n" + visit_text(v) + "\n\n" + report_lines(v)
+              + (f"\n✍️ Signed off by {signed['name']}" if signed.get("name") else ""))
     done = "✅ Done, the report has gone to SH. Thank you!\n\n" + report_lines(v)
-    if query is not None:
-        await edit_or_send(query, done)
+    kb = None
+    if v["outcome"] == "REPLACE":
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📦 Send a replacement / payment request",
+                                                         callback_data=f"oq:n:{appt_id}")]])
+    if query is not None and not getattr(query.message, "photo", None):
+        await edit_or_send(query, done, kb)
     else:
-        await tell(bot, uid, done)
+        if query is not None:
+            try:
+                await query.edit_message_reply_markup(None)
+            except Exception:
+                pass
+        await tell(bot, uid, done, kb)
+    if v["outcome"] == "RESOLVED":
+        await send_review_qr(bot, uid)
     await tell(bot, v["created_by"], report)
+    pay = payment_photo_of(appt_id)
+    cap = f"📷 PayNow payment · visit #{appt_id}" + (
+        f" · {money_text(v['amount_cents'], v['currency'])}" if v["amount_cents"] else "")
+    if pay:
+        try:
+            await bot.send_photo(v["created_by"], pay, caption=cap)
+        except Exception as e:
+            log.info("Couldn't send the payment photo: %s", e)
     where = setting("visit_report_chat", "")
     if where:
         try:
             target = json.loads(where)
             kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
             await bot.send_message(target["chat"], report, disable_web_page_preview=True, **kw)
+            if signed.get("file"):
+                await bot.send_photo(target["chat"], signed["file"], caption=f"✍️ Sign-off · visit #{appt_id}", **kw)
+            if pay:
+                await bot.send_photo(target["chat"], pay, caption=cap, **kw)
         except Exception as e:
             log.info("Couldn't post the visit report: %s", e)
 
@@ -1465,3 +1541,1745 @@ async def cmd_visitchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     async with write_lock:
         set_setting("visit_report_chat", json.dumps({"chat": chat.id, "thread": thread}))
     await update.message.reply_text("✅ On-Site visit reports will be posted here too.")
+
+
+# --------------------------------------------------------------------------
+# Not finished: no charge, say why, and book the next visit before leaving.
+# The next visit is a new appointment (followup_of = this one) for the same
+# specialist, pinned in their chat with the bot until it's done.
+# --------------------------------------------------------------------------
+
+NF_REASONS = [("PART", "Need a part"), ("TIME", "Out of time"),
+              ("NOTREADY", "Customer not ready"), ("OTHER", "Other")]
+NF_REASON_NAMES = dict(NF_REASONS)
+URGENCY = [("HIGH", "High"), ("MEDIUM", "Medium"), ("LOW", "Low")]
+URGENCY_NAMES = dict(URGENCY)
+URGENCY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+# Quick picks for the next visit's time; ✏️ Type a time takes anything else.
+NEXT_TIMES = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
+
+
+def t12(hm: str) -> str:
+    """'14:00' -> '2pm', '10:30' -> '10:30am'."""
+    h, m = int(hm[:2]), hm[3:5]
+    return f"{h % 12 or 12}{'' if m == '00' else ':' + m}{'am' if h < 12 else 'pm'}"
+
+
+def read_any_time(text: str) -> str | None:
+    """Whatever someone types for a time -> 'HH:MM', or None. '7.15pm', '1930',
+    '230', '2:30', '10' all work. With no am/pm, 10-11 is morning and 12 or
+    1-9 is afternoon/evening (visits run from about 10am to 6pm)."""
+    t = text.strip().lower().replace(" ", "").replace(".", ":")
+    m = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?(am|pm|a|p)?", t)
+    if not m:
+        return None
+    h, mins, mer = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "")[:1]
+    if mins > 59 or h > 23:
+        return None
+    if mer:
+        if h < 1 or h > 12:
+            return None
+        h = (h % 12) + (12 if mer == "p" else 0)
+    elif 1 <= h <= 9:
+        h += 12
+    return f"{h:02d}:{mins:02d}"
+NEXT_DAYS = 14
+ONS_TEXT, ONS_PHOTO = 290, 291      # typed notes / amounts, and photos, in chat
+
+
+def followup_sort(v) -> tuple:
+    """Follow-ups first, most urgent first, then by date and time."""
+    if not v["followup_of"]:
+        return (1, 9, v["starts_at"])
+    return (0, URGENCY_RANK.get(v["urgency"] or "MEDIUM", 1), v["starts_at"])
+
+
+# The specialist's own numbers and past visits on the Me tab. Only their own,
+# no comparisons. Past visits show first name, area and product only: once a
+# visit is done the phone number and full address aren't needed on their phone.
+def my_history(user_id: int) -> dict:
+    rows = q("SELECT * FROM appointments WHERE specialist_id=? AND status='COMPLETED' "
+             "ORDER BY COALESCE(left_at, starts_at) DESC", (user_id,))
+    month = now().astimezone(TZ).strftime("%Y-%m")
+    done_at = lambda v: datetime.fromisoformat(v["left_at"] or v["starts_at"]).astimezone(COUNTRY_TZ[v["country"]])
+    past = []
+    for v in rows[:60]:
+        at = done_at(v)
+        past.append({"id": v["id"], "month": at.strftime("%B %Y"), "when": at.strftime("%a %-d %b"),
+                     "name": (v["customer_name"] or "").split(" ")[0], "postal": v["postal"] or "",
+                     "product": v["product"] or "", "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+                     "outcome": v["outcome"] or "", "outcomeName": OUTCOME_NAMES.get(v["outcome"], "Completed")[2:],
+                     "followup": bool(v["followup_of"])})
+    first = now().astimezone(TZ).date().replace(day=1)
+    ps = pay_summary(user_id, first)
+    return {"pay": {"label": first.strftime("%B") + " so far", "total": ps["total"], "count": ps["count"]},
+            "stats": {
+                "month": sum(1 for v in rows if done_at(v).strftime("%Y-%m") == month),
+                "total": len(rows),
+                "firstTime": sum(1 for v in rows if v["outcome"] == "RESOLVED" and not v["followup_of"]),
+                "followups": sum(1 for v in rows if v["outcome"] == "RETURN"),
+                "replacements": sum(1 for v in rows if v["outcome"] == "REPLACE")},
+            "past": past}
+
+
+def past_visit(user_id: int, appt_id: int) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "COMPLETED":
+        return {"ok": False, "error": "That visit isn't in your past visits."}
+    tz = COUNTRY_TZ[v["country"]]
+    ticks = ticks_of(v["id"])
+    nxt = next_visit_of(v["id"])
+    signed = signoff_of(v["id"])
+    out = {"id": v["id"], "country": v["country"], "when": day_time(span_of(v)[0].astimezone(tz)),
+           "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+           "name": (v["customer_name"] or "").split(" ")[0], "postal": v["postal"] or "",
+           "product": v["product"] or "", "issue": v["issue"] or "",
+           "outcomeName": OUTCOME_NAMES.get(v["outcome"], "Completed")[2:],
+           "onSite": mins_text(visit_minutes(v)) if v["arrived_at"] and v["left_at"] else "",
+           "done": [x for i, x in enumerate(checklist_of(v)) if i in ticks],
+           "charge": (money_text(v["amount_cents"], v["currency"]) + " by "
+                      + dict(PAY_METHODS).get(v["pay_method"], v["pay_method"] or "")) if v["amount_cents"] else "No charge",
+           "signed": signed.get("name", ""), "photos": photos_of(v["id"]),
+           "payPhoto": bool(payment_photo_of(v["id"])),
+           "why": nf_reason_text(v["id"]) if v["outcome"] == "RETURN" else "",
+           "next": (when_text(nxt) if nxt["status"] != "ARRANGING" else "Customer will confirm") if nxt else "",
+           "wasFollowup": bool(v["followup_of"])}
+    return {"ok": True, "visit": out}
+
+
+def next_visit_of(appt_id: int):
+    return q1("SELECT * FROM appointments WHERE followup_of=? AND status!='CANCELLED' "
+              "ORDER BY id DESC LIMIT 1", (appt_id,))
+
+
+def nf_reason_text(appt_id: int) -> str:
+    row = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='not finished' "
+             "ORDER BY id DESC LIMIT 1", (appt_id,))
+    return (row["note"] if row else "") or ""
+
+
+def nf_draft(appt_id: int) -> dict:
+    try:
+        return json.loads(setting(f"nf_draft:{appt_id}", "") or "{}")
+    except ValueError:
+        return {}
+
+
+def save_nf_draft(appt_id: int, d: dict) -> None:
+    set_setting(f"nf_draft:{appt_id}", json.dumps(d))
+
+
+def followup_item(v, user_id: int, role: str) -> dict:
+    tz = COUNTRY_TZ[v["country"]]
+    mine = v["specialist_id"] == user_id
+    item = {
+        "id": v["id"], "of": v["followup_of"], "status": v["status"], "country": v["country"],
+        "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+        "urgency": URGENCY_NAMES.get(v["urgency"] or "MEDIUM", "Medium"),
+        "customer": v["customer_name"], "postal": v["postal"] or "", "product": v["product"] or "",
+        "when": (day_time(span_of(v)[0].astimezone(tz))
+                 if v["status"] != "ARRANGING" else "Customer will confirm the date"),
+        "why": nf_reason_text(v["followup_of"]),
+        "specialist": "You" if mine else display_name_of(v["specialist_id"], ""),
+        "canSet": v["status"] == "ARRANGING" and (mine or admin_for(user_id, "ONSITE")),
+    }
+    if role == "booker" or mine:
+        item.update(phone=v["phone"] or "", address=v["address"], map=map_link(v))
+    return item
+
+
+def book_followup(appt_id: int, user_id: int, d: dict) -> tuple:
+    """Close a visit that didn't finish (no charge) and make the next one.
+    d: reason, note, urgency, and date + time, or later=True.
+    Returns (new id, None) or (None, error)."""
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] != "ONSITE" or v["specialist_id"] != user_id:
+        return None, "That visit isn't open on your side any more."
+    reason = str(d.get("reason") or "")
+    if reason not in NF_REASON_NAMES:
+        return None, "Pick why it didn't finish."
+    urgency = str(d.get("urgency") or "MEDIUM")
+    if urgency not in URGENCY_NAMES:
+        urgency = "MEDIUM"
+    note = str(d.get("note") or "").strip()[:300]
+    later = bool(d.get("later"))
+    start = now()
+    if not later:
+        try:
+            start = local_start(v["country"], str(d.get("date", "")), str(d.get("time", "")))
+        except (ValueError, TypeError):
+            return None, "Pick the date and time for the next visit."
+        if start < now():
+            return None, "That time has already passed."
+        busy = clash(user_id, start, start + timedelta(minutes=v["duration_min"]), exclude_id=appt_id)
+        if busy:
+            return None, f"That clashes: you {clash_phrase(busy)}. Pick another time."
+    cur = run(
+        "INSERT INTO appointments (country, specialist_id, visit_type, starts_at, duration_min,"
+        " customer_name, phone, email, address, postal, product, issue, order_no, status,"
+        " created_by, created_at, urgency, followup_of) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (v["country"], user_id, v["visit_type"], start.isoformat(), v["duration_min"],
+         v["customer_name"], v["phone"], v["email"], v["address"], v["postal"], v["product"],
+         v["issue"], v["order_no"], "ARRANGING" if later else "SCHEDULED",
+         v["created_by"] or user_id, now().isoformat(), urgency, appt_id))
+    new_id = cur.lastrowid
+    why = NF_REASON_NAMES[reason] + (f": {note}" if note else "")
+    log_visit(new_id, user_id, "follow-up", f"of #{appt_id} · {why}")
+    if not later:
+        log_visit(new_id, user_id, "booked")
+    run("UPDATE appointments SET outcome='RETURN', left_at=COALESCE(left_at, ?), amount_cents=0, "
+        "currency=NULL, pay_method=NULL, followup_done=1 WHERE id=?", (now().isoformat(), appt_id))
+    log_visit(appt_id, user_id, "not finished", why)
+    set_setting(f"nf_draft:{appt_id}", "")
+    return new_id, None
+
+
+async def pin_next_visit(bot, appt_id: int) -> None:
+    """Pin the next visit at the top of the specialist's chat with the bot."""
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["status"] != "SCHEDULED" or not v["specialist_id"]:
+        return
+    await unpin_visit(bot, appt_id)
+    tz = COUNTRY_TZ[v["country"]]
+    when = span_of(v)[0].astimezone(tz).strftime("%a %-d %b, %H:%M")
+    lines = [f"📌 Next visit #{v['id']} · {when}",
+             f"{COUNTRY_NAMES[v['country']]} · {VISIT_NAMES.get(v['visit_type'], v['visit_type'])}",
+             f"{v['customer_name']}" + (f" · {v['postal']}" if v["postal"] else ""),
+             f"🔴 Follow-up · {URGENCY_NAMES.get(v['urgency'] or 'MEDIUM')}"]
+    if v["product"]:
+        lines.append(f"Product: {v['product']}")
+    why = nf_reason_text(v["followup_of"]) if v["followup_of"] else ""
+    if why:
+        lines.append(f"Last time: {why}")
+    try:
+        m = await bot.send_message(v["specialist_id"], "\n".join(lines),
+                                   reply_markup=visit_buttons(v, v["specialist_id"]),
+                                   disable_web_page_preview=True)
+        await bot.pin_chat_message(v["specialist_id"], m.message_id, disable_notification=True)
+        async with write_lock:
+            set_setting(f"visit_pin:{appt_id}", f"{v['specialist_id']}:{m.message_id}")
+    except Exception as e:
+        log.info("Couldn't pin visit %s: %s", appt_id, e)
+
+
+async def unpin_visit(bot, appt_id: int) -> None:
+    raw = setting(f"visit_pin:{appt_id}", "")
+    if not raw:
+        return
+    try:
+        uid, mid = (int(x) for x in raw.split(":"))
+        await bot.unpin_chat_message(chat_id=uid, message_id=mid)
+    except Exception as e:
+        log.info("Couldn't unpin visit %s: %s", appt_id, e)
+    async with write_lock:
+        set_setting(f"visit_pin:{appt_id}", "")
+
+
+def nf_summary(v, d: dict) -> str:
+    lines = [f"🔁 Not finished · {v['customer_name']} (#{v['id']})", "No charge for this visit."]
+    if d.get("reason"):
+        lines.append(f"Why: {NF_REASON_NAMES[d['reason']]}" + (f" · {d['note']}" if d.get("note") else ""))
+    if d.get("urgency"):
+        lines.append(f"Urgency: {URGENCY_NAMES[d['urgency']]}")
+    if d.get("later"):
+        lines.append("Next visit: the customer will confirm the date")
+    elif d.get("date"):
+        day = date.fromisoformat(d["date"]).strftime("%a %-d %b")
+        lines.append(f"Next visit: {day}" + (f", {t12(d['time'])}" if d.get("time") else ""))
+    return "\n".join(lines)
+
+
+def nf_keyboard(v, step: str, d: dict) -> InlineKeyboardMarkup:
+    vid = v["id"]
+    back = {"r": f"vz:lv:{vid}", "u": f"vn:b:{vid}:r", "d": f"vn:b:{vid}:u",
+            "t": f"vn:b:{vid}:d", "k": f"vn:b:{vid}:{'d' if d.get('later') else 't'}"}[step]
+    rows = []
+    if step == "r":
+        rows = [[InlineKeyboardButton(("✅ " if d.get("reason") == k else "") + n,
+                                      callback_data=f"vn:r:{vid}:{k}")] for k, n in NF_REASONS]
+    elif step == "u":
+        rows = [[InlineKeyboardButton(("✅ " if d.get("urgency") == k else "") + n,
+                                      callback_data=f"vn:u:{vid}:{k}") for k, n in URGENCY]]
+        rows.append([InlineKeyboardButton("✏️ Add a note" if not d.get("note") else "✏️ Change the note",
+                                          callback_data=f"vn:n:{vid}")])
+    elif step == "d":
+        today = datetime.now(COUNTRY_TZ[v["country"]]).date()
+        days = [today + timedelta(days=i) for i in range(NEXT_DAYS)]
+        btns = [InlineKeyboardButton(x.strftime("%a %-d %b"), callback_data=f"vn:d:{vid}:{x.strftime('%Y%m%d')}")
+                for x in days]
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        rows.append([InlineKeyboardButton("🕓 Customer will confirm later", callback_data=f"vn:l:{vid}")])
+    elif step == "t":
+        times = NEXT_TIMES
+        day = d.get("date", "")
+        if day == datetime.now(COUNTRY_TZ[v["country"]]).date().isoformat():
+            times = [t for t in NEXT_TIMES if local_start(v["country"], day, t) > now()]
+        btns = [InlineKeyboardButton(t12(t), callback_data=f"vn:t:{vid}:{t.replace(':', '')}") for t in times]
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        rows.append([InlineKeyboardButton("✏️ Type a time", callback_data=f"vn:x:{vid}")])
+    elif step == "k":
+        rows = [[InlineKeyboardButton("✅ Done, close this visit" if d.get("later")
+                                      else "✅ Book the next visit", callback_data=f"vn:k:{vid}")]]
+    rows.append([InlineKeyboardButton("‹ Back", callback_data=back)])
+    return InlineKeyboardMarkup(rows)
+
+
+NF_QUESTIONS = {"r": "Why didn't it finish?", "u": "How urgent is the next visit?",
+                "d": "When is the next visit? Agree it with the customer before you leave.",
+                "t": "What time?", "k": "All good?"}
+
+
+async def nf_step(query, appt_id: int, step: str) -> None:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    d = nf_draft(appt_id)
+    await edit_or_send(query, nf_summary(v, d) + "\n\n" + NF_QUESTIONS[step], nf_keyboard(v, step, d))
+
+
+async def on_nf_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vn:r reason · vn:u urgency · vn:d date · vn:t time · vn:l later ·
+    vn:b back · vn:k book — the not-finished steps in /visits."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, appt_id = parts[1], int(parts[2])
+    uid = query.from_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != uid or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return
+    d = nf_draft(appt_id)
+    nxt = None
+    if action == "r" and parts[3] in NF_REASON_NAMES:
+        d["reason"], nxt = parts[3], "u"
+    elif action == "u" and parts[3] in URGENCY_NAMES:
+        d["urgency"], nxt = parts[3], "d"
+    elif action == "d":
+        d["date"] = f"{parts[3][:4]}-{parts[3][4:6]}-{parts[3][6:]}"
+        d.pop("later", None)
+        nxt = "t"
+    elif action == "t":
+        d["time"] = f"{parts[3][:2]}:{parts[3][2:]}"
+        nxt = "k"
+    elif action == "l":
+        d["later"] = True
+        d.pop("date", None), d.pop("time", None)
+        nxt = "k"
+    elif action == "b":
+        nxt = parts[3]
+    elif action == "k":
+        async with write_lock:
+            new_id, err = book_followup(appt_id, uid, d)
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        await query.answer("Booked" if not d.get("later") else "Done")
+        await finish_visit(context.bot, query, appt_id, uid)
+        await pin_next_visit(context.bot, new_id)
+        return
+    if nxt is None:
+        await query.answer()
+        return
+    async with write_lock:
+        save_nf_draft(appt_id, d)
+    await query.answer()
+    await nf_step(query, appt_id, nxt)
+
+
+async def on_nf_note_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """vn:n:<id> — type a note about why it didn't finish."""
+    query = update.callback_query
+    appt_id = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != query.from_user.id or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "nf_note", "id": appt_id}
+    await edit_or_send(query, "Type the note in one message, e.g. bracket too short, bring the long one."
+                              "\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def on_nf_time_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """vn:x:<id> — type any time for the next visit."""
+    query = update.callback_query
+    appt_id = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != query.from_user.id or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "nf_time", "id": appt_id}
+    await edit_or_send(query, "Type the time, e.g. 7pm, 9:30am or 1930.\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def on_ons_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Typed text for the On-Site chat steps."""
+    job = context.user_data.pop("ons", None) or {}
+    text = (update.message.text or "").strip()
+    if job.get("kind") == "nf_time":
+        appt_id = job["id"]
+        v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+        if not v or v["status"] != "ONSITE":
+            return ConversationHandler.END
+        hm = read_any_time(text)
+        if not hm:
+            context.user_data["ons"] = job
+            await update.message.reply_text("I couldn't read that time. Try e.g. 7pm, 9:30am or 1930.\n/cancel to stop")
+            return ONS_TEXT
+        async with write_lock:
+            d = nf_draft(appt_id)
+            d["time"] = hm
+            save_nf_draft(appt_id, d)
+        await update.message.reply_text(nf_summary(v, d) + "\n\n" + NF_QUESTIONS["k"],
+                                        reply_markup=nf_keyboard(v, "k", d))
+        return ConversationHandler.END
+    if job.get("kind") == "nf_note":
+        appt_id = job["id"]
+        v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+        if not v or v["status"] != "ONSITE":
+            return ConversationHandler.END
+        async with write_lock:
+            d = nf_draft(appt_id)
+            d["note"] = text[:300]
+            save_nf_draft(appt_id, d)
+        await update.message.reply_text(nf_summary(v, d) + "\n\n" + NF_QUESTIONS["u"],
+                                        reply_markup=nf_keyboard(v, "u", d))
+        return ConversationHandler.END
+    return await ons_text_more(update, context, job, text)
+
+
+ONS_TEXT_HANDLERS = {}     # kind -> async fn(update, context, job, text) -> state
+
+
+async def ons_text_more(update, context, job: dict, text: str) -> int:
+    """Other typed steps, by kind (requests, cab claims)."""
+    fn = ONS_TEXT_HANDLERS.get(job.get("kind"))
+    return await fn(update, context, job, text) if fn else ConversationHandler.END
+
+
+# --------------------------------------------------------------------------
+# The specialist's day in the App: Today, the visit screen (Arrived, a
+# checklist, optional photos) and Leave. The checklists are DRAFT steps until
+# the specialist confirms them. Ticks and photos are kept without new tables:
+# ticks in settings, photos in the visit's log.
+# --------------------------------------------------------------------------
+
+CHECKLISTS = {
+    "SETUP": [
+        "Unbox and check for damage",
+        "Place it and connect power (and the TV cable for a soundbar)",
+        "Connect to Wi-Fi in the Sonos or Marshall app",
+        "Update the firmware, and pair the sub or surrounds if any",
+        "Test it with the customer and show them the app",
+    ],
+    "TROUBLESHOOT": [
+        "Check the problem matches what the customer reported",
+        "Check power and cables (power, HDMI eARC or optical, Ethernet if used)",
+        "Check Wi-Fi: right network, good signal where it sits",
+        "Open the Sonos or Marshall app and check it sees every product",
+        "Update the firmware and the app",
+        "Power cycle the product (unplug, wait, plug back in)",
+        "Sub (Sonos or Marshall Sub 200): check it's paired, re-pair if needed",
+        "Factory reset and set up again, only if needed",
+        "Test it with the customer: TV audio, music, sub with the soundbar",
+        "Record the result",
+    ],
+}
+CHECKLIST_DRAFT = True     # flip once the specialist has confirmed the steps
+
+
+def checklist_of(v) -> list:
+    return CHECKLISTS.get(v["visit_type"], CHECKLISTS["SETUP"])
+
+
+def ticks_of(appt_id: int) -> list:
+    try:
+        return [int(i) for i in json.loads(setting(f"visit_checks:{appt_id}", "") or "[]")]
+    except (ValueError, TypeError):
+        return []
+
+
+def set_tick(appt_id: int, user_id: int, i: int, on: bool) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id:
+        return False, "That's not your visit."
+    if not 0 <= i < len(checklist_of(v)):
+        return False, "That step isn't on the list."
+    ticks = set(ticks_of(appt_id))
+    (ticks.add if on else ticks.discard)(i)
+    set_setting(f"visit_checks:{appt_id}", json.dumps(sorted(ticks)))
+    return True, None
+
+
+def photos_of(appt_id: int) -> int:
+    return q1("SELECT COUNT(*) AS n FROM appointment_log WHERE appt_id=? AND action='photo'",
+              (appt_id,))["n"]
+
+
+def arrive(appt_id: int, user_id: int) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id:
+        return False, "That's not your visit."
+    if v["status"] != "SCHEDULED":
+        return False, "Already marked."
+    run("UPDATE appointments SET status='ONSITE', arrived_at=? WHERE id=?", (now().isoformat(), appt_id))
+    log_visit(appt_id, user_id, "arrived")
+    return True, None
+
+
+def visit_screen(v, user_id: int) -> dict:
+    """Everything the visit screen in the App needs, for the specialist's own visit."""
+    tz = COUNTRY_TZ[v["country"]]
+    start = span_of(v)[0].astimezone(tz)
+    hhmm = lambda iso: datetime.fromisoformat(iso).astimezone(tz).strftime("%H:%M") if iso else ""
+    item = {
+        "id": v["id"], "status": v["status"], "country": v["country"],
+        "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+        "when": day_time(start), "start": start.strftime("%H:%M"),
+        "customer": v["customer_name"], "phone": v["phone"] or "", "email": v["email"] or "",
+        "address": v["address"], "postal": v["postal"] or "", "product": v["product"] or "",
+        "issue": v["issue"] or "", "order": v["order_no"] or "", "map": map_link(v),
+        "note": handover_note(v["id"]), "arrived": hhmm(v["arrived_at"]),
+        "minutes": visit_minutes(v), "onSite": mins_text(visit_minutes(v)),
+        "followup": URGENCY_NAMES.get(v["urgency"] or "MEDIUM", "") if v["followup_of"] else "",
+        "why": nf_reason_text(v["followup_of"]) if v["followup_of"] else "",
+        "checklist": checklist_of(v), "ticks": ticks_of(v["id"]), "draft": CHECKLIST_DRAFT,
+        "photos": photos_of(v["id"]), "formUrl": VISIT_FORM_URL,
+        "mine": v["specialist_id"] == user_id,
+        "canRequest": may_request(v, user_id), "reviewQr": bool(REVIEW_URL),
+        "paynowReady": bool(PAYNOW_UEN) and v["country"] == "SG",
+        "payPhoto": bool(payment_photo_of(v["id"])),
+        "signed": signoff_of(v["id"]).get("name", ""), "signText": SIGNOFF_TEXT, "signDraft": SIGNOFF_DRAFT,
+        "canClaim": may_claim(v, user_id),
+    }
+    if v["status"] == "ONSITE":
+        suggest = visit_charge(v["country"], max(1, visit_minutes(v)))
+        item["suggest"] = suggest[0] if suggest else None
+        item["currency"] = CURRENCY.get(v["country"], "SGD")
+    if v["status"] == "COMPLETED":
+        item["report"] = report_lines(v)
+    return item
+
+
+def today_payload(user_id: int, country: str) -> dict:
+    """The specialist's Today: the next visit on top, then today's timeline."""
+    tz = COUNTRY_TZ[country]
+    today = datetime.now(tz).date()
+    rows = q("SELECT * FROM appointments WHERE specialist_id=? AND status IN "
+             "('SCHEDULED','ONSITE','COMPLETED')", (user_id,))
+    todays = sorted((v for v in rows if span_of(v)[0].astimezone(tz).date() == today),
+                    key=lambda v: v["starts_at"])
+    upcoming = sorted((v for v in rows if v["status"] in ("SCHEDULED", "ONSITE")),
+                      key=lambda v: (v["status"] != "ONSITE", v["starts_at"]))
+    nxt = upcoming[0] if upcoming else None
+    return {
+        "label": today.strftime("%a %-d %b"),
+        "next": visit_screen(nxt, user_id) if nxt else None,
+        "items": [{"id": v["id"], "start": span_of(v)[0].astimezone(tz).strftime("%H:%M"),
+                   "customer": v["customer_name"], "postal": v["postal"] or "",
+                   "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]), "status": v["status"],
+                   "followup": bool(v["followup_of"])} for v in todays],
+    }
+
+
+async def leave_from_app(appt_id: int, user_id: int, b: dict) -> dict:
+    """Leave from the App: outcome, then the charge (Resolved), the next visit
+    (Not finished) or nothing more (Replacement). Runs on the bot's loop."""
+    bot = bot_ref()
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "That visit isn't open on your side any more."}
+    outcome = str(b.get("outcome") or "")
+    if outcome not in OUTCOME_NAMES:
+        return {"ok": False, "error": "Pick how it went."}
+    if outcome == "RETURN":
+        async with write_lock:
+            run("UPDATE appointments SET left_at=? WHERE id=?", (now().isoformat(), appt_id))
+            new_id, err = book_followup(appt_id, user_id, b)
+        if err:
+            return {"ok": False, "error": err}
+        await finish_visit(bot, None, appt_id, user_id)
+        await pin_next_visit(bot, new_id)
+        return {"ok": True, "next": new_id}
+    cents, cur, method = 0, None, None
+    if outcome == "RESOLVED" and not b.get("noCharge"):
+        try:
+            cents = round(float(str(b.get("amount") or "0").replace(",", "")) * 100)
+        except ValueError:
+            cents = -1
+        if cents <= 0 or cents > 10_000_000:
+            return {"ok": False, "error": "Type the amount, or pick No charge."}
+        method = str(b.get("method") or "")
+        if method not in dict(PAY_METHODS):
+            return {"ok": False, "error": "Pick how the customer paid."}
+        if method == "PAYNOW" and not payment_photo_of(appt_id):
+            return {"ok": False, "error": "Add a photo of the customer's PayNow payment first."}
+        cur = CURRENCY.get(v["country"], "SGD")
+    async with write_lock:
+        run("UPDATE appointments SET outcome=?, left_at=?, amount_cents=?, currency=?, pay_method=? "
+            "WHERE id=?", (outcome, now().isoformat(), cents, cur, method, appt_id))
+    await finish_visit(bot, None, appt_id, user_id)
+    return {"ok": True}
+
+
+async def on_visit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A photo sent to the bot while on site goes with that visit (optional)."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE or not update.message.photo:
+        return
+    uid = update.effective_user.id
+    if await photo_for_other(update, context):
+        return
+    here = q("SELECT * FROM appointments WHERE specialist_id=? AND status='ONSITE'", (uid,))
+    if len(here) != 1:
+        return
+    v = here[0]
+    async with write_lock:
+        log_visit(v["id"], uid, "photo", update.message.photo[-1].file_id)
+    await update.message.reply_text(f"📷 Added to {v['customer_name']}'s visit "
+                                    f"({photos_of(v['id'])} so far).")
+
+
+ONS_PHOTO_HANDLERS = []    # async fn(update, context) -> True if it used the photo
+
+
+async def photo_for_other(update, context) -> bool:
+    """Other uses of a photo sent to the bot (e.g. a cab receipt)."""
+    for fn in ONS_PHOTO_HANDLERS:
+        if await fn(update, context):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# Replacement / payment requests: a fixed format posted to the SH x Ops chat
+# (set with /requestchat), with I'll handle it, Done and a Note back to the
+# specialist. No customer phone or address in the post.
+# --------------------------------------------------------------------------
+
+RQ_NEEDS = [("REPLACEMENT", "Replacement unit"), ("PART", "Part"), ("OTHER", "Other")]
+RQ_WARRANTY = [("IN", "In warranty"), ("OUT", "Out of warranty")]
+RQ_PAYS = [("NONE", "No charge"), ("PAYNOW", "PayNow"), ("LINK", "Payment link")]
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+RQ_NEED_NAMES, RQ_WARRANTY_NAMES, RQ_PAYS_NAMES = dict(RQ_NEEDS), dict(RQ_WARRANTY), dict(RQ_PAYS)
+
+
+def may_request(v, user_id: int) -> bool:
+    return bool(v) and v["specialist_id"] == user_id and v["status"] in ("ONSITE", "COMPLETED")
+
+
+def create_onsite_request(user_id: int, appt_id: int, f: dict) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not may_request(v, user_id):
+        return None, "You can send a request for your own visit, on site or after it."
+    need, warranty, pays = (str(f.get(k) or "") for k in ("need", "warranty", "pays_by"))
+    if need not in RQ_NEED_NAMES:
+        return None, "Pick what's needed."
+    if warranty not in RQ_WARRANTY_NAMES:
+        return None, "Pick in or out of warranty."
+    if pays not in RQ_PAYS_NAMES:
+        return None, "Pick how the customer pays."
+    reason = str(f.get("reason") or "").strip()[:400]
+    if len(reason) < 3:
+        return None, "Say why in a few words."
+    price = None
+    raw = str(f.get("price") or "").replace(",", "").strip()
+    if raw:
+        try:
+            price = round(float(re.sub(r"^[A-Za-z$ ]+", "", raw)) * 100)
+        except ValueError:
+            return None, "Type the price as a number, or leave it empty (to confirm)."
+        if price < 0 or price > 10_000_000:
+            return None, "That price doesn't look right."
+    if pays == "LINK" and not price:
+        return None, "Type the price the customer pays."
+    if pays == "LINK":
+        if len(str(f.get("cust_name") or "").strip()) < 2:
+            return None, "Type the customer's name for the payment link."
+        if not EMAIL_RE.match(str(f.get("cust_email") or "").strip()):
+            return None, "Type the customer's email for the payment link."
+    cur = run("INSERT INTO onsite_requests (appt_id, country, need, reason, warranty, price_cents, "
+              "currency, pays_by, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+              (appt_id, v["country"], need, reason, warranty, price, CURRENCY.get(v["country"], "SGD"),
+               pays, user_id, now().isoformat()))
+    log_visit(appt_id, user_id, "request", f"#{cur.lastrowid} {RQ_NEED_NAMES[need]}")
+    return cur.lastrowid, None
+
+
+def rq_text(r) -> str:
+    v = q1("SELECT * FROM appointments WHERE id=?", (r["appt_id"],))
+    tz = COUNTRY_TZ[r["country"]]
+    day = span_of(v)[0].astimezone(tz).strftime("%a %-d %b") if v else ""
+    price = money_text(r["price_cents"], r["currency"]) if r["price_cents"] is not None else "To confirm"
+    lines = [f"📦 <b>Replacement / payment request</b> · {COUNTRY_NAMES[r['country']].split(' ')[0]} {r['country']}",
+             f"Visit #{r['appt_id']} · {day}"]
+    if v and v["product"]:
+        lines.append(f"Product: {esc(v['product'])}")
+    lines += [f"Need: {RQ_NEED_NAMES[r['need']]}", f"Reason: {esc(r['reason'])}",
+              f"Warranty: {RQ_WARRANTY_NAMES[r['warranty']]}", f"Price: {price}",
+              f"Pays by: {RQ_PAYS_NAMES[r['pays_by']]}",
+              f"From: {esc(display_name_of(r['created_by'], 'the specialist'))}", ""]
+    if r["status"] == "OPEN":
+        lines.append("🔸 Open · nobody on it yet")
+    elif r["status"] == "TAKEN":
+        lines.append(f"🙋 {esc(display_name_of(r['taken_by'], 'Someone'))} is handling it")
+    else:
+        lines.append(f"✅ Done by {esc(display_name_of(r['done_by'], 'Someone'))}")
+    if r["note"]:
+        lines.append(f"📝 {esc(r['note'])}")
+    return "\n".join(lines)
+
+
+def rq_buttons(r, bot_username: str = "") -> InlineKeyboardMarkup | None:
+    rows = []
+    if r["status"] == "OPEN":
+        rows.append([InlineKeyboardButton("🙋 I'll handle it", callback_data=f"oq:t:{r['id']}")])
+    if r["status"] == "TAKEN":
+        rows.append([InlineKeyboardButton("✅ Done", callback_data=f"oq:d:{r['id']}")])
+    if r["status"] != "DONE" and bot_username:
+        rows.append([InlineKeyboardButton("📝 Note to the specialist",
+                                          url=f"https://t.me/{bot_username}?start=oqn_{r['id']}")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def post_onsite_request(bot, rid: int) -> bool:
+    """Post to the request chat, or DM the On-Site admins if none is set."""
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+    where = setting("onsite_request_chat", "")
+    if where:
+        try:
+            target = json.loads(where)
+            kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
+            m = await bot.send_message(target["chat"], rq_text(r), parse_mode=constants.ParseMode.HTML,
+                                       reply_markup=rq_buttons(r, bot.username), **kw)
+            async with write_lock:
+                run("UPDATE onsite_requests SET chat_id=?, msg_id=? WHERE id=?", (m.chat_id, m.message_id, rid))
+            return True
+        except Exception as e:
+            log.info("Couldn't post On-Site request %s: %s", rid, e)
+    for uid in onsite_fyi_ids() or list(ADMIN_IDS):
+        try:
+            await bot.send_message(uid, rq_text(r) + "\n\n<i>No request chat is set yet: send "
+                                   "/requestchat in the SH x Ops chat.</i>", parse_mode=constants.ParseMode.HTML)
+        except Exception:
+            pass
+    return False
+
+
+# Payment link: Finance gets the customer's name and email in their own chat
+# (set with /financechat) and emails the link. The name and email are only in
+# that message, never saved in the bot's database.
+def finance_text(r, name: str, email: str) -> str:
+    v = q1("SELECT * FROM appointments WHERE id=?", (r["appt_id"],))
+    flag = COUNTRY_NAMES[r["country"]].split(" ")[0]
+    return "\n".join([
+        f"💳 <b>Payment link needed</b> · {flag} {r['country']}",
+        f"Request #{r['id']} · visit #{r['appt_id']}",
+        f"Customer: {esc(name)}", f"Email: {esc(email)}",
+        f"Amount: {money_text(r['price_cents'] or 0, r['currency'] or 'SGD')}",
+        f"For: {RQ_NEED_NAMES[r['need']]}" + (f" · {esc(v['product'])}" if v and v["product"] else ""),
+        f"Reason: {esc(r['reason'])}",
+        f"From: {esc(display_name_of(r['created_by'], 'the specialist'))}"])
+
+
+async def post_finance_link(bot, rid: int, name: str, email: str) -> bool:
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+    text = finance_text(r, name.strip()[:80], email.strip()[:120])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🙋 I'll send it", callback_data=f"fl:t:{rid}")]])
+    where = setting("finance_chat", "")
+    if where:
+        try:
+            target = json.loads(where)
+            kw = {"message_thread_id": target["thread"]} if target.get("thread") else {}
+            await bot.send_message(target["chat"], text, parse_mode=constants.ParseMode.HTML, reply_markup=kb, **kw)
+            return True
+        except Exception as e:
+            log.info("Couldn't post payment link request %s: %s", rid, e)
+    for uid in list(ADMIN_IDS):
+        try:
+            await bot.send_message(uid, text + "\n\n<i>No Finance chat is set yet: send /financechat in it.</i>",
+                                   parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+        except Exception:
+            pass
+    return False
+
+
+async def on_finance_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """fl:t:<id> I'll send it · fl:d:<id> Link sent — in the Finance chat."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    uid = query.from_user.id
+    if agent_status(uid) != "active" and not is_owner(uid):
+        await query.answer("Only SH Bot members can do this.", show_alert=True)
+        return
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (int(raw),))
+    if not r:
+        await query.answer("That request is gone.", show_alert=True)
+        return
+    who = esc(display_name_of(uid, "Someone"))
+    base = (query.message.text_html or "").split("\n\n🙋")[0].split("\n\n✅")[0]
+    if action == "t":
+        text, kb = base + f"\n\n🙋 {who} is sending it", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Link sent", callback_data=f"fl:d:{r['id']}")]])
+        tell_msg = f"💳 {who} from Finance is sending the payment link for request #{r['id']} (visit #{r['appt_id']})."
+    else:
+        text, kb = base + f"\n\n✅ Link sent by {who}", None
+        tell_msg = f"✅ The payment link for request #{r['id']} (visit #{r['appt_id']}) has been sent to the customer."
+    await query.answer()
+    try:
+        await query.edit_message_text(text, parse_mode=constants.ParseMode.HTML, reply_markup=kb)
+    except BadRequest:
+        pass
+    await tell(context.bot, r["created_by"], tell_msg)
+
+
+async def cmd_financechat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/financechat (admins, inside a group) — payment link requests go here."""
+    if not admin_for(update.effective_user.id, "ONSITE", "SH"):
+        return
+    chat = update.effective_chat
+    if context.args and context.args[0].lower() == "off":
+        async with write_lock:
+            set_setting("finance_chat", "")
+        await update.message.reply_text("Payment link requests now go to the owner by DM.")
+        return
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        await update.message.reply_text("Send this inside the Finance chat where payment link requests should go.")
+        return
+    thread = update.message.message_thread_id if update.message.is_topic_message else None
+    async with write_lock:
+        set_setting("finance_chat", json.dumps({"chat": chat.id, "thread": thread}))
+    await update.message.reply_text("✅ Payment link requests will be posted here. Only people in this chat see the customer's name and email.")
+
+
+async def refresh_onsite_request(bot, rid: int) -> None:
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+    if not r or not r["chat_id"]:
+        return
+    try:
+        await bot.edit_message_text(rq_text(r), chat_id=r["chat_id"], message_id=r["msg_id"],
+                                    parse_mode=constants.ParseMode.HTML,
+                                    reply_markup=rq_buttons(r, bot.username))
+    except BadRequest:
+        pass
+
+
+async def on_rq_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """oq:t:<id> I'll handle it · oq:d:<id> Done — in the request chat."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    uid = query.from_user.id
+    if agent_status(uid) != "active" and not is_owner(uid):
+        await query.answer("Only SH Bot members can do this.", show_alert=True)
+        return
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (int(raw),))
+    if not r:
+        await query.answer("That request is gone.", show_alert=True)
+        return
+    who = display_name_of(uid, "Someone")
+    async with write_lock:
+        if action == "t":
+            cur = run("UPDATE onsite_requests SET status='TAKEN', taken_by=?, taken_at=? WHERE id=? AND status='OPEN'",
+                      (uid, now().isoformat(), r["id"]))
+        else:
+            cur = run("UPDATE onsite_requests SET status='DONE', done_by=?, done_at=? WHERE id=? AND status='TAKEN'",
+                      (uid, now().isoformat(), r["id"]))
+    if not cur.rowcount:
+        await query.answer("Someone already did that.")
+        await refresh_onsite_request(context.bot, r["id"])
+        return
+    await query.answer("On it" if action == "t" else "Done")
+    await refresh_onsite_request(context.bot, r["id"])
+    await tell(context.bot, r["created_by"],
+               (f"🙋 {who} is handling your request for visit #{r['appt_id']} "
+                f"({RQ_NEED_NAMES[r['need']]})." if action == "t" else
+                f"✅ {who} marked your request for visit #{r['appt_id']} done "
+                f"({RQ_NEED_NAMES[r['need']]})."))
+
+
+async def start_rq_note(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
+    """/start oqn_<id>, from 📝 Note to the specialist under a request."""
+    uid = update.effective_user.id
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (int(raw),)) if raw.isdigit() else None
+    if not r or (agent_status(uid) != "active" and not is_owner(uid)):
+        await update.message.reply_text("That request is gone.")
+        return ConversationHandler.END
+    context.user_data["ons"] = {"kind": "rq_note", "id": r["id"]}
+    await update.message.reply_text(
+        f"📝 Note to {display_name_of(r['created_by'], 'the specialist')} about visit #{r['appt_id']} "
+        f"({RQ_NEED_NAMES[r['need']]}). Type it in one message, e.g. unit ships Fri, or payment link sent."
+        "\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def _rq_note_text(update, context, job, text) -> int:
+    r = q1("SELECT * FROM onsite_requests WHERE id=?", (job["id"],))
+    if not r or not text:
+        await update.message.reply_text("Nothing was sent.")
+        return ConversationHandler.END
+    async with write_lock:
+        run("UPDATE onsite_requests SET note=? WHERE id=?", (text[:500], r["id"]))
+    await tell(context.bot, r["created_by"], f"📝 Note on your request for visit #{r['appt_id']}:\n\n{text[:500]}"
+               f"\n— {display_name_of(update.effective_user.id, 'SH x Ops')}")
+    await refresh_onsite_request(context.bot, r["id"])
+    await update.message.reply_text("✅ Sent to the specialist, and added under the request.")
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["rq_note"] = _rq_note_text
+
+
+async def cmd_requestchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/requestchat (admins, inside a group) — On-Site replacement / payment
+    requests are posted here. /requestchat off — stop."""
+    if not admin_for(update.effective_user.id, "ONSITE", "SH"):
+        return
+    chat = update.effective_chat
+    if context.args and context.args[0].lower() == "off":
+        async with write_lock:
+            set_setting("onsite_request_chat", "")
+        await update.message.reply_text("On-Site requests now go to the On-Site admins by DM.")
+        return
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        await update.message.reply_text("Send this inside the SH x Ops chat where requests should go.")
+        return
+    thread = update.message.message_thread_id if update.message.is_topic_message else None
+    async with write_lock:
+        set_setting("onsite_request_chat", json.dumps({"chat": chat.id, "thread": thread}))
+    await update.message.reply_text("✅ On-Site replacement / payment requests will be posted here.")
+
+
+# The request form in /visits: need → warranty → pays by → reason (typed) → send.
+RQ_STEPS = [("need", RQ_NEEDS, "What's needed?"), ("warranty", RQ_WARRANTY, "Warranty?"),
+            ("pays_by", RQ_PAYS, "How does the customer pay?")]
+
+
+def rq_draft_key(appt_id: int, uid: int) -> str:
+    return f"rq_draft:{appt_id}:{uid}"
+
+
+def rq_draft(appt_id: int, uid: int) -> dict:
+    try:
+        return json.loads(setting(rq_draft_key(appt_id, uid), "") or "{}")
+    except ValueError:
+        return {}
+
+
+def rq_chat_view(v, d: dict, step: int) -> tuple:
+    """(text, keyboard) for step 0-2 (picks), 3 (reason), 4 (send)."""
+    head = [f"📦 Replacement / payment request · visit #{v['id']}", f"{v['customer_name']}"
+            + (f" · {v['product']}" if v["product"] else "")]
+    names = {"need": RQ_NEED_NAMES, "warranty": RQ_WARRANTY_NAMES, "pays_by": RQ_PAYS_NAMES}
+    for k, label in (("need", "Need"), ("warranty", "Warranty"), ("pays_by", "Pays by")):
+        if d.get(k):
+            head.append(f"{label}: {names[k][d[k]]}")
+    if d.get("reason"):
+        head.append(f"Reason: {d['reason']}")
+    head.append(f"Price: {d['price']}" if d.get("price") else "Price: to confirm")
+    if d.get("pays_by") == "LINK" and d.get("cust_email"):
+        head.append(f"Payment link to: {d.get('cust_name', '')} · {d['cust_email']}")
+    vid = v["id"]
+    back = f"oq:s:{vid}:{step - 1}" if step > 0 else f"vz:v:{vid}"
+    if step < 3:
+        key, opts, question = RQ_STEPS[step]
+        rows = [[InlineKeyboardButton(("✅ " if d.get(key) == k else "") + n, callback_data=f"oq:p:{vid}:{step}:{k}")]
+                for k, n in opts]
+        text = "\n".join(head) + "\n\n" + question
+    elif step == 3:
+        rows = [[InlineKeyboardButton("✏️ Type the reason" if not d.get("reason") else "✏️ Change the reason",
+                                      callback_data=f"oq:r:{vid}")]]
+        if d.get("reason"):
+            rows.append([InlineKeyboardButton("Next ›", callback_data=f"oq:s:{vid}:4")])
+        text = "\n".join(head) + "\n\nWhy is it needed? One line, e.g. won't power on, fault confirmed on site."
+    else:
+        rows, missing = [], []
+        if d.get("pays_by") == "LINK" or (d.get("pays_by") == "PAYNOW" and not static_qr_id()):
+            rows.append([InlineKeyboardButton("✏️ Type the price" if not d.get("price") else "✏️ Change the price",
+                                              callback_data=f"oq:m:{vid}")])
+            if not d.get("price"):
+                missing.append("the price")
+        if d.get("pays_by") == "LINK":
+            rows.append([InlineKeyboardButton("✏️ Customer name and email" if not d.get("cust_email")
+                                              else "✏️ Change name and email", callback_data=f"oq:c:{vid}")])
+            if not d.get("cust_email"):
+                missing.append("the customer's name and email")
+        if missing:
+            text = "\n".join(head) + "\n\nAdd " + " and ".join(missing) + "."
+        else:
+            rows.append([InlineKeyboardButton("✅ Send to SH x Ops", callback_data=f"oq:k:{vid}")])
+            text = "\n".join(head) + "\n\nSend it?" + ("\nFinance gets the name and email to send the link."
+                                                       if d.get("pays_by") == "LINK" else "")
+    rows.append([InlineKeyboardButton("‹ Back", callback_data=back)])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def on_rq_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """oq:n:<visit> start · oq:p:<visit>:<step>:<key> pick · oq:s:<visit>:<step> go to
+    a step · oq:k:<visit> send — the request form in /visits."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, vid, uid = parts[1], int(parts[2]), query.from_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_request(v, uid):
+        await query.answer("That's not open for a request.", show_alert=True)
+        return
+    d = rq_draft(vid, uid)
+    step = 0
+    if action == "n":
+        d = {}
+    elif action == "p":
+        step = int(parts[3])
+        d[RQ_STEPS[step][0]] = parts[4]
+        step += 1
+    elif action == "s":
+        step = max(0, min(4, int(parts[3])))
+    elif action == "k":
+        async with write_lock:
+            rid, err = create_onsite_request(uid, vid, d)
+            if not err:
+                set_setting(rq_draft_key(vid, uid), "")
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        await query.answer("Sent")
+        posted = await post_onsite_request(context.bot, rid)
+        if d.get("pays_by") == "LINK":
+            await post_finance_link(context.bot, rid, d.get("cust_name", ""), d.get("cust_email", ""))
+        if d.get("pays_by") == "PAYNOW":
+            r = q1("SELECT * FROM onsite_requests WHERE id=?", (rid,))
+            await send_request_paynow(context.bot, uid, v, r["price_cents"] or 0)
+        await edit_or_send(query, ("✅ Sent to SH x Ops. You'll get a message when someone picks it up."
+                                   if posted else "✅ Sent to the On-Site admins (no request chat is set yet)."),
+                           InlineKeyboardMarkup([[InlineKeyboardButton("◀️ All visits", callback_data="vz:lst")]]))
+        return
+    async with write_lock:
+        set_setting(rq_draft_key(vid, uid), json.dumps(d))
+    await query.answer()
+    text, kb = rq_chat_view(v, d, step)
+    await edit_or_send(query, text, kb)
+
+
+async def on_rq_reason_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """oq:r:<visit> — type the reason."""
+    query = update.callback_query
+    vid = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_request(v, query.from_user.id):
+        await query.answer("That's not open for a request.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "rq_reason", "id": vid}
+    await edit_or_send(query, "Type why it's needed, in one message.\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def _rq_reason_text(update, context, job, text) -> int:
+    uid = update.effective_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (job["id"],))
+    if not may_request(v, uid):
+        return ConversationHandler.END
+    async with write_lock:
+        d = rq_draft(v["id"], uid)
+        d["reason"] = text[:400]
+        set_setting(rq_draft_key(v["id"], uid), json.dumps(d))
+    t, kb = rq_chat_view(v, d, 4)
+    await update.message.reply_text(t, reply_markup=kb)
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["rq_reason"] = _rq_reason_text
+
+
+async def on_rq_extra_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """oq:m:<visit> type the price · oq:c:<visit> type the customer's name and email."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    vid = int(raw)
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_request(v, query.from_user.id):
+        await query.answer("That's not open for a request.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "rq_price" if action == "m" else "rq_contact", "id": vid}
+    await edit_or_send(query, (f"Type the price in {CURRENCY.get(v['country'], 'SGD')}, e.g. 120 or 99.50."
+                               if action == "m" else
+                               "Type the customer's name and email in one message, e.g. James, james@example.com."
+                               "\nOnly Finance sees these, to email the payment link.") + "\n/cancel to stop")
+    return ONS_TEXT
+
+
+async def _rq_extra_text(update, context, job, text) -> int:
+    uid = update.effective_user.id
+    v = q1("SELECT * FROM appointments WHERE id=?", (job["id"],))
+    if not may_request(v, uid):
+        return ConversationHandler.END
+    d = rq_draft(v["id"], uid)
+    if job["kind"] == "rq_price":
+        try:
+            val = float(re.sub(r"^[A-Za-z$ ]+", "", text.replace(",", "").strip()))
+            assert 0 < val < 100000
+        except (ValueError, AssertionError):
+            context.user_data["ons"] = job
+            await update.message.reply_text("Type the price as a number, e.g. 120 or 99.50.\n/cancel to stop")
+            return ONS_TEXT
+        d["price"] = f"{val:.2f}"
+    else:
+        m = re.search(r"[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+", text)
+        name = re.sub(r"[,;\s]+$", "", text[:m.start()].strip()) if m else ""
+        if not m or len(name) < 2:
+            context.user_data["ons"] = job
+            await update.message.reply_text("Type the name, then the email, e.g. James, james@example.com.\n/cancel to stop")
+            return ONS_TEXT
+        d["cust_name"], d["cust_email"] = name[:80], m.group(0)[:120]
+    async with write_lock:
+        set_setting(rq_draft_key(v["id"], uid), json.dumps(d))
+    t, kb = rq_chat_view(v, d, 4)
+    await update.message.reply_text(t, reply_markup=kb)
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["rq_price"] = _rq_extra_text
+ONS_TEXT_HANDLERS["rq_contact"] = _rq_extra_text
+
+
+async def send_request_paynow(bot, chat_id: int, v, cents: int) -> None:
+    """The PayNow QR for a replacement / payment request, to show the customer."""
+    if cents <= 0 and not static_qr_id():
+        return
+    qr = await qr_for(bot, v, cents)
+    amt = money_text(cents, CURRENCY.get(v['country'], 'SGD')) if cents > 0 else "the amount"
+    cap = (f"Scan to pay TC Acoustic with PayNow. The customer keys in {amt}." if qr.get("static") else
+           f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
+           f"{amt} · Reference {qr['ref']}")
+    try:
+        if qr["png"]:
+            await bot.send_photo(chat_id, qr["png"], caption=cap)
+        else:
+            await bot.send_message(chat_id, cap)
+    except Exception as e:
+        log.info("Couldn't send the request PayNow QR: %s", e)
+
+
+def my_onsite_requests(user_id: int) -> list:
+    out = []
+    for r in q("SELECT * FROM onsite_requests WHERE created_by=? ORDER BY id DESC LIMIT 30", (user_id,)):
+        out.append({"id": r["id"], "visit": r["appt_id"], "need": RQ_NEED_NAMES[r["need"]],
+                    "status": r["status"], "reason": r["reason"],
+                    "who": display_name_of(r["taken_by"] or r["done_by"], "") if r["taken_by"] else "",
+                    "note": r["note"] or "",
+                    "when": datetime.fromisoformat(r["created_at"]).astimezone(TZ).strftime("%a %-d %b")})
+    return out
+
+
+# --------------------------------------------------------------------------
+# QR codes: PayNow (a real SGQR only when PAYNOW_UEN is set, otherwise a
+# clearly marked SAMPLE that isn't a payment code) and the review link.
+# --------------------------------------------------------------------------
+
+PAYNOW_UEN = os.environ.get("PAYNOW_UEN", "").strip()
+PAYNOW_NAME = os.environ.get("PAYNOW_NAME", "").strip() or "TC Acoustic"
+REVIEW_URL = os.environ.get("REVIEW_URL", "").strip()
+
+
+def _tlv(tag: str, val: str) -> str:
+    return f"{tag}{len(val):02d}{val}"
+
+
+def _crc16(data: str) -> str:
+    crc = 0xFFFF
+    for ch in data.encode():
+        crc ^= ch << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else (crc << 1)
+            crc &= 0xFFFF
+    return f"{crc:04X}"
+
+
+def paynow_payload(cents: int, ref: str) -> str:
+    """SGQR / PayNow to a UEN, fixed amount, with a reference."""
+    acct = _tlv("00", "SG.PAYNOW") + _tlv("01", "2") + _tlv("02", PAYNOW_UEN) + _tlv("03", "0")
+    s = (_tlv("00", "01") + _tlv("01", "12") + _tlv("26", acct) + _tlv("52", "0000") + _tlv("53", "702")
+         + _tlv("54", f"{cents / 100:.2f}") + _tlv("58", "SG") + _tlv("59", PAYNOW_NAME[:25])
+         + _tlv("60", "Singapore") + _tlv("62", _tlv("01", ref[:25])) + "6304")
+    return s + _crc16(s)
+
+
+def qr_png(text: str) -> bytes | None:
+    try:
+        import io
+        import segno
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    segno.make(text, error="m").save(buf, kind="png", scale=8, border=3)
+    return buf.getvalue()
+
+
+# TC's own PayNow QR: an admin sends the image once with /paynowqr. The customer
+# keys in the amount, and the specialist takes a photo of the payment.
+_static_qr = {}
+
+
+def static_qr_id() -> str:
+    return setting("paynow_qr_file", "")
+
+
+async def static_qr_png(bot) -> bytes | None:
+    fid = static_qr_id()
+    if not fid:
+        return None
+    if fid not in _static_qr:
+        try:
+            f = await bot.get_file(fid)
+            _static_qr.clear()
+            _static_qr[fid] = bytes(await f.download_as_bytearray())
+        except Exception as e:
+            log.info("Couldn't load the PayNow QR: %s", e)
+            return None
+    return _static_qr[fid]
+
+
+def payment_photo_of(appt_id: int) -> str:
+    r = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='payphoto' ORDER BY id DESC LIMIT 1",
+           (appt_id,))
+    return r["note"] if r else ""
+
+
+async def cmd_paynowqr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/paynowqr (admins, in a DM) — send TC's PayNow QR image next. /paynowqr off — remove it."""
+    uid = update.effective_user.id
+    if not admin_for(uid, "ONSITE", "SH") or update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if context.args and context.args[0].lower() == "off":
+        async with write_lock:
+            set_setting("paynow_qr_file", "")
+        await update.message.reply_text("PayNow QR removed.")
+        return
+    async with write_lock:
+        set_setting(f"paynow_qr_wait:{uid}", "1")
+    await update.message.reply_text("Send TC's PayNow QR image now (as a photo). Use the official one from Finance.")
+
+
+async def _paynow_qr_photo(update, context) -> bool:
+    uid = update.effective_user.id
+    if not setting(f"paynow_qr_wait:{uid}", ""):
+        return False
+    async with write_lock:
+        set_setting(f"paynow_qr_wait:{uid}", "")
+        set_setting("paynow_qr_file", update.message.photo[-1].file_id)
+    await update.message.reply_text("✅ Saved. Specialists now show this QR for PayNow.")
+    return True
+
+
+async def _payment_photo(update, context) -> bool:
+    """After the PayNow QR is shown in chat, the next photo is the payment."""
+    uid = update.effective_user.id
+    raw = setting(f"payphoto_wait:{uid}", "")
+    if not raw:
+        return False
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(raw),))
+    async with write_lock:
+        set_setting(f"payphoto_wait:{uid}", "")
+        if v and v["specialist_id"] == uid:
+            log_visit(v["id"], uid, "payphoto", update.message.photo[-1].file_id)
+    if not v:
+        return False
+    await update.message.reply_text("📷 Payment photo saved. Tap when they've paid:",
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                                        "✅ Customer has paid", callback_data=f"vz:pm:{v['id']}:PAYNOW")]]))
+    return True
+
+
+ONS_PHOTO_HANDLERS.insert(0, _payment_photo)
+ONS_PHOTO_HANDLERS.insert(0, _paynow_qr_photo)
+
+
+# Customer sign-off in the App, instead of the Zoho form: the customer reads what
+# was done, types their name, ticks the consent and signs with a finger. The
+# signature image goes to SH (whoever booked the visit) as the record, and its
+# file id, name and time go in the visit's log. SIGNOFF_TEXT is DRAFT wording
+# until TC confirms it.
+SIGNOFF_DRAFT = True
+SIGNOFF_TEXT = ("I confirm the work above was done and my product was working when the specialist left. "
+                "I agree to TC Acoustic keeping this record of the visit.")
+
+
+def signoff_of(appt_id: int) -> dict:
+    r = q1("SELECT note FROM appointment_log WHERE appt_id=? AND action='signoff' ORDER BY id DESC LIMIT 1",
+           (appt_id,))
+    try:
+        return json.loads(r["note"]) if r else {}
+    except ValueError:
+        return {}
+
+
+def signoff_summary(v, name: str) -> str:
+    tz = COUNTRY_TZ[v["country"]]
+    ticks = ticks_of(v["id"])
+    done = [x for i, x in enumerate(checklist_of(v)) if i in ticks]
+    lines = [f"✍️ Customer sign-off · visit #{v['id']}",
+             f"{VISIT_NAMES.get(v['visit_type'], v['visit_type'])} · {v['product'] or ''}".rstrip(" ·"),
+             f"Signed by {name} · {now().astimezone(tz).strftime('%a %-d %b, ')}{t12(now().astimezone(tz).strftime('%H:%M'))}"]
+    if done:
+        lines.append("Done: " + "; ".join(done))
+    return "\n".join(lines)[:1000]
+
+
+async def signoff_from_app(user_id: int, appt_id: int, name: str, consent: bool, sig: str) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "The customer signs while you're on site."}
+    name = " ".join(str(name or "").split())[:80]
+    if len(name) < 2:
+        return {"ok": False, "error": "Ask the customer to type their name."}
+    if not consent:
+        return {"ok": False, "error": "The customer needs to tick the box."}
+    img = photo_bytes(sig)
+    if not img:
+        return {"ok": False, "error": "The signature didn't come through. Try again."}
+    cap = signoff_summary(v, name)
+    fid = await upload_photo(bot_ref(), v["created_by"], img, cap) or await upload_photo(bot_ref(), user_id, img, cap)
+    if not fid:
+        return {"ok": False, "error": "Couldn't save the sign-off just now."}
+    async with write_lock:
+        log_visit(appt_id, user_id, "signoff", json.dumps({"file": fid, "name": name, "at": now().isoformat()}))
+    return {"ok": True, "name": name}
+
+
+async def payment_photo_from_app(user_id: int, appt_id: int, photo: str) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "That visit isn't open on your side any more."}
+    img = photo_bytes(photo)
+    if not img:
+        return {"ok": False, "error": "That photo didn't come through. Try again."}
+    fid = await upload_photo(bot_ref(), user_id, img, f"📷 PayNow payment for visit #{appt_id}")
+    if not fid:
+        return {"ok": False, "error": "Couldn't save the photo just now."}
+    async with write_lock:
+        log_visit(appt_id, user_id, "payphoto", fid)
+    return {"ok": True}
+
+
+async def qr_for(bot, v, cents: int) -> dict:
+    """What to show for PayNow: TC's own QR if set, else a generated one."""
+    png = await static_qr_png(bot)
+    if png:
+        return {"sample": False, "static": True, "png": png, "ref": f"V{v['id']}"}
+    return dict(paynow_qr(v, cents), static=False)
+
+
+def paynow_qr(v, cents: int) -> dict:
+    """{'sample': bool, 'png': bytes|None, 'ref': str}. Real only for SG with PAYNOW_UEN."""
+    ref = f"V{v['id']}"
+    if PAYNOW_UEN and v["country"] == "SG":
+        return {"sample": False, "png": qr_png(paynow_payload(cents, ref)), "ref": ref}
+    return {"sample": True, "png": qr_png(f"SAMPLE ONLY - NOT A PAYMENT CODE - visit {ref}"), "ref": ref}
+
+
+def data_uri(png: bytes | None) -> str:
+    import base64
+    kind = "jpeg" if png and png[:2] == b"\xff\xd8" else "png"
+    return f"data:image/{kind};base64," + base64.b64encode(png).decode() if png else ""
+
+
+async def send_paynow_qr(bot, chat_id: int, v) -> None:
+    qr = await qr_for(bot, v, v["amount_cents"] or 0)
+    amt = money_text(v['amount_cents'] or 0, v['currency'] or 'SGD')
+    if qr.get("static"):
+        cap = (f"Scan to pay TC Acoustic with PayNow. The customer keys in {amt}.\n"
+               f"📷 Then send a photo of their payment screen here.")
+        async with write_lock:
+            set_setting(f"payphoto_wait:{chat_id}", str(v["id"]))
+    else:
+        cap = (f"{'⚠️ SAMPLE — not a payment code. PayNow isn’t set up yet.' if qr['sample'] else 'Scan to pay with PayNow'}\n"
+               f"{amt} · Reference {qr['ref']}\n📷 Then send a photo of their payment screen here.")
+        async with write_lock:
+            set_setting(f"payphoto_wait:{chat_id}", str(v["id"]))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Customer has paid", callback_data=f"vz:pm:{v['id']}:PAYNOW")],
+                               [InlineKeyboardButton("‹ Back", callback_data=f"vq:b:{v['id']}")]])
+    if qr["png"]:
+        await bot.send_photo(chat_id, qr["png"], caption=cap, reply_markup=kb)
+    else:
+        await bot.send_message(chat_id, cap, reply_markup=kb)
+
+
+async def send_review_qr(bot, chat_id: int) -> None:
+    if not REVIEW_URL:
+        return
+    png = qr_png(REVIEW_URL)
+    cap = "⭐ Show this to the customer: scan to leave us a review."
+    try:
+        if png:
+            await bot.send_photo(chat_id, png, caption=cap)
+        else:
+            await bot.send_message(chat_id, f"{cap}\n{REVIEW_URL}")
+    except Exception as e:
+        log.info("Couldn't send the review QR: %s", e)
+
+
+async def on_paynow_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """vq:p:<id> show the PayNow QR · vq:b:<id> back to how they paid."""
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(raw),))
+    if not v or v["specialist_id"] != query.from_user.id or v["status"] != "ONSITE":
+        await query.answer("That step is already done.", show_alert=True)
+        return
+    await query.answer()
+    if action == "p":
+        await send_paynow_qr(context.bot, query.from_user.id, v)
+    else:
+        await context.bot.send_message(query.from_user.id, f"How did they pay {money_text(v['amount_cents'], v['currency'])}?",
+                                       reply_markup=pay_method_kb(v["id"]))
+
+
+def pay_method_kb(appt_id: int) -> InlineKeyboardMarkup:
+    """Cash / Other finish straight away; PayNow first shows the QR."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(n, callback_data=(f"vq:p:{appt_id}" if k == "PAYNOW"
+                                                                          else f"vz:pm:{appt_id}:{k}"))
+                                  for k, n in PAY_METHODS]])
+
+
+# --------------------------------------------------------------------------
+# Cab claims: the specialist claims a ride to or from a visit with the amount
+# and a receipt photo; On-Site admins approve or reject with a reason.
+# --------------------------------------------------------------------------
+
+CAB_TRIPS = [("TO", "To the visit"), ("FROM", "From the visit"), ("BOTH", "Both ways")]
+CAB_TRIP_NAMES = dict(CAB_TRIPS)
+CAB_REJECT = [("RECEIPT", "Receipt unclear"), ("LIMIT", "Over the limit"),
+              ("NOTVISIT", "Not for a visit"), ("OTHER", "Other")]
+CAB_REJECT_NAMES = dict(CAB_REJECT)
+CAB_STATUS = {"RECEIPT": "Waiting for the receipt", "PENDING": "Waiting for approval",
+              "APPROVED": "Approved", "REJECTED": "Rejected"}
+
+
+def may_claim(v, user_id: int) -> bool:
+    return bool(v) and v["specialist_id"] == user_id and v["status"] in ("ONSITE", "COMPLETED")
+
+
+def create_cab_claim(user_id: int, appt_id: int, trip: str, amount: str) -> tuple:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not may_claim(v, user_id):
+        return None, "Claim against your own visit, once you've arrived."
+    if trip not in CAB_TRIP_NAMES:
+        return None, "Pick the trip."
+    try:
+        cents = round(float(re.sub(r"^[A-Za-z$ ]+", "", str(amount or "").replace(",", "").strip())) * 100)
+    except ValueError:
+        cents = 0
+    if cents <= 0 or cents > 100_000:
+        return None, "Type the fare, e.g. 18.40."
+    # One claim waits for its receipt at a time: an older one still waiting is dropped.
+    run("DELETE FROM cab_claims WHERE user_id=? AND status='RECEIPT'", (user_id,))
+    cur = run("INSERT INTO cab_claims (appt_id, user_id, trip, amount_cents, currency, created_at) "
+              "VALUES (?,?,?,?,?,?)", (appt_id, user_id, trip, cents, CURRENCY.get(v["country"], "SGD"),
+                                       now().isoformat()))
+    return cur.lastrowid, None
+
+
+def cab_text(c) -> str:
+    v = q1("SELECT * FROM appointments WHERE id=?", (c["appt_id"],))
+    tz = COUNTRY_TZ[v["country"]] if v else TZ
+    day = span_of(v)[0].astimezone(tz).strftime("%a %-d %b") if v else ""
+    flag = COUNTRY_NAMES[v["country"]].split(" ")[0] + " " + v["country"] if v else ""
+    lines = [f"🚕 Cab claim · {flag}", f"From: {display_name_of(c['user_id'], 'a specialist')}",
+             f"Visit #{c['appt_id']} · {day}" + (f" · {v['postal']}" if v and v["postal"] else ""),
+             f"Trip: {CAB_TRIP_NAMES[c['trip']]}", f"Amount: {money_text(c['amount_cents'], c['currency'])}"]
+    if c["status"] == "APPROVED":
+        lines.append(f"\n✅ Approved by {display_name_of(c['decided_by'], 'an admin')}")
+    elif c["status"] == "REJECTED":
+        lines.append(f"\n❌ Rejected by {display_name_of(c['decided_by'], 'an admin')}: {c['reason']}")
+    return "\n".join(lines)
+
+
+def cab_admins() -> list:
+    return onsite_fyi_ids() or list(ADMIN_IDS)
+
+
+def cab_kb(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"cb:a:{cid}"),
+                                  InlineKeyboardButton("❌ Reject", callback_data=f"cb:r:{cid}")]])
+
+
+async def send_cab_to_admins(bot, cid: int) -> None:
+    c = q1("SELECT * FROM cab_claims WHERE id=?", (cid,))
+    sent = []
+    for uid in cab_admins():
+        try:
+            m = await bot.send_photo(uid, c["receipt"], caption=cab_text(c), reply_markup=cab_kb(cid))
+            sent.append([uid, m.message_id])
+        except Exception as e:
+            log.info("Couldn't send cab claim %s to %s: %s", cid, uid, e)
+    async with write_lock:
+        set_setting(f"cab_msgs:{cid}", json.dumps(sent))
+
+
+async def _cab_receipt_photo(update, context) -> bool:
+    """A photo while a cab claim waits for its receipt is that receipt."""
+    uid = update.effective_user.id
+    c = q1("SELECT * FROM cab_claims WHERE user_id=? AND status='RECEIPT' ORDER BY id DESC LIMIT 1", (uid,))
+    if not c:
+        return False
+    async with write_lock:
+        run("UPDATE cab_claims SET receipt=?, status='PENDING' WHERE id=?",
+            (update.message.photo[-1].file_id, c["id"]))
+    await update.message.reply_text(f"✅ Cab claim sent for approval: "
+                                    f"{money_text(c['amount_cents'], c['currency'])}, "
+                                    f"{CAB_TRIP_NAMES[c['trip']].lower()}. You'll hear back here.")
+    await send_cab_to_admins(context.bot, c["id"])
+    return True
+
+
+ONS_PHOTO_HANDLERS.append(_cab_receipt_photo)
+
+
+async def on_cab_form(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cb:n:<visit> start (pick the trip) in /visits."""
+    query = update.callback_query
+    vid = int(query.data.split(":")[2])
+    v = q1("SELECT * FROM appointments WHERE id=?", (vid,))
+    if not may_claim(v, query.from_user.id):
+        await query.answer("Claim against your own visit, once you've arrived.", show_alert=True)
+        return
+    await query.answer()
+    rows = [[InlineKeyboardButton(n, callback_data=f"cb:p:{vid}:{k}")] for k, n in CAB_TRIPS]
+    rows.append([InlineKeyboardButton("‹ Back", callback_data=f"vz:v:{vid}")])
+    await edit_or_send(query, f"🚕 Cab claim · visit #{vid} · {v['customer_name']}\n\nWhich trip?",
+                       InlineKeyboardMarkup(rows))
+
+
+async def on_cab_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """cb:p:<visit>:<TRIP> — then type the fare."""
+    query = update.callback_query
+    _, _, raw, trip = query.data.split(":")
+    v = q1("SELECT * FROM appointments WHERE id=?", (int(raw),))
+    if not may_claim(v, query.from_user.id) or trip not in CAB_TRIP_NAMES:
+        await query.answer("That step is already done.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ons"] = {"kind": "cab_amount", "id": v["id"], "trip": trip}
+    await edit_or_send(query, f"🚕 {CAB_TRIP_NAMES[trip]} · visit #{v['id']}\n\n"
+                              f"Type the fare in {CURRENCY.get(v['country'], 'SGD')}, e.g. 18.40.\n/cancel to stop",
+                       InlineKeyboardMarkup([[InlineKeyboardButton("‹ Back", callback_data=f"cb:n:{v['id']}")]]))
+    return ONS_TEXT
+
+
+async def _cab_amount_text(update, context, job, text) -> int:
+    uid = update.effective_user.id
+    async with write_lock:
+        cid, err = create_cab_claim(uid, job["id"], job["trip"], text)
+    if err:
+        context.user_data["ons"] = job
+        await update.message.reply_text(err + " Or /cancel.")
+        return ONS_TEXT
+    await update.message.reply_text("📷 Now send a photo of the receipt here.")
+    return ConversationHandler.END
+
+
+ONS_TEXT_HANDLERS["cab_amount"] = _cab_amount_text
+
+
+async def on_cab_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cb:a:<id> approve · cb:r:<id> reject (pick why) · cb:x:<id>:<KEY> reject
+    with that reason · cb:b:<id> back."""
+    query = update.callback_query
+    parts = query.data.split(":")
+    action, cid, uid = parts[1], int(parts[2]), query.from_user.id
+    if not admin_for(uid, "ONSITE"):
+        await query.answer("Only On-Site admins approve cab claims.", show_alert=True)
+        return
+    c = q1("SELECT * FROM cab_claims WHERE id=?", (cid,))
+    if not c or c["status"] != "PENDING":
+        await query.answer("Already decided.")
+        return
+    if action == "r":
+        await query.answer()
+        rows = [[InlineKeyboardButton(n, callback_data=f"cb:x:{cid}:{k}")] for k, n in CAB_REJECT]
+        rows.append([InlineKeyboardButton("‹ Back", callback_data=f"cb:b:{cid}")])
+        await query.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+        return
+    if action == "b":
+        await query.answer()
+        await query.edit_message_reply_markup(cab_kb(cid))
+        return
+    if action == "x" and parts[3] in CAB_REJECT_NAMES:
+        status, reason = "REJECTED", CAB_REJECT_NAMES[parts[3]]
+    elif action == "a":
+        status, reason = "APPROVED", None
+    else:
+        await query.answer()
+        return
+    async with write_lock:
+        cur = run("UPDATE cab_claims SET status=?, reason=?, decided_by=?, decided_at=? WHERE id=? AND status='PENDING'",
+                  (status, reason, uid, now().isoformat(), cid))
+    if not cur.rowcount:
+        await query.answer("Already decided.")
+        return
+    await query.answer("Approved" if status == "APPROVED" else "Rejected")
+    c = q1("SELECT * FROM cab_claims WHERE id=?", (cid,))
+    try:
+        sent = json.loads(setting(f"cab_msgs:{cid}", "") or "[]")
+    except ValueError:
+        sent = []
+    for chat_id, mid in sent:
+        try:
+            await context.bot.edit_message_caption(chat_id=chat_id, message_id=mid, caption=cab_text(c), reply_markup=None)
+        except Exception:
+            pass
+    await tell(context.bot, c["user_id"],
+               (f"✅ Your cab claim was approved: {money_text(c['amount_cents'], c['currency'])} "
+                f"for visit #{c['appt_id']}." if status == "APPROVED" else
+                f"❌ Your cab claim of {money_text(c['amount_cents'], c['currency'])} for visit "
+                f"#{c['appt_id']} was rejected: {reason}. Ask {display_name_of(uid, 'the admin')} if unsure."))
+
+
+def my_cab_claims(user_id: int) -> list:
+    return [{"id": c["id"], "visit": c["appt_id"], "trip": CAB_TRIP_NAMES[c["trip"]],
+             "amount": money_text(c["amount_cents"], c["currency"]), "status": c["status"],
+             "statusName": CAB_STATUS[c["status"]], "reason": c["reason"] or "",
+             "when": datetime.fromisoformat(c["created_at"]).astimezone(TZ).strftime("%a %-d %b")}
+            for c in q("SELECT * FROM cab_claims WHERE user_id=? ORDER BY id DESC LIMIT 30", (user_id,))]
+
+
+def photo_bytes(data: str) -> bytes | None:
+    """A photo from the App (a data: URL or base64), or None if it isn't one."""
+    import base64
+    raw = str(data or "")
+    if "," in raw[:80]:
+        raw = raw.split(",", 1)[1]
+    try:
+        out = base64.b64decode(raw, validate=True)
+    except Exception:
+        return None
+    return out if 100 < len(out) <= 8_000_000 and out[:3] in (b"\xff\xd8\xff", b"\x89PN") else None
+
+
+async def upload_photo(bot, user_id: int, data: bytes, caption: str) -> str | None:
+    """Telegram keeps photos by file id, so an App photo goes to the person's own
+    chat with the bot (a record for them too) and its file id is kept."""
+    try:
+        m = await bot.send_photo(user_id, data, caption=caption)
+        return m.photo[-1].file_id
+    except Exception as e:
+        log.info("Couldn't upload a photo for %s: %s", user_id, e)
+        return None
+
+
+async def cab_from_app(user_id: int, appt_id: int, trip: str, amount: str, photo: str = "") -> dict:
+    img = photo_bytes(photo) if photo else None
+    if photo and not img:
+        return {"ok": False, "error": "That photo didn't come through. Try again."}
+    async with write_lock:
+        cid, err = create_cab_claim(user_id, appt_id, trip, amount)
+    if err:
+        return {"ok": False, "error": err}
+    if img:
+        fid = await upload_photo(bot_ref(), user_id, img, f"🧾 Receipt for your cab claim (visit #{appt_id})")
+        if fid:
+            async with write_lock:
+                run("UPDATE cab_claims SET receipt=?, status='PENDING' WHERE id=?", (fid, cid))
+            await send_cab_to_admins(bot_ref(), cid)
+            return {"ok": True, "sent": True}
+    await tell(bot_ref(), user_id, f"📷 Send a photo of the receipt here for your cab claim (visit #{appt_id}).")
+    return {"ok": True, "sent": False}
+
+
+async def visit_photo_from_app(user_id: int, appt_id: int, photo: str) -> dict:
+    v = q1("SELECT * FROM appointments WHERE id=?", (appt_id,))
+    if not v or v["specialist_id"] != user_id or v["status"] != "ONSITE":
+        return {"ok": False, "error": "Photos can be added while you're on site."}
+    img = photo_bytes(photo)
+    if not img:
+        return {"ok": False, "error": "That photo didn't come through. Try again."}
+    fid = await upload_photo(bot_ref(), user_id, img, f"📷 Added to visit #{appt_id}")
+    if not fid:
+        return {"ok": False, "error": "Couldn't save the photo just now."}
+    async with write_lock:
+        log_visit(appt_id, user_id, "photo", fid)
+    return {"ok": True, "photos": photos_of(appt_id)}
+
+
+# --------------------------------------------------------------------------
+# Pay: specialists are paid per visit (the Pay tab, and Admin → Team → On-Site)
+# --------------------------------------------------------------------------
+
+def month_bounds(month: str) -> tuple:
+    """'2026-10' (or '' for this month) → (first day, label, prev, next, is_current)."""
+    today = now().date()
+    try:
+        first = date.fromisoformat(month + "-01")
+    except ValueError:
+        first = today.replace(day=1)
+    if first > today:
+        first = today.replace(day=1)
+    prev = (first - timedelta(days=1)).replace(day=1)
+    nxt = (first + timedelta(days=32)).replace(day=1)
+    return first, first.strftime("%B %Y"), prev.strftime("%Y-%m"), nxt.strftime("%Y-%m"), nxt > today
+
+
+def pay_rate(user_id: int):
+    row = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+    return VISIT_PAY.get(row["country"] if row else "")
+
+
+def paid_visits(user_id: int, first: date) -> list:
+    """Visits that count for pay in this month: finished (🏁 Leave tapped)."""
+    month = first.strftime("%Y-%m")
+    return q("SELECT * FROM appointments WHERE specialist_id=? AND status='COMPLETED'"
+             " AND substr(left_at,1,7)=? ORDER BY left_at DESC", (user_id, month))
+
+
+def pay_summary(user_id: int, first: date) -> dict:
+    rows, rate = paid_visits(user_id, first), pay_rate(user_id)
+    return {"count": len(rows),
+            "total": money_text(rate[0] * len(rows), rate[1]).replace(".00", "") if rate else "",
+            "rate": money_text(rate[0], rate[1]).replace(".00", "") if rate else "", "rows": rows}
+
+
+def pay_payload(user_id: int, month: str = "") -> dict:
+    first, label, prev, nxt, current = month_bounds(month)
+    s = pay_summary(user_id, first)
+    counted = [{**pay_visit(v), "outcome": OUTCOME_NAMES.get(v["outcome"], "Completed")[2:]}
+               for v in s["rows"]]
+    cancelled = q("SELECT * FROM appointments WHERE specialist_id=? AND status='CANCELLED'"
+                  " AND substr(starts_at,1,7)=? ORDER BY starts_at DESC",
+                  (user_id, first.strftime("%Y-%m")))
+    return {
+        "label": label, "prev": prev, "next": nxt, "hasNext": not current,
+        "count": s["count"], "total": s["total"],
+        "resolved": sum(1 for v in s["rows"] if v["outcome"] == "RESOLVED"),
+        "followup": sum(1 for v in s["rows"] if v["outcome"] in ("RETURN", "REPLACE")),
+        "counted": counted,
+        "notCounted": [{**pay_visit(v), "outcome": "Cancelled", "key": "CANCELLED"} for v in cancelled],
+    }
+
+
+def pay_visit(v) -> dict:
+    """A visit on the Pay screen: when, what, first name and area (no amount per
+    visit, and no phone or full address, like past visits on the Me tab)."""
+    start = span_of(v)[0].astimezone(COUNTRY_TZ[v["country"]])
+    return {"id": v["id"], "day": start.strftime("%a %-d %b"), "time": t12(start.strftime("%H:%M")),
+            "type": VISIT_NAMES.get(v["visit_type"], v["visit_type"]),
+            "customer": (v["customer_name"] or "").split(" ")[0], "postal": v["postal"] or "",
+            "product": v["product"] or "", "key": v["outcome"] or ""}
+
+
+def onsite_team_payload(month: str = "") -> dict:
+    """Admin → Team → On-Site: each specialist's visits and pay for the month."""
+    first, label, prev, nxt, current = month_bounds(month)
+    flags = {c: flag for c, flag, _, _ in COUNTRIES}
+    people, done, totals = [], 0, {}
+    for r in q("SELECT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
+               "WHERE m.dept='ONSITE' AND a.status='active' ORDER BY a.country, lower(a.name)"):
+        s = pay_summary(r["user_id"], first)
+        done += s["count"]
+        rate = pay_rate(r["user_id"])
+        if rate:
+            totals[rate[1]] = totals.get(rate[1], 0) + rate[0] * s["count"]
+        people.append({"name": display_name_of(r["user_id"], r["name"]), "flag": flags.get(r["country"] or "", ""),
+                       "count": s["count"], "pay": s["total"] or "Rate not set"})
+    return {"label": label, "prev": prev, "next": nxt, "hasNext": not current, "done": done, "people": people,
+            "total": " + ".join(money_text(c, cur).replace(".00", "") for cur, c in sorted(totals.items()))}
+
