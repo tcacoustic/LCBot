@@ -857,11 +857,7 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     if not rows:
         return ("📋 <b>Open cases</b>\n\nNothing open right now 🎉",
                 InlineKeyboardMarkup(new_btn) if new_btn else None)
-    lines = ["📋 <b>Open cases</b>", ""]
-    if mine:
-        lines.append(f"Your channels: {len(own)} · Others: {len(rest)}")
-    else:
-        lines.append(f"{len(rows)} open")
+    lines = ["📋 <b>Open cases</b>", "", f"{len(rows)} open"]
     lines += ["", "📣 Online request · ↩️ handed back to SH",
               "☑️SH / ☑️ON one side has closed it",
               "⏰ due today · 🚨 overdue", ""]
@@ -874,10 +870,6 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     buttons, heading, nums = [], None, []
     for i, (r, is_own) in enumerate(ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]):
         n = page * CASES_PER_PAGE + i + 1
-        if mine and not is_own and heading is not False:
-            # Own channels come first with no heading; one divider where the rest start.
-            heading = False
-            lines += ["", "<b>— Other channels —</b>"]
         lines.append(case_list_line(n, r))
         nums.append(InlineKeyboardButton(str(n), callback_data=f"cs:v:{r['id']}"))
     lines += ["", "<i>Tap a number to open that case.</i>"]
