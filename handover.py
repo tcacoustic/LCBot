@@ -745,28 +745,19 @@ def may_edit_cases(user_id: int) -> bool:
     return is_online(user_id) or admin_for(user_id, "ON")
 
 
-def case_button_label(r) -> str:
+def case_list_line(n: int, r) -> str:
+    """One case in the /cases message: number, name, order number and store,
+    in full (buttons are one line on a phone, so they only carry the number)."""
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
-    # The order number tells cases apart better than the platform name; the
-    # flag keeps the country. No order: the platform name, as before.
     order = (r["order_no"] or "").strip()
-    if order and order.lower() not in ("none", "-", "na", "n/a"):
-        flag = next((f for k, f, _ in CHANNELS if k == r["channel"]), "")
-        where = f"{flag} {order}".strip()
-    else:
-        where = CHANNEL_NAMES.get(r["channel"] or "", "?")
-    label = f"{r['prio']} {r['username']} · {where}"
-    if r["handed_back"]:
-        label = "↩️ " + label
-    elif r["origin"] == "on" and not r["sh_closed"]:
-        label = "📣 " + label
-    elif r["sh_closed"]:
-        label += " · ☑️SH"
-    elif r["on_closed"]:
-        label += " · ☑️ON"
-    if sla_mark(due):
-        label += f" {sla_mark(due)}"
-    return label[:60]
+    if order.lower() in ("none", "-", "na", "n/a"):
+        order = ""
+    store = (r["store"] or "").strip() or next((name for k, _, name in CHANNELS if k == r["channel"]), "")
+    mark = "↩️ " if r["handed_back"] else ("📣 " if r["origin"] == "on" and not r["sh_closed"] else "")
+    tail = " · ☑️SH" if r["sh_closed"] and not r["handed_back"] else (" · ☑️ON" if r["on_closed"] else "")
+    sla = f" {sla_mark(due)}" if sla_mark(due) else ""
+    parts = [esc(r["username"] or "?")] + ([f"<code>{esc(order)}</code>"] if order else []) + ([esc(store)] if store else [])
+    return f"<b>{n}.</b> {mark}{r['prio']} " + " · ".join(parts) + tail + sla
 
 
 CASES_PER_PAGE = 15
@@ -873,21 +864,24 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(f"{len(rows)} open")
     lines += ["", "📣 Online request · ↩️ handed back to SH",
               "☑️SH / ☑️ON one side has closed it",
-              "⏰ due today · 🚨 overdue", "", "<i>Tap a case to open it.</i>"]
+              "⏰ due today · 🚨 overdue", ""]
     # Own channels first, a page at a time: keeps it scannable on a phone and
     # well under Telegram's 100-button limit.
     ordered = [(r, True) for r in own] + [(r, False) for r in rest]
     pages = max(1, -(-len(ordered) // CASES_PER_PAGE))
     page = min(max(page, 0), pages - 1)
     here = f"cs:l:{page}"
-    buttons, heading = [], None
-    for r, is_own in ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]:
+    buttons, heading, nums = [], None, []
+    for i, (r, is_own) in enumerate(ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]):
+        n = page * CASES_PER_PAGE + i + 1
         if mine and not is_own and heading is not False:
             # Own channels come first with no heading; one divider where the rest start.
             heading = False
-            buttons.append([InlineKeyboardButton("— Other channels —", callback_data=here)])
-        buttons.append([InlineKeyboardButton(case_button_label(r),
-                                             callback_data=f"cs:v:{r['id']}")])
+            lines += ["", "<b>— Other channels —</b>"]
+        lines.append(case_list_line(n, r))
+        nums.append(InlineKeyboardButton(str(n), callback_data=f"cs:v:{r['id']}"))
+    lines += ["", "<i>Tap a number to open that case.</i>"]
+    buttons += [nums[i:i + 5] for i in range(0, len(nums), 5)]
     if pages > 1:
         nav = []
         if page > 0:
