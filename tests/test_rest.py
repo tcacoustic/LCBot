@@ -89,6 +89,14 @@ class RestClientTest(unittest.TestCase):
         self.assertEqual(s["headers"]["Content-Profile"], "lc_bot_dev")
         self.assertEqual(out, "00000000-0000-4000-8000-000000000001")
 
+    def test_timestamps_are_asked_for_in_the_bots_zone(self):
+        http = FakeHttp((200, b"[]"), (201, b"[]"))
+        c = RestClient("https://x.supabase.co/", "pk", Tokens(), schema="lc_bot", http=http, timezone="Asia/Singapore")
+        c.select("weeks")
+        c.insert("weeks", {"label": "W1"})
+        self.assertEqual(http.sent[0]["headers"]["Prefer"], "timezone=Asia/Singapore")
+        self.assertEqual(http.sent[1]["headers"]["Prefer"], "return=representation,timezone=Asia/Singapore")
+
     def test_an_error_carries_postgrests_code_and_message(self):
         http = FakeHttp((403, b'{"code": "42501", "message": "permission denied for table members"}'))
         with self.assertRaises(DataApiError) as e:

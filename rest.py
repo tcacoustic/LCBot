@@ -32,10 +32,12 @@ def _urllib_http(method: str, url: str, headers: dict, body: str | None) -> tupl
 
 class RestClient:
     def __init__(self, supabase_url: str, publishable_key: str, tokens, *, schema: str, http=_urllib_http,
-                 rest_path: str = "/rest/v1/"):
+                 rest_path: str = "/rest/v1/", timezone: str | None = None):
         # rest_path is "/" only for a bare local PostgREST in tests; Supabase serves it under /rest/v1/.
         self._base = supabase_url.rstrip("/") + rest_path
         self._key, self._tokens, self.schema, self._http = publishable_key, tokens, schema, http
+        # Timestamps come back in this zone (PostgREST 12's Prefer: timezone), as the bot always kept them.
+        self._tz = timezone
 
     def _call(self, method: str, path: str, params: dict, body=None, *, schema: str | None = None,
               prefer: str | None = None):
@@ -47,6 +49,7 @@ class RestClient:
                    "Accept-Profile" if method == "GET" else "Content-Profile": profile}
         if method != "GET":
             headers["Content-Type"] = "application/json"
+        prefer = ",".join(p for p in (prefer, f"timezone={self._tz}" if self._tz else None) if p)
         if prefer:
             headers["Prefer"] = prefer
         status, raw = self._http(method, url, headers, json.dumps(body) if body is not None else None)

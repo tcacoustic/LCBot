@@ -52,7 +52,8 @@ def sql(statement: str) -> str:
 
 
 def client(schema: str = "lc_bot_dev", role: str = "lc_bot_dev_app") -> RestClient:
-    return RestClient(PGRST_URL, "local-publishable-key", LocalToken(role), schema=schema, rest_path="/")
+    return RestClient(PGRST_URL, "local-publishable-key", LocalToken(role), schema=schema, rest_path="/",
+                      timezone="Asia/Singapore")
 
 
 @unittest.skipUnless(LIVE, "set LCBOT_LIVE_DB=1 with a local database and PostgREST (tests/README.md)")

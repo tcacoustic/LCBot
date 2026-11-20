@@ -110,6 +110,22 @@ class PeopleTest(LiveTestCase):
         self.data.set_agent(990000001, salaried=True)
         self.assertFalse(self.data.agent(990000001)["tag_calls"])            # a write here reloads
 
+    def test_decisions_newest_first_with_who_decided(self):
+        self.person(990000009, "Admin Person")
+        self.data.request_access(990000001, "First")
+        self.data.request_access(990000002, "Second")
+        self.data.decide(990000001, approve=True, by=990000009)
+        self.data.decide(990000002, approve=False, by=990000009)
+        rows = self.data.decisions(25)
+        self.assertEqual([(r["name"], r["status"], r["decided_by"]) for r in rows],
+                         [("Second", "declined", 990000009), ("First", "active", 990000009)])
+        self.assertEqual([r["name"] for r in self.data.agents(status="declined")], ["Second"])
+
+    def test_renaming_a_waiting_request(self):
+        self.data.request_access(990000001, "Jia")
+        self.data.rename_request(990000001, "Tan Jia En")
+        self.assertEqual(self.data.agent(990000001)["name"], "Tan Jia En")
+
 
 class SettingsTest(LiveTestCase):
     def setUp(self):
@@ -125,3 +141,14 @@ class SettingsTest(LiveTestCase):
         self.assertEqual(self.data.settings_like("case_pick:"), {"case_pick:a": "skip:1"})
         self.data.del_setting("view_as:1")
         self.assertEqual(self.data.setting("view_as:1"), "")
+
+    def test_times_come_back_in_the_bots_zone(self):
+        self.data.request_access(990000001, "Jia En")
+        self.assertTrue(self.data.agent(990000001)["requested_at"].endswith("+08:00"))
+
+    def test_who_decided_comes_back_as_a_telegram_id(self):
+        self.person(990000009, "Admin Person")
+        self.data.request_access(990000001, "Jia En")
+        self.data.decide(990000001, approve=True, by=990000009)
+        self.data._changed()
+        self.assertEqual(Data(self.db).agent(990000001)["decided_by"], 990000009)

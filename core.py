@@ -69,11 +69,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 
-# The warehouse's Data API, as the bot's own role. DB_SCHEMA has no default on purpose:
-# LCBot Test sets lc_bot_dev and production sets lc_bot, so neither can reach the other's data.
-DB_SCHEMA = os.environ["DB_SCHEMA"].strip()
-data = Data(RestClient(os.environ["SUPABASE_URL"].strip(), os.environ["SUPABASE_PUBLISHABLE_KEY"].strip(),
-                       service_token_from_env(), schema=DB_SCHEMA))
 
 
 DAY_ALIASES = {
@@ -112,6 +107,12 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "").strip() or "Asia/Singapore")
+
+# The warehouse's Data API, as the bot's own role. DB_SCHEMA has no default on purpose:
+# LCBot Test sets lc_bot_dev and production sets lc_bot, so neither can reach the other's data.
+DB_SCHEMA = os.environ["DB_SCHEMA"].strip()
+data = Data(RestClient(os.environ["SUPABASE_URL"].strip(), os.environ["SUPABASE_PUBLISHABLE_KEY"].strip(),
+                       service_token_from_env(), schema=DB_SCHEMA, timezone=TZ.key))
 DB_PATH = os.environ.get("DB_PATH", "").strip() or "avails.db"
 MIN_PER_SLOT = env_int("MIN_PER_SLOT", 1)
 # How many agents can hold the same slot. 1 = first come, first served.
@@ -2964,12 +2965,8 @@ def week_bounds(d: date) -> tuple:
 
 
 def find_agent(target: str):
-    if target.startswith("@"):
-        return q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
-    if target.isdigit():
-        return q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
-    return q1("SELECT * FROM agents WHERE lower(display_name)=lower(?) "
-              "OR lower(name)=lower(?)", (target, target))
+    """Someone by Telegram id or name. @usernames aren't kept any more, so '@jia' looks for the name 'jia'."""
+    return data.find(target.lstrip("@"))
 
 
 def at_time_on(the_date: str, hhmm_text: str) -> datetime | None:

@@ -33,6 +33,7 @@ class Data:
     def __init__(self, rest, *, clock=time.monotonic):
         self.db, self._clock = rest, clock
         self._pid: dict[int, str] = {}   # telegram id -> person id; neither changes once set
+        self._tg: dict[str, int] = {}
         self._cache: tuple[float, dict] | None = None
         self._settings: tuple[float, dict] | None = None
 
@@ -42,7 +43,13 @@ class Data:
         for p in rows:
             if p["telegram_id"] is not None:
                 self._pid[p["telegram_id"]] = p["id"]
+                self._tg[p["id"]] = p["telegram_id"]
         return rows
+
+    def telegram_id(self, person_id: str | None) -> int | None:
+        if person_id and person_id not in self._tg:
+            self._people(id=f"eq.{person_id}")
+        return self._tg.get(person_id) if person_id else None
 
     def person_id(self, tg: int) -> str | None:
         if tg not in self._pid:
@@ -50,8 +57,7 @@ class Data:
         return self._pid.get(tg)
 
     # ------------------------------------------------------------------ rows in the old shape
-    @staticmethod
-    def _member_row(m: dict, p: dict) -> dict:
+    def _member_row(self, m: dict, p: dict) -> dict:
         revoked = p["status"] == "revoked"
         return {
             "user_id": p["telegram_id"], "person_id": p["id"],
@@ -60,18 +66,20 @@ class Data:
             "role": m["access_level"], "status": "revoked" if revoked else m["status"],
             "active": m["active"] and not revoked, "dm_ok": m["dms_allowed"],
             "requested_at": m["requested_at"], "decided_at": m["decided_at"],
+            "decided_by": self.telegram_id(m["decided_by_person_id"]), "username": None,
             "req_msgs": m["request_message_ids"], "support_name": m["support_name"],
             "on_avails": m["shows_on_avails"], "tag_calls": m["tagged_in_calls"],
             "salaried": m["salaried"], "channels": m["online_channels"], "store": m["fs_store"],
         }
 
-    @staticmethod
-    def _request_row(r: dict) -> dict:
+    def _request_row(self, r: dict) -> dict:
         return {
             "user_id": r["telegram_id"], "person_id": r["person_id"], "name": r["given_name"],
             "full_name": r["given_name"], "display_name": r["given_name"], "country": None,
-            "role": "agent", "status": r["status"], "active": r["status"] == "pending",
+            "role": "agent", "status": "active" if r["status"] == "approved" else r["status"],
+            "active": r["status"] == "pending",
             "dm_ok": True, "requested_at": r["requested_at"], "decided_at": r["decided_at"],
+            "decided_by": self.telegram_id(r["decided_by_person_id"]), "username": r["telegram_username"],
             "req_msgs": r["request_message_ids"], "support_name": None, "on_avails": False,
             "tag_calls": False, "salaried": False, "channels": None, "store": None,
             "telegram_name": r["telegram_name"],
@@ -126,6 +134,15 @@ class Data:
                 and all(r[k] == v for k, v in flags.items())]
         return sorted(rows, key=lambda r: (r["name"].lower(), r["user_id"]))
 
+    def decisions(self, limit: int) -> list[dict]:
+        """The latest access decisions, newest first: each decided request, as its person is now."""
+        rows = []
+        for r in self.db.select("join_requests", decided_at="not.is.null", order="decided_at.desc", limit=str(limit)):
+            row = self._request_row(r)
+            row["status"] = "active" if r["status"] == "approved" else r["status"]
+            rows.append(row)
+        return rows
+
     def find(self, text: str) -> dict | None:
         """A member by Telegram id or by name (shown or full), case blind. No @usernames."""
         text = text.strip()
@@ -145,6 +162,9 @@ class Data:
         if self.db.update("join_requests", body, telegram_id=f"eq.{tg}", status="eq.pending"):
             return
         self.db.insert("join_requests", {"telegram_id": tg, **body})
+
+    def rename_request(self, tg: int, given_name: str) -> None:
+        self.db.update("join_requests", {"given_name": given_name}, telegram_id=f"eq.{tg}", status="eq.pending")
 
     def set_request_messages(self, tg: int, sent: list) -> None:
         self.db.update("join_requests", {"request_message_ids": sent}, telegram_id=f"eq.{tg}", status="eq.pending")
@@ -212,3 +232,20 @@ class Data:
     def del_setting(self, key: str) -> None:
         self.db.delete("settings", key=f"eq.{key}")
         self._settings = None
+
+    # ------------------------------------------------------------------ the board
+    def _week_slot_ids(self, week_id: str) -> list[str]:
+        days = [r["id"] for r in self.db.select("days", select="id", week_id=f"eq.{week_id}")]
+        if not days:
+            return []
+        return [r["id"] for r in self.db.select("slots", select="id", day_id=_in(days))]
+
+    def free_week(self, tg: int, week_id: str) -> int:
+        """Drop someone's signups and confirmation for a week. Returns the slots freed."""
+        pid = self.person_id(tg)
+        slots = self._week_slot_ids(week_id)
+        if not pid:
+            return 0
+        freed = self.db.delete("signups", person_id=f"eq.{pid}", slot_id=_in(slots)) if slots else []
+        self.db.delete("confirmations", person_id=f"eq.{pid}", week_id=f"eq.{week_id}")
+        return len(freed)
