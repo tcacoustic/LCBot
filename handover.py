@@ -935,7 +935,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     parts = query.data.split(":")
     action = parts[1]
-    case_id = int(parts[2]) if len(parts) > 2 else 0    # the page, for cs:l
+    case_id = parts[2] if len(parts) > 2 else ""        # a case uuid, or the page for cs:l
 
     if action == "x" and is_online(uid):
         async with write_lock:
@@ -978,7 +978,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await refresh_case_post(context.bot, case_id)
 
     if action == "l":
-        text, kb = cases_list(uid, page=case_id)
+        text, kb = cases_list(uid, page=int(case_id) if case_id.isdigit() else 0)
         parse = constants.ParseMode.HTML
     else:
         text, kb = case_view(case_id, uid)

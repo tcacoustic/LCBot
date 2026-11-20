@@ -1008,10 +1008,10 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"No shifts logged in {first.strftime('%B %Y')}."
         )
         return
-    data = io.BytesIO(buf.getvalue().encode())
-    data.name = f"payroll_{first.strftime('%Y_%m')}.csv"
+    out = io.BytesIO(buf.getvalue().encode())
+    out.name = f"payroll_{first.strftime('%Y_%m')}.csv"
     await update.message.reply_document(
-        data, filename=data.name,
+        out, filename=out.name,
         caption=f"{rows_written} shift(s) — {first.strftime('%B %Y')}. Estimates, not payroll.",
     )
 
@@ -1076,7 +1076,7 @@ async def on_ot_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_ot_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    eid = int(query.data.split(":")[2])
+    eid = query.data.split(":")[2]
     row = data.row("time_entries", id=eid)
     if not row:
         await query.answer()

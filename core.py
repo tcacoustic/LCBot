@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import threading
 
 from data import Data
@@ -113,7 +112,6 @@ TZ = ZoneInfo(os.environ.get("TZ_NAME", "").strip() or "Asia/Singapore")
 DB_SCHEMA = os.environ["DB_SCHEMA"].strip()
 data = Data(RestClient(os.environ["SUPABASE_URL"].strip(), os.environ["SUPABASE_PUBLISHABLE_KEY"].strip(),
                        service_token_from_env(), schema=DB_SCHEMA, timezone=TZ.key))
-DB_PATH = os.environ.get("DB_PATH", "").strip() or "avails.db"
 MIN_PER_SLOT = env_int("MIN_PER_SLOT", 1)
 # How many agents can hold the same slot. 1 = first come, first served.
 SLOT_CAPACITY = max(1, env_int("SLOT_CAPACITY", 1))
@@ -143,9 +141,6 @@ DEFAULT_RATE_CENTS = env_int("DEFAULT_RATE_CENTS", 0)
 REVIEW_RATE_CENTS = env_int("REVIEW_RATE_CENTS", 1000)
 # How long after a shift ends before an open clock-in is auto-closed.
 AUTO_CLOSE_GRACE_MIN = env_int("AUTO_CLOSE_GRACE_MIN", 120)
-# Automatic database backup, DM'd to owners. 0-6 = Mon-Sun.
-BACKUP_DAY = env_int("BACKUP_DAY", 0)
-BACKUP_TIME = os.environ.get("BACKUP_TIME", "").strip() or "09:00"
 # "slot"   = pay the full rostered block, however long they were actually on
 # "actual" = pay the exact clocked time
 PAY_MODE = (os.environ.get("PAY_MODE", "").strip().lower() or "slot")
@@ -250,467 +245,10 @@ write_lock = asyncio.Lock()
 # Database
 # --------------------------------------------------------------------------
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS weeks (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    label         TEXT NOT NULL,
-    start_date    TEXT NOT NULL,
-    end_date      TEXT NOT NULL,
-    key_events    TEXT,
-    deadline      TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'open',
-    header_msg_id INTEGER
-);
-CREATE TABLE IF NOT EXISTS days (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    week_id   INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
-    idx       INTEGER NOT NULL,
-    name      TEXT NOT NULL,
-    the_date  TEXT NOT NULL,
-    msg_id    INTEGER
-);
-CREATE TABLE IF NOT EXISTS slots (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    day_id     INTEGER NOT NULL REFERENCES days(id) ON DELETE CASCADE,
-    idx        INTEGER NOT NULL,
-    label      TEXT NOT NULL,
-    start_min  INTEGER NOT NULL,
-    capacity   INTEGER
-);
-CREATE TABLE IF NOT EXISTS signups (
-    slot_id  INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
-    user_id  INTEGER NOT NULL,
-    name     TEXT NOT NULL,
-    ts       TEXT NOT NULL,
-    PRIMARY KEY (slot_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS agents (
-    user_id  INTEGER PRIMARY KEY,
-    name     TEXT NOT NULL,
-    username TEXT,
-    dm_ok    INTEGER NOT NULL DEFAULT 0,
-    active   INTEGER NOT NULL DEFAULT 1,
-    role     TEXT NOT NULL DEFAULT 'agent',
-    status   TEXT NOT NULL DEFAULT 'active',
-    display_name TEXT,
-    requested_at TEXT,
-    decided_by   INTEGER,
-    decided_at   TEXT
-);
-CREATE TABLE IF NOT EXISTS presets (
-    name   TEXT PRIMARY KEY,
-    config TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-CREATE TABLE IF NOT EXISTS fixed_slots (
-    user_id  INTEGER NOT NULL,
-    day_name TEXT NOT NULL,
-    label    TEXT NOT NULL,
-    PRIMARY KEY (user_id, day_name, label)
-);
-CREATE TABLE IF NOT EXISTS drop_requests (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind         TEXT NOT NULL DEFAULT 'drop',
-    agent_id     INTEGER NOT NULL,
-    slot_id      INTEGER NOT NULL,
-    reason       TEXT,
-    target_id    INTEGER,
-    requested_at TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',
-    decided_by   INTEGER,
-    decided_at   TEXT
-);
-CREATE TABLE IF NOT EXISTS ot_claims (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id    INTEGER NOT NULL,
-    agent_id    INTEGER NOT NULL,
-    claimed_out TEXT NOT NULL,
-    ot_minutes  INTEGER NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL DEFAULT 'pending',
-    asked_at    TEXT NOT NULL,
-    decided_by  INTEGER,
-    decided_at  TEXT,
-    notified    TEXT
-);
-CREATE TABLE IF NOT EXISTS reviews (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   INTEGER NOT NULL,
-    the_date   TEXT NOT NULL,
-    photo_id   TEXT,
-    note       TEXT,
-    added_by   INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS ho_cases (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   INTEGER NOT NULL,
-    the_date   TEXT NOT NULL,
-    section    TEXT NOT NULL DEFAULT 'open',
-    prio       TEXT,
-    platform   TEXT,
-    flag       TEXT,
-    store      TEXT,
-    username   TEXT,
-    body       TEXT,
-    closed     INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    closed_by  INTEGER,
-    closed_at  TEXT
-);
-CREATE TABLE IF NOT EXISTS handovers (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id  INTEGER NOT NULL,
-    the_date  TEXT NOT NULL,
-    body      TEXT,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS pay_rates (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id       INTEGER,
-    cents          INTEGER NOT NULL,
-    effective_from TEXT NOT NULL,
-    created_by     INTEGER,
-    created_at     TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS time_entries (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   INTEGER NOT NULL,
-    slot_id    INTEGER,
-    the_date   TEXT NOT NULL,
-    clock_in   TEXT NOT NULL,
-    clock_out  TEXT,
-    status     TEXT NOT NULL DEFAULT 'open',
-    source     TEXT NOT NULL DEFAULT 'agent',
-    note       TEXT,
-    shift_label TEXT,
-    opening_posted INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS time_edits (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id   INTEGER NOT NULL,
-    changed_by INTEGER NOT NULL,
-    before     TEXT,
-    after      TEXT,
-    reason     TEXT,
-    changed_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS confirmations (
-    week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL,
-    ts      TEXT NOT NULL,
-    PRIMARY KEY (week_id, user_id)
-);
-"""
-
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
-# The web server runs on its own thread and shares this connection. Without
-# these two settings a read from the web thread can sit waiting behind a write
-# on the bot's thread, which shows up as the Mini App spinning forever.
-try:
-    db.execute("PRAGMA journal_mode=WAL")      # readers don't block on writers
-    db.execute("PRAGMA busy_timeout=8000")     # wait 8s, then fail loudly
-    db.commit()
-except Exception as _e:                        # a volume that can't do WAL
-    log.warning("Couldn't set WAL mode: %s", _e)
-db.executescript(SCHEMA)
-# Days used to be stored as THURS. Bring old rows in line with the new THU.
-for _tbl, _col in (("days", "name"), ("fixed_slots", "day_name")):
-    try:
-        db.execute(f"UPDATE {_tbl} SET {_col}='THU' WHERE {_col}='THURS'")
-    except sqlite3.OperationalError:
-        pass
-try:
-    for _p in db.execute("SELECT name, config FROM presets").fetchall():
-        if "THURS" in _p[1]:
-            db.execute(
-                "UPDATE presets SET config=? WHERE name=?",
-                (_p[1].replace('"THURS"', '"THU"'), _p[0]),
-            )
-except sqlite3.OperationalError:
-    pass
-db.commit()
-
-_slot_cols = {r[1] for r in db.execute("PRAGMA table_info(slots)")}
-if "capacity" not in _slot_cols:
-    db.execute("ALTER TABLE slots ADD COLUMN capacity INTEGER")
-_dr_cols = {r[1] for r in db.execute("PRAGMA table_info(drop_requests)")}
-if "kind" not in _dr_cols:
-    db.execute("ALTER TABLE drop_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'drop'")
-if "notified" not in _dr_cols:
-    db.execute("ALTER TABLE drop_requests ADD COLUMN notified TEXT")
-if "target_id" not in _dr_cols:
-    db.execute("ALTER TABLE drop_requests ADD COLUMN target_id INTEGER")
-_te_cols = {r[1] for r in db.execute("PRAGMA table_info(time_entries)")}
-for _c, _d in (("shift_label", "TEXT"),
-               ("opening_posted", "INTEGER NOT NULL DEFAULT 0")):
-    if _c not in _te_cols:
-        db.execute(f"ALTER TABLE time_entries ADD COLUMN {_c} {_d}")
-_cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
-if "role" not in _cols:
-    db.execute(
-        "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'agent'"
-    )
-for _col, _ddl in [
-    ("status", "TEXT NOT NULL DEFAULT 'active'"),
-    ("display_name", "TEXT"),
-    ("req_msgs", "TEXT"),
-    ("support_name", "TEXT"),
-    ("on_avails", "INTEGER NOT NULL DEFAULT 1"),
-    ("tag_calls", "INTEGER NOT NULL DEFAULT 1"),
-    ("salaried", "INTEGER NOT NULL DEFAULT 0"),
-    ("requested_at", "TEXT"),
-    ("decided_by", "INTEGER"),
-    ("decided_at", "TEXT"),
-    ("channels", "TEXT"),            # Online team: JSON list of channel keys
-]:
-    if _col not in _cols:
-        db.execute(f"ALTER TABLE agents ADD COLUMN {_col} {_ddl}")
-# Handover cases: the Online channel, the case split into fields, and a
-# close tick for each side (SH and Online). `closed` stays as "fully closed".
-_hc_cols = {r[1] for r in db.execute("PRAGMA table_info(ho_cases)")}
-for _col, _ddl in [
-    ("channel", "TEXT"),
-    ("order_no", "TEXT"),
-    ("product", "TEXT"),
-    ("happened", "TEXT"),
-    ("done", "TEXT"),
-    ("need", "TEXT"),
-    ("sh_closed", "INTEGER NOT NULL DEFAULT 0"),
-    ("sh_closed_by", "INTEGER"),
-    ("sh_closed_at", "TEXT"),
-    ("on_closed", "INTEGER NOT NULL DEFAULT 0"),
-    ("on_closed_by", "INTEGER"),
-    ("on_closed_at", "TEXT"),
-]:
-    if _col not in _hc_cols:
-        db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
-for _col, _ddl in [
-    ("chat_posted", "INTEGER NOT NULL DEFAULT 0"),
-    ("post_id", "INTEGER"),
-    ("handed_back", "INTEGER NOT NULL DEFAULT 0"),
-    ("pm_notified", "INTEGER NOT NULL DEFAULT 0"),
-    ("origin", "TEXT NOT NULL DEFAULT 'sh'"),     # 'on' = an Online request
-]:
-    if _col not in _hc_cols:
-        db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
-if "pm_notified" not in _hc_cols:
-    # Platform managers only hear about cases added from now on.
-    db.execute("UPDATE ho_cases SET pm_notified=1")
-if "chat_posted" not in _hc_cols:
-    # Only cases added from now on go to the store chats.
-    db.execute("UPDATE ho_cases SET chat_posted=1")
-# Which department(s) each person works in. The source of truth for what
-# they see; agents.role now only says admin or not.
-db.execute("""CREATE TABLE IF NOT EXISTS memberships (
-    user_id    INTEGER NOT NULL,
-    dept       TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (user_id, dept)
-)""")
-if not db.execute("SELECT 1 FROM settings WHERE key='memberships_moved'").fetchone():
-    # First start with departments: agents and admins into Livechat, the
-    # Online team into ON. Pending and declined people get theirs on approval.
-    _ts = datetime.now().isoformat()
-    db.execute("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
-               "SELECT user_id, 'ON', ? FROM agents WHERE role='online'", (_ts,))
-    db.execute("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
-               "SELECT user_id, 'LIVECHAT', ? FROM agents WHERE status='active' "
-               "AND role IN ('agent', 'admin')", (_ts,))
-    # agents.role 'online' is left as it is: the new code goes by memberships,
-    # and the previous version still reads it if we ever roll back.
-    db.execute("INSERT INTO settings (key, value) VALUES ('memberships_moved', ?)", (_ts,))
-# On-Site: home visits, their history, and times a specialist isn't free.
-# Times are ISO strings with the visit country's UTC offset.
-db.execute("""CREATE TABLE IF NOT EXISTS appointments (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    country            TEXT NOT NULL,
-    specialist_id      INTEGER,
-    visit_type         TEXT NOT NULL,
-    starts_at          TEXT NOT NULL,
-    duration_min       INTEGER NOT NULL DEFAULT 120,
-    customer_name      TEXT NOT NULL,
-    phone              TEXT,
-    email              TEXT,
-    address            TEXT NOT NULL,
-    postal             TEXT,
-    product            TEXT,
-    issue              TEXT,
-    order_no           TEXT,
-    status             TEXT NOT NULL DEFAULT 'SCHEDULED',
-    created_by         INTEGER,
-    created_at         TEXT NOT NULL,
-    proposed_starts_at TEXT,
-    proposed_by        INTEGER,
-    arrived_at         TEXT,
-    left_at            TEXT,
-    outcome            TEXT,
-    amount_cents       INTEGER,
-    currency           TEXT,
-    pay_method         TEXT,
-    followup_done      INTEGER NOT NULL DEFAULT 0
-)""")
-db.execute("""CREATE TABLE IF NOT EXISTS appointment_log (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    appt_id    INTEGER NOT NULL,
-    user_id    INTEGER,
-    action     TEXT NOT NULL,
-    note       TEXT,
-    created_at TEXT NOT NULL
-)""")
-db.execute("""CREATE TABLE IF NOT EXISTS specialist_blocks (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL,
-    starts_at  TEXT NOT NULL,
-    ends_at    TEXT NOT NULL,
-    note       TEXT,
-    part       TEXT,
-    created_at TEXT NOT NULL
-)""")
-if "part" not in {r[1] for r in db.execute("PRAGMA table_info(specialist_blocks)")}:
-    db.execute("ALTER TABLE specialist_blocks ADD COLUMN part TEXT")   # AM, PM or FD
-if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
-    db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
-if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
-    db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
-# On-Site replacement / payment requests, posted to the SH x Ops chat.
-db.execute("""CREATE TABLE IF NOT EXISTS onsite_requests (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    appt_id     INTEGER NOT NULL,
-    country     TEXT NOT NULL,
-    need        TEXT NOT NULL,       -- REPLACEMENT, PART, OTHER
-    reason      TEXT NOT NULL,
-    warranty    TEXT NOT NULL,       -- IN, OUT
-    price_cents INTEGER,             -- NULL = to confirm
-    currency    TEXT,
-    pays_by     TEXT NOT NULL,       -- LINK, PAYNOW, NONE
-    status      TEXT NOT NULL DEFAULT 'OPEN',   -- OPEN, TAKEN, DONE
-    created_by  INTEGER NOT NULL,
-    created_at  TEXT NOT NULL,
-    taken_by    INTEGER,
-    taken_at    TEXT,
-    done_by     INTEGER,
-    done_at     TEXT,
-    note        TEXT,
-    chat_id     INTEGER,
-    msg_id      INTEGER
-)""")
-# On-Site cab claims: a ride to or from a visit, with a receipt photo.
-db.execute("""CREATE TABLE IF NOT EXISTS cab_claims (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    appt_id      INTEGER NOT NULL,
-    user_id      INTEGER NOT NULL,
-    trip         TEXT NOT NULL,      -- TO, FROM, BOTH
-    amount_cents INTEGER NOT NULL,
-    currency     TEXT NOT NULL,
-    receipt      TEXT,               -- Telegram file_id of the receipt photo
-    status       TEXT NOT NULL DEFAULT 'RECEIPT',   -- RECEIPT, PENDING, APPROVED, REJECTED
-    reason       TEXT,
-    decided_by   INTEGER,
-    decided_at   TEXT,
-    created_at   TEXT NOT NULL
-)""")
-# Follow-up visits: the visit it follows on from, and how urgent it is.
-_ap_cols = {r[1] for r in db.execute("PRAGMA table_info(appointments)")}
-for _col in ("urgency TEXT", "followup_of INTEGER"):
-    if _col.split()[0] not in _ap_cols:
-        db.execute(f"ALTER TABLE appointments ADD COLUMN {_col}")
-# Who did what to a case, and any note they left.
-# Special requests to Ops (ops.py): one row each, mirrored to the Ops sheet.
-db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_no        TEXT NOT NULL,
-    country         TEXT,
-    category        TEXT NOT NULL,
-    details         TEXT NOT NULL,
-    delivery_date   TEXT NOT NULL,
-    timeframe       TEXT NOT NULL,
-    timeframe_other TEXT,
-    created_by      INTEGER NOT NULL,
-    created_at      TEXT NOT NULL,
-    after_cutoff    INTEGER NOT NULL DEFAULT 0,   -- next working day's delivery, asked after 2pm
-    urgent          INTEGER NOT NULL DEFAULT 0,   -- same-day delivery
-    status          TEXT NOT NULL DEFAULT 'OPEN',
-    reason          TEXT,
-    taken_by        INTEGER,
-    taken_at        TEXT,
-    ops_note        TEXT,
-    handled_by      INTEGER,
-    handled_at      TEXT,
-    ops_chat_id     INTEGER,
-    ops_msg_id      INTEGER,
-    sheet_dirty     INTEGER NOT NULL DEFAULT 1,
-    sheet_row       INTEGER
-)""")
-_cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
-for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER",
-             "urgent INTEGER NOT NULL DEFAULT 0", "source TEXT NOT NULL DEFAULT 'bot'",
-             "submitted_name TEXT"):
-    if _col.split()[0] not in _cols:
-        db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
-db.execute("""CREATE TABLE IF NOT EXISTS case_log (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    case_id    INTEGER NOT NULL,
-    user_id    INTEGER,
-    side       TEXT,
-    action     TEXT NOT NULL,
-    note       TEXT,
-    created_at TEXT NOT NULL
-)""")
-# One message in a store's chat: new cases from one handover, or one
-# Online request.
-db.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel    TEXT NOT NULL,
-    chat_id    INTEGER NOT NULL,
-    thread_id  INTEGER,
-    message_id INTEGER,
-    agent_id   INTEGER,
-    the_date   TEXT NOT NULL,
-    created_at TEXT NOT NULL
-)""")
-if "kind" not in {r[1] for r in db.execute("PRAGMA table_info(channel_posts)")}:
-    db.execute("ALTER TABLE channel_posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'handover'")
-if "sh_closed" not in _hc_cols:
-    # Cases closed before the two ticks existed count as closed on both sides.
-    db.execute(
-        "UPDATE ho_cases SET sh_closed=1, sh_closed_by=closed_by, "
-        "sh_closed_at=closed_at, on_closed=1, on_closed_by=closed_by, "
-        "on_closed_at=closed_at WHERE closed=1"
-    )
-for _name, _cfg in SEED_PRESETS.items():
-    db.execute(
-        "INSERT OR IGNORE INTO presets (name, config) VALUES (?,?)",
-        (_name, json.dumps(_cfg)),
-    )
-db.commit()
-
-
-# The bot and the Mini App's request threads share this one connection, and
-# SQLite can't run two statements on it at once (that gave "bad parameter or
-# other API misuse" and half-read rows). So they take turns. Reentrant, so
-# code already holding it can still call these helpers.
-db_lock = threading.RLock()
-
-
-def q(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-    with db_lock:
-        return db.execute(sql, args).fetchall()
-
-
-def q1(sql: str, args: tuple = ()) -> sqlite3.Row | None:
-    with db_lock:
-        return db.execute(sql, args).fetchone()
-
-
-def run(sql: str, args: tuple = ()) -> sqlite3.Cursor:
-    with db_lock:
-        cur = db.execute(sql, args)
-        db.commit()
-        return cur
+def seed_presets() -> None:
+    """The built-in timing patterns, added once (never overwriting an edited one). Run at startup."""
+    data.add("presets", [{"name": n, "config": json.dumps(c)} for n, c in SEED_PRESETS.items()],
+             on_conflict="name", returning=False, ignore=True)
 
 
 # --------------------------------------------------------------------------
@@ -1262,7 +800,7 @@ def week_containing(d: date) -> dict | None:
                     order="-start_date")
 
 
-def this_week() -> sqlite3.Row | None:
+def this_week() -> dict | None:
     """The week being worked right now.
 
     Different from latest_week(): once next week opens for avails, that one is
@@ -1271,7 +809,7 @@ def this_week() -> sqlite3.Row | None:
     return week_containing(now().date()) or latest_week()
 
 
-def latest_week() -> sqlite3.Row | None:
+def latest_week() -> dict | None:
     """The week we're actually in.
 
     Prefer the open one, then whichever covers today, then the one starting
@@ -1906,7 +1444,6 @@ PICKUP_PICK, PICKUP_REASON = 210, 211
 HANDOVER_TEXT = 220
 HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
 REVIEW_PHOTO = 230
-RESTORE_FILE, RESTORE_OK = 250, 251
 HO_PICK = 231
 CASE_NOTE, CASE_EDIT = 270, 271
 OT_WHEN = 260
@@ -2914,54 +2451,6 @@ def at_time_on(the_date: str, hhmm_text: str) -> datetime | None:
     return datetime.combine(d, time(mins // 60, mins % 60), TZ)
 
 
-EXPECTED_TABLES = {
-    "agents", "weeks", "days", "slots", "signups", "time_entries",
-    "pay_rates", "handovers", "ho_cases", "reviews", "drop_requests",
-}
-
-
-def inspect_db(path: str) -> dict:
-    """Read a database file without touching the live one."""
-    out = {"ok": False, "tables": set(), "counts": {}, "newest": None}
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
-        con.row_factory = sqlite3.Row
-    except Exception as e:
-        out["error"] = f"Can't open it: {e}"
-        return out
-    try:
-        names = {
-            r["name"] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        out["tables"] = names
-        missing = EXPECTED_TABLES - names
-        if missing:
-            out["error"] = "Not an avails database — missing " + ", ".join(
-                sorted(missing)[:4]
-            )
-            return out
-        for t in ("agents", "weeks", "time_entries", "signups", "handovers",
-                  "reviews"):
-            out["counts"][t] = con.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-        r = con.execute(
-            "SELECT MAX(the_date) d FROM time_entries"
-        ).fetchone()
-        out["newest"] = r["d"] if r else None
-        out["ok"] = True
-    except Exception as e:
-        out["error"] = f"Couldn't read it: {e}"
-    finally:
-        con.close()
-    return out
-
-
-# --------------------------------------------------------------------------
-# Scheduled jobs
-# --------------------------------------------------------------------------
-
-
 async def nudge(context: ContextTypes.DEFAULT_TYPE, week_id: int, prefix: str) -> None:
     w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
@@ -3145,8 +2634,6 @@ OWNER_EXTRA = [
     ("setrate", "Set the hourly rate"),
     ("payroll", "Export shifts as CSV"),
     ("export", "This week's board as CSV"),
-    ("backup", "Download a copy of the data"),
-    ("restore", "Put a backup back"),
     ("chatid", "Show this chat's ID"),
 ]
 ADMIN_COMMANDS = AGENT_COMMANDS + [

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import time
 
 ROSTER_TTL_S = 60
@@ -244,6 +245,9 @@ class _Tables:
     def rows(self, table: str, *, order: str | None = None, limit: int | None = None,
              either: list[dict] | None = None, **filters) -> list[dict]:
         """Rows matching every filter; with either=[{...}, {...}], also matching one of those."""
+        rid = filters.get("id")
+        if isinstance(rid, (str, int)) and not re.fullmatch(r"[0-9a-f-]{36}", str(rid)):
+            return []        # not a row id (an old number on a stale button, a typo): no such row
         params = {**self._filters(table, filters), **self._order(table, order)}
         if either:
             params["or"] = "(" + self._either(table, either) + ")"
