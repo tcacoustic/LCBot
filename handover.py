@@ -34,7 +34,7 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if not args:
-        mine = q1("SELECT support_name FROM agents WHERE user_id=?", (user.id,))
+        mine = data.agent(user.id)
         own = mine["support_name"] if mine else None
         team = setting("support_name", "")
         lines = [
@@ -55,13 +55,13 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if args[0].lower() == "reset":
         async with write_lock:
-            run("UPDATE agents SET support_name=NULL WHERE user_id=?", (user.id,))
+            data.set_agent(user.id, support_name=None)
         await update.message.reply_text("Cleared — you'll use the team default.")
         return
 
     value = " ".join(args).strip()
     async with write_lock:
-        run("UPDATE agents SET support_name=? WHERE user_id=?", (value, user.id))
+        data.set_agent(user.id, support_name=value)
     await update.message.reply_text(
         f"Your openings will list <b>{esc(value)}</b> as support.",
         parse_mode=constants.ParseMode.HTML,
@@ -160,12 +160,7 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     cases = [case_row_to_dict(c) for c in running]
     text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
     async with write_lock:
-        run(
-            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
-            "VALUES (?,?,?,?)",
-            (user.id, today.isoformat(),
-             "\n\n".join(render_case(c) for c in cases), now().isoformat()),
-        )
+        add_handover(user.id, today, "\n\n".join(render_case(c) for c in cases))
     posted = await post_ops(context.bot, text) if text else False
     await sync_store_chats(context.bot, user.id)
     await query.answer("Carried forward ✓")
@@ -194,11 +189,7 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     async with write_lock:
         for cid in closed_ids:
             close_case(cid, user.id)
-        run(
-            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
-            "VALUES (?,?,?,?)",
-            (user.id, today.isoformat(), "", now().isoformat()),
-        )
+        add_handover(user.id, today, "")
     text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
     posted = await post_ops(context.bot, text) if text else False
     await sync_store_chats(context.bot, user.id, closed_ids)
@@ -304,12 +295,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for d in new_cases:
             insert_case(user.id, d, today)
             cases.append(d)
-        run(
-            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
-            "VALUES (?,?,?,?)",
-            (user.id, today.isoformat(),
-             "\n\n".join(render_case(c) for c in cases), now().isoformat()),
-        )
+        add_handover(user.id, today, "\n\n".join(render_case(c) for c in cases))
 
     text, _ = render_shift_summary(user.id, display_name_of(user.id, user.full_name))
     posted = await post_ops(context.bot, text) if text else False
@@ -677,11 +663,7 @@ async def got_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     today = now().date()
     async with write_lock:
-        run(
-            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
-            "VALUES (?,?,?,?)",
-            (user.id, today.isoformat(), body, now().isoformat()),
-        )
+        add_handover(user.id, today, body)
 
     text = (
         handover_header(today)
@@ -714,9 +696,7 @@ async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Recent handovers, for admins."""
     if not is_admin(update.effective_user.id):
         return
-    rows = q(
-        "SELECT * FROM handovers ORDER BY created_at DESC LIMIT 10"
-    )
+    rows = data.rows("handovers", order="-created_at", limit=10)
     if not rows:
         await update.message.reply_text("No handovers recorded yet.")
         return
@@ -773,9 +753,8 @@ def still_open_for_online(channel: str, before) -> list:
     requests are left out."""
     if not online_covers(channel):
         return []
-    return q("SELECT * FROM ho_cases WHERE channel=? AND closed=0 AND on_closed=0"
-             " AND handed_back=0 AND COALESCE(origin,'')!='on' AND created_at<?"
-             " ORDER BY created_at, id", (channel, before.isoformat()))
+    return data.rows("ho_cases", channel=channel, closed=False, on_closed=False, handed_back=False,
+                     origin=("neq", "on"), created_at=("lt", before.isoformat()), order="created_at")
 
 
 def bump_text(channel: str, rows: list) -> str:
@@ -786,7 +765,7 @@ def bump_text(channel: str, rows: list) -> str:
     lines += [f"<i>{sub}</i>", ""]
     for r in rows:
         name = esc(r["username"] or "case")
-        p = q1("SELECT chat_id, message_id FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
+        p = data.row("channel_posts", id=r["post_id"]) if r["post_id"] else None
         chat = str(p["chat_id"]) if p else ""
         if chat.startswith("-100") and p["message_id"]:
             name = f'<a href="https://t.me/c/{chat[4:]}/{p["message_id"]}">{name}</a>'
@@ -849,7 +828,7 @@ async def job_case_bump(context: ContextTypes.DEFAULT_TYPE) -> None:
 def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     mine = set(online_channels(user_id))
     skipped = skipped_ids()
-    rows = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id") if r["id"] not in skipped]
+    rows = [r for r in data.rows("ho_cases", closed=False, order="created_at") if r["id"] not in skipped]
     own = [r for r in rows if r["channel"] in mine]
     rest = [r for r in rows if r["channel"] not in mine]
     new_btn = ([[InlineKeyboardButton("➕ New Online request", callback_data="cs:new")]]
@@ -885,8 +864,8 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(new_btn + buttons)
 
 
-def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+def case_view(case_id: str, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return "That case is gone.", InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ All cases", callback_data="cs:l")]])
@@ -975,7 +954,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await refresh_case_post(context.bot, case_id)
         await query.answer("Force closed ✓")
     elif action == "ro":
-        r = q1("SELECT closed FROM ho_cases WHERE id=?", (case_id,))
+        r = data.row("ho_cases", id=case_id)
         if r and r["closed"]:
             async with write_lock:
                 reopen_case(case_id, uid)
@@ -1019,10 +998,10 @@ async def on_case_note_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("You can't do that here.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
-    context.user_data["case_note"] = (action, int(raw))
-    r = q1("SELECT username FROM ho_cases WHERE id=?", (int(raw),))
+    context.user_data["case_note"] = (action, raw)
+    r = data.row("ho_cases", id=raw)
     who = r["username"] if r else "this case"
-    mine = reusable_note(int(raw), uid) if action == "h" else None
+    mine = reusable_note(raw, uid) if action == "h" else None
     if mine:
         await query.edit_message_text(
             f"↩️ <b>Hand {esc(who)} back to SH</b>\n\nUse your note?\n"
@@ -1052,11 +1031,11 @@ async def on_handback_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     uid = query.from_user.id
     _, action, raw = query.data.split(":")
-    case_id = int(raw)
+    case_id = raw
     await query.answer()
     if action == "hw":
         context.user_data["case_note"] = ("h", case_id)
-        r = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
+        r = data.row("ho_cases", id=case_id)
         await query.edit_message_text(
             f"↩️ <b>Hand {esc(r['username'] if r else 'this case')} back to SH</b>"
             "\n\nWhat do you need from them?\n\n<i>/cancel to stop</i>",
@@ -1111,8 +1090,8 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 
-def edit_picker(case_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+def edit_picker(case_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return "That case is gone.", InlineKeyboardMarkup(
             [[InlineKeyboardButton("◀️ All cases", callback_data="cs:l")]])
@@ -1138,12 +1117,12 @@ async def on_case_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not may_edit_cases(uid) or key not in EDIT_LABELS or key == "prio":
         await query.answer("You can't do that here.", show_alert=True)
         return ConversationHandler.END
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (int(raw),))
+    r = data.row("ho_cases", id=raw)
     if not r:
         await query.answer("That case is gone.", show_alert=True)
         return ConversationHandler.END
     await query.answer()
-    context.user_data["case_edit"] = (int(raw), key)
+    context.user_data["case_edit"] = (raw, key)
     optional = key == "done"
     await query.edit_message_text(
         f"✏️ <b>{esc(EDIT_LABELS[key])}</b> for {esc(r['username'])}\n\n"
@@ -1186,8 +1165,8 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not may_see_cases(uid):
         await query.answer("This is for the SH and Online teams.", show_alert=True)
         return
-    case_id = int(query.data.split(":")[2])
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    case_id = query.data.split(":")[2]
+    r = data.row("ho_cases", id=case_id)
     if not r or r["closed"]:
         await query.answer("That case is already closed.")
         await refresh_case_post(context.bot, case_id)
@@ -1214,8 +1193,8 @@ async def on_store_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer("This is for the platform managers.", show_alert=True)
         return
     _, action, cid = query.data.split(":")
-    case_id = int(cid)
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    case_id = cid
+    r = data.row("ho_cases", id=case_id)
     if not r or not awaiting_pm(r):
         await query.answer("Someone already answered this one.")
         await refresh_case_post(context.bot, case_id)
@@ -1240,8 +1219,8 @@ async def on_store_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not may_see_cases(uid):
         await query.answer("This is for the SH and Online teams.", show_alert=True)
         return
-    case_id = int(query.data.split(":")[2])
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    case_id = query.data.split(":")[2]
+    r = data.row("ho_cases", id=case_id)
     if not r:
         await query.answer("That case is gone.")
         return
@@ -1278,16 +1257,15 @@ def case_report(channels: list, first: date, last: date) -> str:
     for key, flag, name in CHANNELS:
         if key not in channels:
             continue
-        new = q1("SELECT COUNT(*) c FROM ho_cases WHERE channel=? AND created_at>=? "
-                 "AND created_at<?", (key, start, end))["c"]
-        done = q("SELECT created_at, closed_at FROM ho_cases WHERE channel=? AND closed=1 "
-                 "AND closed_at>=? AND closed_at<?", (key, start, end))
-        open_rows = q("SELECT the_date, prio FROM ho_cases WHERE channel=? AND closed=0", (key,))
+        new = data.count("ho_cases", channel=key, created_at=(("gte", start), ("lt", end)))
+        done = data.rows("ho_cases", channel=key, closed=True, closed_at=(("gte", start), ("lt", end)))
+        open_rows = data.rows("ho_cases", channel=key, closed=False)
         overdue = sum(1 for r in open_rows
                       if sla_mark(case_due(date.fromisoformat(r["the_date"]), r["prio"]), today) == "🚨")
-        back = q1("SELECT COUNT(*) c FROM case_log l JOIN ho_cases h ON h.id=l.case_id "
-                  "WHERE h.channel=? AND l.action='handed back' AND l.created_at>=? "
-                  "AND l.created_at<?", (key, start, end))["c"]
+        handed = data.rows("case_log", action="handed back", created_at=(("gte", start), ("lt", end)))
+        theirs = {r["id"] for r in data.rows("ho_cases", channel=key, id=list({e["case_id"] for e in handed}))} \
+            if handed else set()
+        back = sum(1 for e in handed if e["case_id"] in theirs)
         spans = [(datetime.fromisoformat(r["closed_at"]) - datetime.fromisoformat(r["created_at"])).total_seconds()
                  for r in done if r["closed_at"] and r["created_at"]]
         for k, v in (("new", new), ("closed", len(done)), ("open", len(open_rows)),

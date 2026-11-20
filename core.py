@@ -2182,16 +2182,13 @@ def search_cases(text: str, limit: int = 20) -> list:
         return []
     day = read_day(text)
     if day:
-        return q("SELECT * FROM ho_cases WHERE the_date=? OR substr(created_at, 1, 10)=?"
-                 " ORDER BY id DESC LIMIT ?", (day.isoformat(), day.isoformat(), limit))
-    words = text.split()[:5]
-    clause = "(" + " OR ".join(f"COALESCE({f}, '') LIKE ? ESCAPE '\\'" for f in SEARCH_FIELDS) + ")"
-    params = []
-    for w in words:
-        w = w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params += [f"%{w}%"] * len(SEARCH_FIELDS)
-    return q(f"SELECT * FROM ho_cases WHERE {' AND '.join([clause] * len(words))}"
-             " ORDER BY id DESC LIMIT ?", (*params, limit))
+        start = datetime.combine(day, time(0, 0), TZ)
+        return data.rows("ho_cases", either=[
+            {"the_date": day.isoformat()},
+            {"created_at": (("gte", f'"{start.isoformat()}"'),
+                            ("lt", f'"{(start + timedelta(days=1)).isoformat()}"'))},
+        ], order="-created_at", limit=limit)
+    return data.search("ho_cases", text.split()[:5], SEARCH_FIELDS, order="-created_at", limit=limit)
 
 
 def compose_body(d: dict, origin: str = "sh") -> str:
@@ -2254,7 +2251,7 @@ def online_covers(channel: str | None) -> bool:
     return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
 
 
-def pm_pick(case_id: int) -> tuple[str, int] | None:
+def pm_pick(case_id: str) -> tuple[str, int] | None:
     """A PM's answer to a new SH case: ('help', who) or ('skip', who).
     Kept in settings, not a new column."""
     v = setting(f"case_pick:{case_id}")
@@ -2264,15 +2261,14 @@ def pm_pick(case_id: int) -> tuple[str, int] | None:
     return kind, int(who)
 
 
-def helper_of(case_id: int) -> int | None:
+def helper_of(case_id: str) -> int | None:
     p = pm_pick(case_id)
     return p[1] if p and p[0] == "help" else None
 
 
 def skipped_ids() -> set:
     """Cases a PM said Not needed: off the Online team's lists."""
-    return {int(r["key"].split(":")[1])
-            for r in q("SELECT key FROM settings WHERE key LIKE 'case_pick:%' AND value LIKE 'skip:%'")}
+    return {k.split(":", 1)[1] for k, v in data.settings_like("case_pick:").items() if v.startswith("skip:")}
 
 
 def awaiting_pm(r) -> bool:
@@ -2282,154 +2278,135 @@ def awaiting_pm(r) -> bool:
             and pm_pick(r["id"]) is None)
 
 
-def pm_will_help(case_id: int, user_id: int) -> None:
+def pm_will_help(case_id: str, user_id: int) -> None:
     set_setting(f"case_pick:{case_id}", f"help:{user_id}")
     log_case(case_id, user_id, "on", "will help")
 
 
-def pm_not_needed(case_id: int, user_id: int) -> None:
+def pm_not_needed(case_id: str, user_id: int) -> None:
     """Counts as Online's close. SH isn't told; SH's close finishes it. The
     caller moves it out of the store chat (move_to_tc_online)."""
     set_setting(f"case_pick:{case_id}", f"skip:{user_id}")
     close_case(case_id, user_id, "on", action="not needed")
 
 
-def clear_pick(case_id: int) -> None:
-    run("DELETE FROM settings WHERE key=?", (f"case_pick:{case_id}",))
+def clear_pick(case_id: str) -> None:
+    data.del_setting(f"case_pick:{case_id}")
 
 
-def log_case(case_id: int, user_id: int | None, side: str, action: str,
+def log_case(case_id: str, user_id: int | None, side: str, action: str,
              note: str = "") -> None:
-    run("INSERT INTO case_log (case_id, user_id, side, action, note, created_at)"
-        " VALUES (?,?,?,?,?,?)",
-        (case_id, user_id, side, action, note or None, now().isoformat()))
+    data.add("case_log", {"case_id": case_id, "user_id": user_id, "side": side, "action": action,
+                          "note": note or None, "created_at": now().isoformat()}, returning=False)
 
 
-def latest_note(case_id: int, actions=("note", "handed back"), side: str | None = None):
+def latest_note(case_id: str, actions=("note", "handed back"), side: str | None = None):
     """The newest note someone wrote on a case (not edit records), or None."""
-    marks = ",".join("?" * len(actions))
-    extra, args = ("AND side=? ", (side,)) if side else ("", ())
-    return q1(f"SELECT * FROM case_log WHERE case_id=? AND note IS NOT NULL "
-              f"AND action IN ({marks}) {extra}ORDER BY id DESC LIMIT 1",
-              (case_id, *actions, *args))
+    extra = {"side": side} if side else {}
+    return data.row("case_log", case_id=case_id, note=("not.is", None), action=list(actions),
+                    order="-created_at", **extra)
 
 
-def reusable_note(case_id: int, user_id: int):
+def reusable_note(case_id: str, user_id: int):
     """The note this person just left, if it's still the latest word on the
     case — so handing back doesn't make them type it twice."""
     n = latest_note(case_id)
     return n if n and n["user_id"] == user_id and n["action"] == "note" else None
 
 
-def case_history(case_id: int) -> list:
-    return q("SELECT * FROM case_log WHERE case_id=? ORDER BY id", (case_id,))
+def case_history(case_id: str) -> list:
+    return data.rows("case_log", case_id=case_id, order="created_at")
 
 
-def insert_case(agent_id: int, d: dict, the_date: date, origin: str = "sh") -> int:
+def insert_case(agent_id: int, d: dict, the_date: date, origin: str = "sh") -> str:
     """Save a new case. Fills in its channel and the written-out body.
     origin 'on' is an Online request: posted to its store chat straight away,
     so it's marked as already posted and the PM isn't told about their own."""
     d["channel"] = channel_for(d["platform"], d.get("store"))
     d["body"] = compose_body(d, origin)
-    done_already = 1 if origin == "on" else 0
-    cur = run(
-        "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform, flag,"
-        " store, username, body, channel, order_no, product, happened, done,"
-        " need, created_at, origin, pm_notified, chat_posted)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (agent_id, the_date.isoformat(), d["section"], d["prio"], d["platform"],
-         d.get("flag", ""), d.get("store", ""), d["username"], d["body"],
-         d["channel"], d["order_no"], d["product"], d["happened"],
-         d.get("done") or None, d["need"], now().isoformat(),
-         origin, done_already, done_already),
-    )
-    return cur.lastrowid
+    done_already = origin == "on"
+    return data.add("ho_cases", {
+        "agent_id": agent_id, "the_date": the_date.isoformat(), "section": d["section"], "prio": d["prio"],
+        "platform": d["platform"], "flag": d.get("flag", ""), "store": d.get("store", ""),
+        "username": d["username"], "body": d["body"], "channel": d["channel"], "order_no": d["order_no"],
+        "product": d["product"], "happened": d["happened"], "done": d.get("done") or None, "need": d["need"],
+        "created_at": now().isoformat(), "origin": origin, "pm_notified": done_already,
+        "chat_posted": done_already,
+    })["id"]
 
 
-def close_case(case_id: int, user_id: int, side: str = "sh", action: str = "closed") -> None:
+def close_case(case_id: str, user_id: int, side: str = "sh", action: str = "closed") -> None:
     """Tick one side closed. Fully closed once both sides are, or once SH is
     if the Online team doesn't cover that channel."""
     if side not in ("sh", "on"):
         raise ValueError(side)
     ts = now().isoformat()
-    run(
-        f"UPDATE ho_cases SET {side}_closed=1, {side}_closed_by=?, "
-        f"{side}_closed_at=?, handed_back=0 WHERE id=?",
-        (user_id, ts, case_id),
-    )
+    rows = data.change("ho_cases", {f"{side}_closed": True, f"{side}_closed_by": user_id,
+                                    f"{side}_closed_at": ts, "handed_back": False}, id=case_id)
     log_case(case_id, user_id, side, action)
-    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    row = rows[0] if rows else None
     if row and row["sh_closed"] and (
         row["on_closed"] or not online_covers(row["channel"])
     ):
-        run(
-            "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
-            (user_id, ts, case_id),
-        )
+        data.change("ho_cases", {"closed": True, "closed_by": user_id, "closed_at": ts}, id=case_id)
 
 
 EDIT_LABELS = {"prio": "Urgency", **{k: label for k, label, _ in CASE_FIELDS}}
 
 
-def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
+def save_case_edit(case_id: str, user_id: int, key: str, value: str) -> None:
     """Change one part of a case, rebuild its written-out body, and log it."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     old = r[key] or ""
     if old == value:
         return
-    run(f"UPDATE ho_cases SET {key}=? WHERE id=?", (value or None, case_id))
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.change("ho_cases", {key: value or None}, id=case_id)[0]
     if r["order_no"] is not None:
         d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
-        run("UPDATE ho_cases SET body=? WHERE id=?",
-            (compose_body(d, r["origin"]), case_id))
+        data.change("ho_cases", {"body": compose_body(d, r["origin"])}, id=case_id)
     side = "on" if online_view(user_id) else "sh"
     log_case(case_id, user_id, side, "edited",
              f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
 
 
-def reopen_case(case_id: int, user_id: int | None = None) -> None:
+def reopen_case(case_id: str, user_id: int | None = None) -> None:
     """Back to open on both sides."""
     clear_pick(case_id)
-    run(
-        "UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL, "
-        "sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL, "
-        "on_closed=0, on_closed_by=NULL, on_closed_at=NULL WHERE id=?",
-        (case_id,),
-    )
+    data.change("ho_cases", {f"{s}{c}": v for s in ("", "sh_", "on_")
+                             for c, v in (("closed", False), ("closed_by", None), ("closed_at", None))},
+                id=case_id)
     log_case(case_id, user_id, "on" if user_id and online_view(user_id)
              else "sh", "reopened")
 
 
-def reopen_side(case_id: int, user_id: int, side: str) -> None:
+def reopen_side(case_id: str, user_id: int, side: str) -> None:
     """Undo one side's close (a misclick in a store chat): that side is open
     again, and so is the case. The other side's close stays."""
     if side not in ("sh", "on"):
         raise ValueError(side)
-    run(f"UPDATE ho_cases SET {side}_closed=0, {side}_closed_by=NULL, {side}_closed_at=NULL, "
-        "closed=0, closed_by=NULL, closed_at=NULL WHERE id=?", (case_id,))
+    data.change("ho_cases", {f"{side}_closed": False, f"{side}_closed_by": None, f"{side}_closed_at": None,
+                             "closed": False, "closed_by": None, "closed_at": None}, id=case_id)
     if side == "on":
         clear_pick(case_id)
     log_case(case_id, user_id, side, "reopened")
 
 
-def force_close_case(case_id: int, admin_id: int) -> None:
+def force_close_case(case_id: str, admin_id: int) -> None:
     """Admins: close both sides when one side never will."""
     ts = now().isoformat()
-    run(
-        "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=?, handed_back=0, "
-        "sh_closed=1, sh_closed_by=COALESCE(sh_closed_by, ?), "
-        "sh_closed_at=COALESCE(sh_closed_at, ?), "
-        "on_closed=1, on_closed_by=COALESCE(on_closed_by, ?), "
-        "on_closed_at=COALESCE(on_closed_at, ?) WHERE id=?",
-        (admin_id, ts, admin_id, ts, admin_id, ts, case_id),
-    )
+    r = data.row("ho_cases", id=case_id) or {}
+    values = {"closed": True, "closed_by": admin_id, "closed_at": ts, "handed_back": False}
+    for s in ("sh", "on"):                 # a side already closed keeps who closed it, and when
+        values[f"{s}_closed"] = True
+        values[f"{s}_closed_by"] = r.get(f"{s}_closed_by") or admin_id
+        values[f"{s}_closed_at"] = r.get(f"{s}_closed_at") or ts
+    data.change("ho_cases", values, id=case_id)
     log_case(case_id, admin_id, "admin", "force closed")
 
 
-async def announce_handback(bot, case_id: int, user_id: int, note: str) -> None:
+async def announce_handback(bot, case_id: str, user_id: int, note: str) -> None:
     """Tell TC Online straight away that Online needs something from SH."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if r:
         await post_ops(
             bot,
@@ -2439,14 +2416,11 @@ async def announce_handback(bot, case_id: int, user_id: int, note: str) -> None:
         )
 
 
-def hand_back_case(case_id: int, user_id: int, note: str | None) -> None:
+def hand_back_case(case_id: str, user_id: int, note: str | None) -> None:
     """Online needs something from SH: open it again on SH's side, flagged.
     note=None when it reuses the note they just left (already in the log)."""
-    run(
-        "UPDATE ho_cases SET handed_back=1, closed=0, closed_by=NULL, "
-        "closed_at=NULL, sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL "
-        "WHERE id=?", (case_id,),
-    )
+    data.change("ho_cases", {"handed_back": True, "closed": False, "closed_by": None, "closed_at": None,
+                             "sh_closed": False, "sh_closed_by": None, "sh_closed_at": None}, id=case_id)
     log_case(case_id, user_id, "on", "handed back", note)
 
 
@@ -2497,7 +2471,7 @@ def case_status_line(r) -> str:
     return f"🔸 Open · due {due.strftime('%a %-d %b')}"
 
 
-def note_line(case_id: int) -> str:
+def note_line(case_id: str) -> str:
     n = latest_note(case_id)
     if not n:
         return ""
@@ -2505,9 +2479,9 @@ def note_line(case_id: int) -> str:
     return f"📝 {when} · {display_name_of(n['user_id'], '')}: {n['note']}"
 
 
-def render_channel_post(post_id: int) -> str:
-    p = q1("SELECT * FROM channel_posts WHERE id=?", (post_id,))
-    cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))
+def render_channel_post(post_id: str) -> str:
+    p = data.row("channel_posts", id=post_id)
+    cases = data.rows("ho_cases", post_id=post_id, order="created_at")
     who = display_name_of(p["agent_id"], "") if p["agent_id"] else ""
     day = date.fromisoformat(p["the_date"]).strftime("%-d %b %Y")
     heading = {"request": "📣 Online request", "case": "🆕 New case"}.get(p["kind"], "📋 Handover")
@@ -2525,14 +2499,14 @@ def render_channel_post(post_id: int) -> str:
     return "\n".join(out)
 
 
-def channel_post_keyboard(post_id: int, bot_username: str | None):
+def channel_post_keyboard(post_id: str, bot_username: str | None):
     """Two buttons per case. A new case waits on its PM: 🙋 I'll help /
     Not needed. Then ✅ Close while nobody has closed it, ↩️ Reopen once
     someone has (to undo a misclick), plus 📝 Note while it's not fully
     closed. Note opens a private chat with the bot, so nothing is typed in the
     group. The name only goes on the buttons when a message has several cases."""
     rows = []
-    cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))[:45]
+    cases = data.rows("ho_cases", post_id=post_id, order="created_at")[:45]
     for r in cases:
         who = "" if len(cases) == 1 else f" · {(r['username'] or 'case')[:20]}"
         if awaiting_pm(r):
@@ -2554,9 +2528,9 @@ async def post_new_cases_to_chats(bot, agent_id: int) -> int:
     """Send each store's chat the new cases from this handover, one message
     per chat. Returns how many messages went out."""
     by_channel: dict = {}
-    for r in q("SELECT * FROM ho_cases WHERE chat_posted=0 ORDER BY id"):
+    for r in data.rows("ho_cases", chat_posted=False, order="created_at"):
         if r["closed"] or r["sh_closed"] or not channel_chat(r["channel"]):
-            run("UPDATE ho_cases SET chat_posted=1 WHERE id=?", (r["id"],))
+            data.change("ho_cases", {"chat_posted": True}, id=r["id"])
             continue
         by_channel.setdefault(r["channel"], []).append(r)
 
@@ -2584,38 +2558,32 @@ async def send_channel_post(bot, channel: str, cases: list, agent_id: int,
         chunks[-1].append(r)
         size += n
     for chunk in chunks:
-        pid = run(
-            "INSERT INTO channel_posts (channel, chat_id, thread_id, agent_id,"
-            " the_date, created_at, kind) VALUES (?,?,?,?,?,?,?)",
-            (channel, where["chat"], where.get("thread"), agent_id,
-             now().date().isoformat(), now().isoformat(), kind),
-        ).lastrowid
+        pid = data.add("channel_posts", {
+            "channel": channel, "chat_id": where["chat"], "thread_id": where.get("thread"),
+            "agent_id": agent_id, "the_date": now().date().isoformat(), "created_at": now().isoformat(),
+            "kind": kind})["id"]
         ids = [r["id"] for r in chunk]
-        marks = ",".join("?" * len(ids))
-        run(f"UPDATE ho_cases SET post_id=?, chat_posted=1 WHERE id IN ({marks})",
-            (pid, *ids))
+        data.change("ho_cases", {"post_id": pid, "chat_posted": True}, id=ids)
         kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
         try:
             msg = await bot.send_message(
                 where["chat"], render_channel_post(pid),
                 reply_markup=channel_post_keyboard(pid, bot.username), **kw)
-            run("UPDATE channel_posts SET message_id=? WHERE id=?",
-                (msg.message_id, pid))
+            data.change("channel_posts", {"message_id": msg.message_id}, id=pid)
             sent += 1
         except Exception as e:
             # Try again with the next handover.
             log.warning("Couldn't post to the %s chat: %s", channel, e)
-            run(f"UPDATE ho_cases SET post_id=NULL, chat_posted=0 "
-                f"WHERE id IN ({marks})", tuple(ids))
-            run("DELETE FROM channel_posts WHERE id=?", (pid,))
+            data.change("ho_cases", {"post_id": None, "chat_posted": False}, id=ids)
+            data.remove("channel_posts", id=pid)
     return sent
 
 
-async def post_case_now(bot, case_id: int, agent_id: int) -> bool:
+async def post_case_now(bot, case_id: str, agent_id: int) -> bool:
     """A case just added by SH or Livechat goes to its store's chat straight
     away, so the PM sees it without waiting for the end-of-shift handover.
     No linked chat: it waits for the handover summary in TC Online."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r or not channel_chat(r["channel"]):
         return False
     sent = bool(await send_channel_post(bot, r["channel"], [r], agent_id, kind="case"))
@@ -2623,24 +2591,24 @@ async def post_case_now(bot, case_id: int, agent_id: int) -> bool:
     return sent
 
 
-async def post_request(bot, case_id: int, pm_id: int) -> bool:
+async def post_request(bot, case_id: str, pm_id: int) -> bool:
     """A new Online request goes straight to its store's chat, where SH sees
     it. No linked chat: TC Online instead, so SH always hears about it."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return False
     if channel_chat(r["channel"]):
-        run("UPDATE ho_cases SET chat_posted=0 WHERE id=?", (case_id,))
+        data.change("ho_cases", {"chat_posted": False}, id=case_id)
         if await send_channel_post(bot, r["channel"], [r], pm_id, kind="request"):
             return True
-        run("UPDATE ho_cases SET chat_posted=1 WHERE id=?", (case_id,))
+        data.change("ho_cases", {"chat_posted": True}, id=case_id)
     c = case_row_to_dict(r)
     return await post_ops(
         bot, f"📣 Online request · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n\n"
              + render_case(c) + "\n\nIt's at the top of /handover.")
 
 
-async def notify_reply(bot, case_id: int, author_id: int, note: str | None = None,
+async def notify_reply(bot, case_id: str, author_id: int, note: str | None = None,
                        closed: bool = False) -> None:
     """Livechat or SH did something on a case: tell the Online side privately.
     A note goes to every PM who looks after that channel, and to the PM waiting
@@ -2648,14 +2616,13 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
     to the waiting PM. Online's own notes and closes don't ping anyone."""
     if online_view(author_id):
         return
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return
     if r["origin"] == "on":
         waiting = r["agent_id"]
     else:
-        back = q1("SELECT user_id FROM case_log WHERE case_id=? AND action='handed back' "
-                  "ORDER BY id DESC LIMIT 1", (case_id,))
+        back = data.row("case_log", case_id=case_id, action="handed back", order="-created_at")
         waiting = back["user_id"] if back else None
     who = display_name_of(author_id, "SH")
     # Who the case is, then what was said: customer · platform · order.
@@ -2689,10 +2656,10 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
 async def notify_pms(bot, agent_id: int) -> None:
     """A DM to each platform manager whose channels have new cases: what each
     case is and what help it needs. One message per person, not per case."""
-    rows = q("SELECT * FROM ho_cases WHERE pm_notified=0 ORDER BY id")
+    rows = data.rows("ho_cases", pm_notified=False, order="created_at")
     if not rows:
         return
-    run("UPDATE ho_cases SET pm_notified=1 WHERE pm_notified=0")
+    data.change("ho_cases", {"pm_notified": True}, id=[r["id"] for r in rows])
     if setting("pm_alerts", "on") == "off":
         return
     rows = [r for r in rows if not r["closed"]]
@@ -2720,11 +2687,10 @@ async def notify_pms(bot, agent_id: int) -> None:
             log.info("Couldn't message %s about new cases: %s", pm["user_id"], e)
 
 
-async def refresh_case_post(bot, case_id: int) -> None:
+async def refresh_case_post(bot, case_id: str) -> None:
     """Edit the store chat's message so a case's line shows how it stands now."""
-    r = q1("SELECT post_id FROM ho_cases WHERE id=?", (case_id,))
-    p = q1("SELECT * FROM channel_posts WHERE id=?",
-           (r["post_id"],)) if r and r["post_id"] else None
+    r = data.row("ho_cases", id=case_id)
+    p = data.row("channel_posts", id=r["post_id"]) if r and r["post_id"] else None
     if not p or not p["message_id"]:
         return
     try:
@@ -2740,16 +2706,16 @@ async def refresh_case_post(bot, case_id: int) -> None:
         log.warning("Couldn't update the %s chat: %s", p["channel"], e)
 
 
-async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
+async def move_to_tc_online(bot, case_id: str, pm_id: int) -> None:
     """A PM said Not needed: take the case out of its store chat (delete the
     message, or just its part of a shared one). Quietly: no post to TC Online."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return
-    p = q1("SELECT * FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
-    run("UPDATE ho_cases SET post_id=NULL WHERE id=?", (case_id,))
+    p = data.row("channel_posts", id=r["post_id"]) if r["post_id"] else None
+    data.change("ho_cases", {"post_id": None}, id=case_id)
     if p and p["message_id"]:
-        rest = q1("SELECT COUNT(*) AS n FROM ho_cases WHERE post_id=?", (p["id"],))["n"]
+        rest = data.count("ho_cases", post_id=p["id"])
         try:
             if rest:
                 await bot.edit_message_text(
@@ -2767,17 +2733,6 @@ async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
                 except Exception:
                     pass
     # Nothing is posted anywhere: SH see Online's tick on the case and close it.
-
-
-# Sort cases from before channels existed into one, by their store.
-for _r in db.execute(
-    "SELECT id, platform, store FROM ho_cases WHERE channel IS NULL"
-).fetchall():
-    db.execute(
-        "UPDATE ho_cases SET channel=? WHERE id=?",
-        (channel_for(_r[1], _r[2]), _r[0]),
-    )
-db.commit()
 
 
 def render_case(c: dict) -> str:
@@ -2809,11 +2764,11 @@ def render_shift_summary(user_id: int, who: str) -> tuple:
     what's still open from before. Returns (text, closed count); the text is
     empty when they raised and closed nothing, so nothing is posted."""
     since = shift_start(user_id).isoformat()
-    raised = q("SELECT * FROM ho_cases WHERE agent_id=? AND origin='sh' AND created_at >= ?"
-               " ORDER BY id", (user_id, since))
+    raised = data.rows("ho_cases", agent_id=user_id, origin="sh", created_at=("gte", since),
+                       order="created_at")
     ids = {r["id"] for r in raised}
-    closed = [r for r in q("SELECT * FROM ho_cases WHERE sh_closed=1 AND sh_closed_by=?"
-                           " AND sh_closed_at >= ? ORDER BY sh_closed_at", (user_id, since))
+    closed = [r for r in data.rows("ho_cases", sh_closed=True, sh_closed_by=user_id,
+                                   sh_closed_at=("gte", since), order="sh_closed_at")
               if r["id"] not in ids]
     earlier = [r for r in open_cases() if r["id"] not in ids]
     if not raised and not closed:
@@ -2850,13 +2805,14 @@ Product name
 ‼️Need Help: what the next agent should pick up"""
 
 
+def add_handover(agent_id: int, the_date: date, body: str) -> None:
+    data.add("handovers", {"agent_id": agent_id, "the_date": the_date.isoformat(), "body": body,
+                           "created_at": now().isoformat()}, returning=False)
+
+
 def last_open_handover(exclude_agent: int | None = None):
     """The most recent handover that left something open."""
-    row = q1(
-        "SELECT * FROM handovers WHERE body IS NOT NULL AND body <> '' "
-        "ORDER BY created_at DESC LIMIT 1"
-    )
-    return row
+    return data.row("handovers", body=(("not.is", None), ("neq", "")), order="-created_at")
 
 
 def handover_keyboard(running=None) -> InlineKeyboardMarkup:
@@ -2889,7 +2845,7 @@ def handover_question() -> tuple:
 
 def open_cases() -> list:
     """Cases still live on SH's side, oldest first."""
-    return q("SELECT * FROM ho_cases WHERE closed=0 AND sh_closed=0 ORDER BY id")
+    return data.rows("ho_cases", closed=False, sh_closed=False, order="created_at")
 
 
 def case_row_to_dict(r) -> dict:

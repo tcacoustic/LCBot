@@ -65,6 +65,25 @@ TABLES: dict[str, tuple[str, dict[str, str], set[str]]] = {
                                     "sh_closed_by": "sh_closed_by_person_id", "on_closed_by": "on_closed_by_person_id",
                                     "post_id": "chat_post_id"},
                  {"agent_id", "closed_by", "sh_closed_by", "on_closed_by"}),
+    "case_log": ("case_events", {"user_id": "person_id"}, {"user_id"}),
+    "channel_posts": ("chat_posts", {"channel": "online_channel", "agent_id": "agent_person_id",
+                                     "the_date": "posted_on"}, {"agent_id"}),
+    "appointments": ("appointments", {"country": "country_code", "specialist_id": "specialist_person_id",
+                                      "created_by": "created_by_person_id", "proposed_by": "proposed_by_person_id",
+                                      "followup_of": "followup_of_id"},
+                     {"specialist_id", "created_by", "proposed_by"}),
+    "appointment_log": ("appointment_events", {"appt_id": "appointment_id", "user_id": "person_id"}, {"user_id"}),
+    "specialist_blocks": ("specialist_blocks", {"user_id": "person_id"}, {"user_id"}),
+    "onsite_requests": ("onsite_requests", {"appt_id": "appointment_id", "country": "country_code",
+                                            "created_by": "created_by_person_id", "taken_by": "taken_by_person_id",
+                                            "done_by": "done_by_person_id", "msg_id": "message_id"},
+                        {"created_by", "taken_by", "done_by"}),
+    "cab_claims": ("cab_claims", {"appt_id": "appointment_id", "user_id": "person_id", "receipt": "receipt_file_id",
+                                  "decided_by": "decided_by_person_id"}, {"user_id", "decided_by"}),
+    "special_requests": ("special_requests", {"delivery_date": "delivery_on", "created_by": "created_by_person_id",
+                                              "taken_by": "taken_by_person_id", "handled_by": "handled_by_person_id",
+                                              "ops_msg_id": "ops_message_id"},
+                         {"created_by", "taken_by", "handled_by"}),
 }
 # Columns that were 0/1 integers in SQLite and are booleans now.
 SMALL_TABLES = {"pay_rates", "fixed_slots", "presets"}   # read whole and kept until written
@@ -211,8 +230,35 @@ class _Tables:
             parts.append(cols.get(c, c) + (".desc" if desc else ""))
         return {"order": ",".join(parts)}
 
-    def rows(self, table: str, *, order: str | None = None, limit: int | None = None, **filters) -> list[dict]:
+    def _either(self, table, alts: list[dict]) -> str:
+        """Filter dicts, each ANDed within, joined by OR: the inside of a PostgREST or=(...)."""
+        items = []
+        for alt in alts:
+            conds = []
+            for k, v in self._filters(table, alt).items():
+                conds += v[1:-1].split(",") if k == "and" else [f"{k}.{v}"]
+            items.append(conds[0] if len(conds) == 1 else "and(" + ",".join(conds) + ")")
+        return ",".join(items)
+
+    def rows(self, table: str, *, order: str | None = None, limit: int | None = None,
+             either: list[dict] | None = None, **filters) -> list[dict]:
+        """Rows matching every filter; with either=[{...}, {...}], also matching one of those."""
         params = {**self._filters(table, filters), **self._order(table, order)}
+        if either:
+            params["or"] = "(" + self._either(table, either) + ")"
+        if limit:
+            params["limit"] = str(limit)
+        return self._back(table, self.db.select(self._spec(table)[0], **params))
+
+    def search(self, table: str, words: list[str], fields, *, order: str | None = None,
+               limit: int | None = None) -> list[dict]:
+        """Rows where every word turns up, case blind, in at least one of the fields."""
+        def pattern(w):
+            w = w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            w = f"*{w}*".replace("\\", "\\\\").replace('"', '\\"')
+            return f'"{w}"'
+        groups = ["or(" + self._either(table, [{f: ("ilike", pattern(w))} for f in fields]) + ")" for w in words]
+        params = {"and": "(" + ",".join(groups) + ")", **self._order(table, order)}
         if limit:
             params["limit"] = str(limit)
         return self._back(table, self.db.select(self._spec(table)[0], **params))
