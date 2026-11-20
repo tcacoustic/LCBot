@@ -31,8 +31,10 @@ def _urllib_http(method: str, url: str, headers: dict, body: str | None) -> tupl
 
 
 class RestClient:
-    def __init__(self, supabase_url: str, publishable_key: str, tokens, *, schema: str, http=_urllib_http):
-        self._base = supabase_url.rstrip("/") + "/rest/v1/"
+    def __init__(self, supabase_url: str, publishable_key: str, tokens, *, schema: str, http=_urllib_http,
+                 rest_path: str = "/rest/v1/"):
+        # rest_path is "/" only for a bare local PostgREST in tests; Supabase serves it under /rest/v1/.
+        self._base = supabase_url.rstrip("/") + rest_path
         self._key, self._tokens, self.schema, self._http = publishable_key, tokens, schema, http
 
     def _call(self, method: str, path: str, params: dict, body=None, *, schema: str | None = None,
