@@ -817,6 +817,9 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         if not ok:
             return {"ok": False, "error": err}
         on_bot_loop(notify_booked_fyi(bot_ref(), num("id")))
+        v = q1("SELECT followup_of FROM appointments WHERE id=?", (num("id"),))
+        if v and v["followup_of"]:
+            on_bot_loop(pin_next_visit(bot_ref(), num("id")))
         return {"ok": True}
     if path == "/api/visit/reschedule":
         if role != "booker":

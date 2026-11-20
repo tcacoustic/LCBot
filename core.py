@@ -565,6 +565,11 @@ if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
 if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
     db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
+# Follow-up visits: the visit it follows on from, and how urgent it is.
+_ap_cols = {r[1] for r in db.execute("PRAGMA table_info(appointments)")}
+for _col in ("urgency TEXT", "followup_of INTEGER"):
+    if _col.split()[0] not in _ap_cols:
+        db.execute(f"ALTER TABLE appointments ADD COLUMN {_col}")
 # Who did what to a case, and any note they left.
 # Special requests to Ops (ops.py): one row each, mirrored to the Ops sheet.
 db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
@@ -3647,6 +3652,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:15px; font-weight:800; cursor:pointer; }
   .case .tick.on { background:var(--ink); border-color:var(--ink); color:#fff; }
   .case .nm { font-weight:800; font-size:16px; }
+  .case.fu { border-color:var(--red); box-shadow:inset 6px 0 0 var(--red); padding-left:18px; }
   .case .meta { font-size:12px; color:var(--muted); margin-top:2px; }
   .case .body { font-size:14px; white-space:pre-wrap; margin-top:10px; padding-top:10px;
     border-top:1px solid #E2E0DA; color:var(--ink); }
@@ -4630,8 +4636,9 @@ function openLink(u) { if (tg && tg.openLink) tg.openLink(u); else window.open(u
 
 function visitCard(it, d) {
   const done = it.status === 'COMPLETED';
-  let h = '<div class="case' + (done ? ' gone' : '') + '">';
-  h += '<div class="nm">' + esc(it.start) + ' · ' + esc(it.type) + '</div>';
+  let h = '<div class="case' + (done ? ' gone' : '') + (it.followup && !done ? ' fu' : '') + '">';
+  h += '<div class="nm">' + esc(it.start) + ' · ' + esc(it.type)
+     + (it.followup && !done ? ' <span class="tag red">FOLLOW-UP · ' + esc(it.followup.toUpperCase()) + '</span>' : '') + '</div>';
   h += '<div class="meta">' + esc(it.customer) + (it.postal ? ' · ' + esc(it.postal) : '')
      + (d.role === 'booker' ? ' · ' + esc(it.specialist) : '') + '</div>';
   if (it.status === 'ONSITE') h += '<div class="st">On-Site now</div>';
@@ -4702,6 +4709,24 @@ function keepBookForm() {
     const el = document.getElementById('bf_' + k);
     if (el) VS.form[k] = el.value;
   }
+}
+
+function followupCard(it) {
+  let h = '<div class="case fu"><div class="nm" style="display:flex;justify-content:space-between;gap:8px">'
+    + '<span>📌 ' + (REGION_FLAGS[it.country] || '') + ' ' + esc(it.customer) + ' · ' + esc(it.type) + '</span>'
+    + '<span class="tag red" style="align-self:flex-start">FOLLOW-UP · ' + esc(it.urgency.toUpperCase()) + '</span></div>';
+  h += '<div class="meta">' + [it.when, it.postal, it.specialist].filter(Boolean).map(esc).join(' · ') + '</div>';
+  let b = '';
+  if (it.why) b += 'Last time: ' + esc(it.why) + '<br>';
+  if (it.product) b += 'Product: ' + esc(it.product) + '<br>';
+  if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+  if (it.address) b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '');
+  if (b) h += '<div class="body" style="white-space:normal">' + b + '</div>';
+  if (it.map) h += '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div>';
+  if (it.canSet) h += '<div class="fld" style="margin-top:8px"><label>Date and time agreed with the customer</label>'
+     + '<input type="date" id="st_d_' + it.id + '"><input type="time" id="st_t_' + it.id + '" style="margin-top:6px"></div>'
+     + '<div class="acts"><button data-settime="' + it.id + '">Book it</button></div>';
+  return h + '</div>';
 }
 
 function openCard(it) {
@@ -4848,6 +4873,7 @@ async function loadVisits() {
   } else {
     h += '<button class="big ghost" id="addOwn" style="margin:6px 0 4px">+ Add appointment</button>';
   }
+  if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
   const waiting = d.open.filter(x => x.status === 'waiting'), arranging = d.open.filter(x => x.status === 'arranging');
   if (waiting.length) h += '<h2>Waiting for a specialist</h2>' + waiting.map(x => openCard(x)).join('');
   if (arranging.length) h += '<h2>Arranging with the customer</h2>' + arranging.map(x => openCard(x)).join('');

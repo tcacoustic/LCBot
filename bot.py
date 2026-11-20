@@ -745,6 +745,17 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(
         on_visit_button, pattern=r"^vz:(lst|v|ar|lv|oc|ok|nc|pm|fd)(:|$)"))
+    # On-Site typed steps: a note on a visit that didn't finish (and later more).
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:\d+$")],
+            states={ONS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ons_text)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(on_nf_button, pattern=r"^vn:[rudtlbk]:\d+(:\w+)?$"))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))
