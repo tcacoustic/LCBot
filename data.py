@@ -410,6 +410,8 @@ class Data(_Tables):
 
     def agent(self, tg: int) -> dict | None:
         """Someone by Telegram id: a member, else their latest /start request, else None."""
+        if not isinstance(tg, int) or isinstance(tg, bool):   # nobody (a row's empty person column)
+            return None
         row = self._roster().get(tg)
         if row:
             return dict(row)
