@@ -975,10 +975,9 @@ FEEDBACK_KINDS = {"PROBLEM": "🐞 Problem", "IDEA": "💡 Idea", "QUESTION": "�
 
 
 def feedback_head(user_id: int, kind: str = "", where: str = "") -> str:
-    handle = ""
     teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id)]
     bits = [b for b in (FEEDBACK_KINDS.get(kind, ""), f"from the App: {where}" if where else "") if b]
-    return (f"💬 <b>Feedback from {esc(display_name_of(user_id, 'someone'))}</b>{esc(handle)}"
+    return (f"💬 <b>Feedback from {esc(display_name_of(user_id, 'someone'))}</b>"
             f"{' · ' + esc(' + '.join(teams)) if teams else ''}"
             + (f"\n{esc(' · '.join(bits))}" if bits else ""))
 

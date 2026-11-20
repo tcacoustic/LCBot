@@ -29,7 +29,7 @@ def load():
         "BOT_TOKEN": "1:test", "GROUP_CHAT_ID": "-100", "DB_SCHEMA": "lc_bot_dev",
         "SUPABASE_URL": "http://unused.invalid", "SUPABASE_PUBLISHABLE_KEY": "unused",
         "SERVICE_TOKEN_VOLUME_PATH": os.path.join(tmp, "token.json"), "SERVICE_TOKEN_SEED": "unused",
-        "DB_PATH": os.path.join(tmp, "avails.db"), "ADMIN_IDS": "990000099",
+        "ADMIN_IDS": "990000099",
     })
     core = importlib.import_module("core")
     core.data.db = client()          # the same object every module star-imported

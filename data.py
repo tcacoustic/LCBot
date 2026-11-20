@@ -27,6 +27,9 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+NOTHING = "in.()"   # a filter no row matches
+
+
 def _in(values) -> str:
     return "in.(" + ",".join(str(v) for v in values) + ")"
 
@@ -35,7 +38,6 @@ def _in(values) -> str:
 # Feature code reads and writes the bot's own tables under their SQLite names and columns. Each entry:
 # new table name, {old column: new column}, and which old columns hold a person (a Telegram id in the
 # old shape, a person_id in the database).
-P = "person"
 TABLES: dict[str, tuple[str, dict[str, str], set[str]]] = {
     "weeks": ("weeks", {"start_date": "starts_on", "end_date": "ends_on", "deadline": "deadline_at",
                         "header_msg_id": "header_message_id"}, set()),
@@ -86,9 +88,9 @@ TABLES: dict[str, tuple[str, dict[str, str], set[str]]] = {
                                               "ops_msg_id": "ops_message_id"},
                          {"created_by", "taken_by", "handled_by"}),
 }
-# Columns that were 0/1 integers in SQLite and are booleans now.
 SMALL_TABLES = {"pay_rates", "fixed_slots", "presets"}   # read whole and kept until written
 BOARD_TABLES = {"weeks", "days", "slots", "signups", "confirmations"}
+# Columns that were 0/1 integers in SQLite and are booleans now.
 BOOLEANS = {"closed", "sh_closed", "on_closed", "chat_posted", "handed_back", "pm_notified", "opening_posted",
             "followup_done", "after_cutoff", "urgent", "sheet_dirty"}
 # jsonb columns the old code kept as JSON text: given and taken as text, so json.loads still works.
@@ -118,13 +120,18 @@ class _Tables:
             op, val = v
             if op.endswith("is"):
                 return name, f"{op}.null" if val is None else f"{op}.{str(val).lower()}"
-            return name, f"{op}.{self._out_value(table, col, val)}"
+            out = self._out_value(table, col, val)
+            if out is None and col in people:
+                return name, NOTHING
+            return name, f"{op}.{out}"
         if isinstance(v, (list, set, frozenset)):
-            vals = [self._out_value(table, col, x) for x in v]
+            vals = [x for x in (self._out_value(table, col, x) for x in v) if x is not None]
             return name, "in.(" + ",".join(f'"{x}"' for x in vals) + ")"
         if v is None:
             return name, "is.null"
         val = self._out_value(table, col, v)
+        if val is None and col in people:      # nobody on identity with that Telegram id: no rows
+            return name, NOTHING
         if isinstance(val, bool):
             return name, f"is.{str(val).lower()}"
         return name, f"eq.{val}"
@@ -206,7 +213,7 @@ class _Tables:
 
     def slot_info(self, slot_id) -> dict | None:
         """A slot with its day's date and name and its week: through the board, so cheap when it's loaded."""
-        for b in self._boards.values():
+        for b in list(self._boards.values()):      # the Mini App's threads may clear it meanwhile
             if slot_id in b["slot"]:
                 return b["slot"][slot_id]
         s = self.row("slots", id=slot_id)
@@ -549,4 +556,5 @@ class Data(_Tables):
             return 0
         freed = self.db.delete("signups", person_id=f"eq.{pid}", slot_id=_in(slots)) if slots else []
         self.db.delete("confirmations", person_id=f"eq.{pid}", week_id=f"eq.{week_id}")
+        self._boards.clear()
         return len(freed)

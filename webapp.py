@@ -1594,15 +1594,15 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                     teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(uid)]
                     self._send(200, json.dumps({"comingSoon": True, "teams": teams}).encode())
                     return
-                data = home_payload(uid)
-                data["slotsToday"] = todays_slots(uid)
-                data["isAdmin"] = is_admin(uid)
-                data["tabs"] = app_tabs(uid)
+                home = home_payload(uid)
+                home["slotsToday"] = todays_slots(uid)
+                home["isAdmin"] = is_admin(uid)
+                home["tabs"] = app_tabs(uid)
                 teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(uid)]
-                data["teams"] = teams if len(teams) > 1 else []
-                data["booked"] = my_bookings(uid) if visit_role(uid) == "booker" else []
-                data["canRequest"] = may_request(uid)
-                self._send(200, json.dumps(data).encode())
+                home["teams"] = teams if len(teams) > 1 else []
+                home["booked"] = my_bookings(uid) if visit_role(uid) == "booker" else []
+                home["canRequest"] = may_request(uid)
+                self._send(200, json.dumps(home).encode())
             except Exception as e:
                 log.warning("Home view failed: %s", e)
                 try:

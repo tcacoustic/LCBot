@@ -98,3 +98,14 @@ class TimeclockFlowTest(BoardFlowTest):
         self.assertEqual(len(t["shifts"]), 1)
         self.assertEqual(t["shifts"][0]["minutes"], 120)
         self.assertFalse(core.data.row("time_entries", clock_out=None))
+
+    def test_freeing_a_week_shows_on_the_cached_board(self):
+        core.give_slot(self.slots[0]["id"], 990000001)
+        self.assertEqual(len(core.slot_holders(self.slots[0]["id"])), 1)     # board now cached
+        self.data.free_week(990000001, self.week)
+        self.assertEqual(core.slot_holders(self.slots[0]["id"]), [])
+
+    def test_someone_not_on_identity_has_no_rows_rather_than_an_error(self):
+        self.assertEqual(self.data.rows("time_entries", agent_id=990000077), [])
+        self.assertEqual(self.data.rows("time_entries", agent_id=[990000077]), [])
+        self.assertIsNone(self.data.row("signups", user_id=990000077, slot_id=self.slots[0]["id"]))
