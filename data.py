@@ -8,6 +8,9 @@ person is a `join_requests` row.
 from __future__ import annotations
 
 import datetime
+import time
+
+ROSTER_TTL_S = 60
 
 # old agents column -> members column, for flags feature code reads and writes
 _MEMBER_FIELDS = {
@@ -27,9 +30,11 @@ def _in(values) -> str:
 
 
 class Data:
-    def __init__(self, rest):
-        self.db = rest
+    def __init__(self, rest, *, clock=time.monotonic):
+        self.db, self._clock = rest, clock
         self._pid: dict[int, str] = {}   # telegram id -> person id; neither changes once set
+        self._cache: tuple[float, dict] | None = None
+        self._settings: tuple[float, dict] | None = None
 
     # ------------------------------------------------------------------ identity
     def _people(self, **filters) -> list[dict]:
@@ -72,12 +77,29 @@ class Data:
             "telegram_name": r["telegram_name"],
         }
 
-    def _members(self, people: list[dict], **filters) -> list[dict]:
-        if not people:
-            return []
-        by_id = {p["id"]: p for p in people}
-        ms = self.db.select("members", person_id=_in(by_id), **filters)
-        return [self._member_row(m, by_id[m["person_id"]]) for m in ms]
+    def _roster(self) -> dict[int, dict]:
+        """Every member, keyed by Telegram id, with their teams. Kept for ROSTER_TTL_S, and dropped
+        on any write through this module, so a change made elsewhere (a new nickname, a revoked
+        person) shows within the TTL."""
+        if self._cache and self._cache[0] > self._clock():
+            return self._cache[1]
+        ms = self.db.select("members")
+        people = {p["id"]: p for p in self._people(id=_in(m["person_id"] for m in ms))} if ms else {}
+        teams: dict[str, set] = {}
+        for t in self.db.select("team_members", select="person_id,team"):
+            teams.setdefault(t["person_id"], set()).add(t["team"])
+        roster = {}
+        for m in ms:
+            p = people.get(m["person_id"])
+            if p and p["telegram_id"] is not None:
+                row = self._member_row(m, p)
+                row["teams"] = teams.get(m["person_id"], set())
+                roster[p["telegram_id"]] = row
+        self._cache = (self._clock() + ROSTER_TTL_S, roster)
+        return roster
+
+    def _changed(self) -> None:
+        self._cache = None
 
     def _latest_request(self, tg: int) -> dict | None:
         rows = self.db.select("join_requests", telegram_id=f"eq.{tg}", order="requested_at.desc", limit="1")
@@ -85,40 +107,23 @@ class Data:
 
     def agent(self, tg: int) -> dict | None:
         """Someone by Telegram id: a member, else their latest /start request, else None."""
-        people = self._people(telegram_id=f"eq.{tg}")
-        rows = self._members(people)
-        if rows:
-            return rows[0]
+        row = self._roster().get(tg)
+        if row:
+            return dict(row)
         r = self._latest_request(tg)
         return self._request_row(r) if r else None
 
     def agents(self, *, status: str | None = None, team: str | None = None, **flags) -> list[dict]:
         """Members (or, for pending/declined, requests) sorted by shown name. Flags use the old names."""
+        roster = self._roster()
         if status in ("pending", "declined"):
             rows = [self._request_row(r) for r in
                     self.db.select("join_requests", status=f"eq.{status}", order="requested_at")]
-            if status == "declined":   # someone declined once and later let in is a member, not declined
-                members = {m["user_id"] for m in self.agents()}
-                rows = [r for r in rows if r["user_id"] not in members]
-            return rows
-        filters = {_MEMBER_FIELDS[k]: f"is.{str(v).lower()}" if isinstance(v, bool) else f"eq.{v}"
-                   for k, v in flags.items()}
-        if status and status != "revoked":
-            filters["status"] = f"eq.{status}"
-        if team:
-            ids = [t["person_id"] for t in self.db.select("team_members", select="person_id", team=f"eq.{team}")]
-            if not ids:
-                return []
-            filters["person_id"] = _in(ids)
-        ms = self.db.select("members", **filters)
-        if not ms:
-            return []
-        people = {p["id"]: p for p in self._people(id=_in(m["person_id"] for m in ms))}
-        rows = [self._member_row(m, people[m["person_id"]]) for m in ms]
-        if status == "active":
-            rows = [r for r in rows if r["status"] == "active"]
-        elif status == "revoked":
-            rows = [r for r in rows if r["status"] == "revoked"]
+            # someone declined once and later let in is a member, not declined
+            return [r for r in rows if r["user_id"] not in roster] if status == "declined" else rows
+        rows = [dict(r) for r in roster.values()
+                if (status is None or r["status"] == status) and (team is None or team in r["teams"])
+                and all(r[k] == v for k, v in flags.items())]
         return sorted(rows, key=lambda r: (r["name"].lower(), r["user_id"]))
 
     def find(self, text: str) -> dict | None:
@@ -166,17 +171,17 @@ class Data:
     # ------------------------------------------------------------------ members and teams
     def add_member(self, person_id: str, **fields) -> None:
         self.db.insert("members", {"person_id": person_id, **fields}, on_conflict="person_id")
+        self._changed()
 
     def set_agent(self, tg: int, **fields) -> None:
         pid = self.person_id(tg)
         if pid:
             self.db.update("members", {_MEMBER_FIELDS[k]: v for k, v in fields.items()}, person_id=f"eq.{pid}")
+            self._changed()
 
     def teams(self, tg: int) -> set[str]:
-        pid = self.person_id(tg)
-        if not pid:
-            return set()
-        return {t["team"] for t in self.db.select("team_members", select="team", person_id=f"eq.{pid}")}
+        row = self._roster().get(tg)
+        return set(row["teams"]) if row else set()
 
     def set_teams(self, tg: int, teams) -> None:
         pid = self.person_id(tg)
@@ -185,3 +190,25 @@ class Data:
         self.db.delete("team_members", person_id=f"eq.{pid}")
         if teams:
             self.db.insert("team_members", [{"person_id": pid, "team": t} for t in teams])
+        self._changed()
+
+    # ------------------------------------------------------------------ settings
+    def _all_settings(self) -> dict[str, str]:
+        if not (self._settings and self._settings[0] > self._clock()):
+            rows = self.db.select("settings", select="key,value")
+            self._settings = (self._clock() + ROSTER_TTL_S, {r["key"]: r["value"] for r in rows})
+        return self._settings[1]
+
+    def setting(self, key: str, default: str = "") -> str:
+        return self._all_settings().get(key) or default
+
+    def settings_like(self, prefix: str) -> dict[str, str]:
+        return {k: v for k, v in self._all_settings().items() if k.startswith(prefix)}
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.db.insert("settings", {"key": key, "value": value}, on_conflict="key")
+        self._settings = None
+
+    def del_setting(self, key: str) -> None:
+        self.db.delete("settings", key=f"eq.{key}")
+        self._settings = None

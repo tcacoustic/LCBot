@@ -25,6 +25,10 @@ import os
 import re
 import sqlite3
 import threading
+
+from data import Data
+from rest import RestClient
+from service_token import service_token_from_env
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 from dataclasses import dataclass
@@ -64,6 +68,12 @@ from telegram.ext import (
 # --------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+
+# The warehouse's Data API, as the bot's own role. DB_SCHEMA has no default on purpose:
+# LCBot Test sets lc_bot_dev and production sets lc_bot, so neither can reach the other's data.
+DB_SCHEMA = os.environ["DB_SCHEMA"].strip()
+data = Data(RestClient(os.environ["SUPABASE_URL"].strip(), os.environ["SUPABASE_PUBLISHABLE_KEY"].strip(),
+                       service_token_from_env(), schema=DB_SCHEMA))
 
 
 DAY_ALIASES = {
@@ -916,16 +926,14 @@ def is_admin(user_id: int) -> bool:
         return not viewing_as(user_id)     # admin powers pause while viewing as a team
     if not ADMIN_IDS:
         return True          # nothing configured yet — open until an owner is set
-    row = q1(
-        "SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,)
-    )
-    return bool(row and row["role"] == "admin")
+    row = data.agent(user_id)
+    return bool(row and row["active"] and row["role"] == "admin")
 
 
 def is_salaried(agent_id: int) -> bool:
     """Full-timers on a salary — rostered and clocked like anyone else, but
     their livechat hours don't accrue hourly pay."""
-    row = q1("SELECT salaried FROM agents WHERE user_id=?", (agent_id,))
+    row = data.agent(agent_id)
     return bool(row and row["salaried"])
 
 
@@ -1099,21 +1107,16 @@ def hhmm(minutes: int) -> str:
 
 
 def setting(key: str, default: str = "") -> str:
-    row = q1("SELECT value FROM settings WHERE key=?", (key,))
-    return row["value"] if row and row["value"] else default
+    return data.setting(key, default)
 
 
 def set_setting(key: str, value: str) -> None:
-    run(
-        "INSERT INTO settings (key, value) VALUES (?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
+    data.set_setting(key, value)
 
 
 def support_for(user_id: int, fallback: str = "") -> str:
     """Who to list as Support: their own override, else the team default."""
-    row = q1("SELECT support_name FROM agents WHERE user_id=?", (user_id,))
+    row = data.agent(user_id)
     if row and row["support_name"]:
         return row["support_name"]
     return setting("support_name", "") or fallback
@@ -1154,21 +1157,15 @@ def opening_block(user_id: int, name: str, slot_label: str) -> str:
 
 def display_name_of(user_id: int, fallback: str = "") -> str:
     """The roster name if one is set, otherwise whatever Telegram says."""
-    row = q1(
-        "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
-    )
-    if row and row["display_name"]:
-        return row["display_name"]
-    if row and row["name"]:
-        return row["name"]
-    return fallback
+    row = data.agent(user_id)
+    return row["name"] if row and row["name"] else fallback
 
 
 def agent_status(user_id: int) -> str | None:
-    """'active', 'pending', 'declined', or None if never seen."""
+    """'active', 'pending', 'declined', 'revoked' (off the people record), or None if never seen."""
     if is_owner(user_id):
         return "active"
-    row = q1("SELECT status FROM agents WHERE user_id=?", (user_id,))
+    row = data.agent(user_id)
     return row["status"] if row else None
 
 
@@ -1179,12 +1176,7 @@ def has_access(user_id: int) -> bool:
 def admin_ids() -> list:
     """Everyone who should see access requests."""
     ids = set(ADMIN_IDS)
-    ids |= {
-        r["user_id"]
-        for r in q(
-            "SELECT user_id FROM agents WHERE role='admin' AND status='active'"
-        )
-    }
+    ids |= {r["user_id"] for r in data.agents(status="active", role="admin")}
     return sorted(ids)
 
 
@@ -1210,22 +1202,15 @@ def depts_of(user_id: int) -> set:
     view = viewing_as(user_id)
     if view:
         return {view}
-    return {r["dept"] for r in q("SELECT dept FROM memberships WHERE user_id=?",
-                                 (user_id,))}
+    return data.teams(user_id)
 
 
 def set_depts(user_id: int, depts) -> None:
     """Replace someone's departments. Off Livechat = off avails and shift calls."""
-    run("DELETE FROM memberships WHERE user_id=?", (user_id,))
-    for d in depts:
-        run("INSERT INTO memberships (user_id, dept, created_at) VALUES (?,?,?)",
-            (user_id, d, now().isoformat()))
+    depts = list(depts)
+    data.set_teams(user_id, depts)
     if "LIVECHAT" not in depts:
-        run("UPDATE agents SET on_avails=0, tag_calls=0 WHERE user_id=?", (user_id,))
-    # Keep the old role label in step, so the previous version still works
-    # if this one is ever rolled back. Admins keep 'admin'.
-    run("UPDATE agents SET role=? WHERE user_id=? AND role<>'admin'",
-        ("online" if set(depts) == {"ON"} else "agent", user_id))
+        data.set_agent(user_id, on_avails=False, tag_calls=False)
 
 
 def is_online(user_id: int) -> bool:
@@ -1275,15 +1260,15 @@ def online_view(user_id: int) -> bool:
 
 
 def online_channels(user_id: int) -> list:
-    row = q1("SELECT channels FROM agents WHERE user_id=?", (user_id,))
-    return json.loads(row["channels"]) if row and row["channels"] else []
+    row = data.agent(user_id)
+    return list(row["channels"] or []) if row else []
 
 
 def role_of(user_id: int) -> str:
     if is_owner(user_id):
         return "owner"
-    row = q1("SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,))
-    return row["role"] if row else "agent"
+    row = data.agent(user_id)
+    return row["role"] if row and row["active"] else "agent"
 
 
 def open_week() -> sqlite3.Row | None:
@@ -1336,18 +1321,12 @@ def latest_week() -> sqlite3.Row | None:
 
 
 def touch_agent(user, dm_ok: int | None = None) -> None:
-    existing = q1("SELECT * FROM agents WHERE user_id=?", (user.id,))
-    if existing:
-        run(
-            "UPDATE agents SET name=?, username=?, dm_ok=COALESCE(?, dm_ok) "
-            "WHERE user_id=?",
-            (user.full_name, user.username, dm_ok, user.id),
-        )
-    else:
-        run(
-            "INSERT INTO agents (user_id, name, username, dm_ok) VALUES (?,?,?,?)",
-            (user.id, user.full_name, user.username, dm_ok or 0),
-        )
+    """Note that a member has opened a DM with the bot. Names come from the people record now,
+    so nothing else is kept, and nobody becomes a member by talking to the bot."""
+    if dm_ok:
+        row = data.agent(user.id)
+        if row and "teams" in row and not row["dm_ok"]:
+            data.set_agent(user.id, dm_ok=True)
 
 
 # --------------------------------------------------------------------------

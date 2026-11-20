@@ -101,3 +101,27 @@ class PeopleTest(LiveTestCase):
         self.assertEqual(self.data.find("TAN JIA EN")["user_id"], 990000001)
         self.assertEqual(self.data.find("990000001")["user_id"], 990000001)
         self.assertIsNone(self.data.find("nobody"))
+
+    def test_the_roster_is_cached_and_a_write_through_the_module_refreshes_it(self):
+        self.data.add_member(self.person(990000001, "A Person"))
+        self.assertTrue(self.data.agent(990000001)["tag_calls"])
+        sql("update lc_bot_dev.members set tagged_in_calls = false")          # a change made elsewhere
+        self.assertTrue(self.data.agent(990000001)["tag_calls"])             # not seen until the TTL
+        self.data.set_agent(990000001, salaried=True)
+        self.assertFalse(self.data.agent(990000001)["tag_calls"])            # a write here reloads
+
+
+class SettingsTest(LiveTestCase):
+    def setUp(self):
+        super().setUp()
+        self.data = Data(self.db)
+
+    def test_set_read_overwrite_and_delete(self):
+        self.assertEqual(self.data.setting("view_as:1", "none"), "none")
+        self.data.set_setting("view_as:1", "ON")
+        self.data.set_setting("view_as:1", "SH")
+        self.data.set_setting("case_pick:a", "skip:1")
+        self.assertEqual(self.data.setting("view_as:1"), "SH")
+        self.assertEqual(self.data.settings_like("case_pick:"), {"case_pick:a": "skip:1"})
+        self.data.del_setting("view_as:1")
+        self.assertEqual(self.data.setting("view_as:1"), "")
