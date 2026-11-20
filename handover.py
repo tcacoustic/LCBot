@@ -1322,7 +1322,7 @@ async def job_case_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     first, last = week_bounds(now().date() - timedelta(days=7))
     sent = set()
     for pm in online_team():
-        mine = json.loads(pm["channels"] or "[]")
+        mine = (pm["channels"] or [])
         if mine and pm["user_id"] not in sent:
             try:
                 await context.bot.send_message(pm["user_id"], case_report(mine, first, last),

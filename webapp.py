@@ -29,75 +29,64 @@ async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+def uuid_of(raw) -> str:
+    """A row id sent by the App: a whole uuid, else '' (nothing to act on)."""
+    raw = str(raw or "").strip().lower()
+    return raw if re.fullmatch(r"[0-9a-f-]{36}", raw) else ""
+
+
 def miniapp_payload(user_id: int) -> dict:
-    """Own connection — this runs on the web thread, not the bot's."""
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
-        agent = conn.execute(
-            "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
-        ).fetchone()
-        name = (agent["name"] or "You") if agent else "You"
+    name = display_name_of(user_id, "You")
 
-        today = now().date()
-        first = today.replace(day=1)
-        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    today = now().date()
+    first = today.replace(day=1)
+    last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+    rates = data.all_rows("pay_rates")
 
-        def rate_on(d: date) -> int:
-            row = conn.execute(
-                "SELECT cents FROM pay_rates WHERE agent_id=? AND effective_from<=? "
-                "ORDER BY effective_from DESC, id DESC LIMIT 1",
-                (user_id, d.isoformat()),
-            ).fetchone()
-            if row:
-                return row["cents"]
-            row = conn.execute(
-                "SELECT cents FROM pay_rates WHERE agent_id IS NULL AND effective_from<=? "
-                "ORDER BY effective_from DESC, id DESC LIMIT 1",
-                (d.isoformat(),),
-            ).fetchone()
-            return row["cents"] if row else DEFAULT_RATE_CENTS
+    def rate_on(d: date) -> int:
+        day = d.isoformat()
+        for who in (user_id, None):      # their own rate, else the team's
+            mine = [r for r in rates if r["agent_id"] == who and r["effective_from"] <= day]
+            if mine:
+                return max(mine, key=lambda r: (r["effective_from"], r["created_at"]))["cents"]
+        return DEFAULT_RATE_CENTS
 
-        rows = conn.execute(
-            "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
-            "ORDER BY the_date, clock_in",
-            (user_id, first.isoformat(), last.isoformat()),
-        ).fetchall()
+    rows = data.rows("time_entries", agent_id=user_id,
+                     the_date=(("gte", first.isoformat()), ("lte", last.isoformat())),
+                     order="the_date,clock_in")
 
-        shifts, total_min, total_cents, open_count = [], 0, 0, 0
-        seen_days = set()
-        credited = set()
-        for r in rows:
-            if not r["clock_out"]:
-                open_count += 1
-                continue
-            a = datetime.fromisoformat(r["clock_in"])
-            b = datetime.fromisoformat(r["clock_out"])
-            b_min, ot_min = entry_split(r)
-            mins = b_min + ot_min
-            if PAY_MODE == "slot" and r["slot_id"]:
-                key = (r["the_date"], r["slot_id"])
-                if key in credited:
-                    continue          # same block, already counted
-                credited.add(key)
-            day = date.fromisoformat(r["the_date"])
-            cents = round(mins / 60 * rate_on(day)) if mins else 0
-            total_min += mins
-            total_cents += cents
-            seen_days.add(day)
-            shifts.append({
-                "id": r["id"],                      # what /fixtime needs
-                "date": day.strftime("%a %-d %b"),
-                "times": f"{a.strftime('%H:%M')}\u2013{b.strftime('%H:%M')}",
-                "hours": hhmm(mins),
-                "ot": hhmm(ot_min) if ot_min else "",
-                "pay": money(cents) if cents else "",
-                "flagged": r["status"] == "auto",
-                "edited": r["status"] == "edited",
-            })
-        rate = rate_on(today)
-    finally:
-        conn.close()
+    shifts, total_min, total_cents, open_count = [], 0, 0, 0
+    seen_days = set()
+    credited = set()
+    for r in rows:
+        if not r["clock_out"]:
+            open_count += 1
+            continue
+        a = datetime.fromisoformat(r["clock_in"])
+        b = datetime.fromisoformat(r["clock_out"])
+        b_min, ot_min = entry_split(r)
+        mins = b_min + ot_min
+        if PAY_MODE == "slot" and r["slot_id"]:
+            key = (r["the_date"], r["slot_id"])
+            if key in credited:
+                continue          # same block, already counted
+            credited.add(key)
+        day = date.fromisoformat(r["the_date"])
+        cents = round(mins / 60 * rate_on(day)) if mins else 0
+        total_min += mins
+        total_cents += cents
+        seen_days.add(day)
+        shifts.append({
+            "id": ref(r["id"]),                 # what /fixtime needs
+            "date": day.strftime("%a %-d %b"),
+            "times": f"{a.strftime('%H:%M')}\u2013{b.strftime('%H:%M')}",
+            "hours": hhmm(mins),
+            "ot": hhmm(ot_min) if ot_min else "",
+            "pay": money(cents) if cents else "",
+            "flagged": r["status"] == "auto",
+            "edited": r["status"] == "edited",
+        })
+    rate = rate_on(today)
 
     shifts.reverse()
     return {
@@ -136,15 +125,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
         prev_s = (first - timedelta(days=1)).replace(day=1).isoformat()
         next_s = (last + timedelta(days=1)).isoformat()
 
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
-        agents = conn.execute(
-            "SELECT user_id, display_name, name FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') "
-            "ORDER BY name"
-        ).fetchall()
-    finally:
-        conn.close()
+    agents = data.agents(status="active", team="LIVECHAT")
 
     rows, tot_min, tot_ot, tot_cents, tot_rev, flags = [], 0, 0, 0, 0, 0
     for a in agents:
@@ -264,7 +245,7 @@ def team_home_payload(user_id: int) -> dict:
     today = now().date()
     first = today - timedelta(days=today.weekday())
     week = [(first + timedelta(days=i)).isoformat() for i in range(7)]
-    live = ",".join("?" * len(LIVE_STATUSES))
+    live = list(LIVE_STATUSES)
     out = {"teamHome": kind, "name": display_name_of(user_id, "You"),
            "today": today.strftime("%a %-d %b"), "team": DEPT_NAMES.get(kind, kind),
            "tabs": app_tabs(user_id), "tabNames": tab_names(user_id),
@@ -279,41 +260,36 @@ def team_home_payload(user_id: int) -> dict:
             onlineRequests=sum(1 for r in needs if r["origin"] == "on" and not r["handed_back"]),
             handedBack=sum(1 for r in needs if r["handed_back"]),
             needs=[case_shape(r, today) for r in needs[:5]],
-            visitsToday=q1(f"SELECT COUNT(*) AS n FROM appointments WHERE status IN ({live})"
-                           " AND substr(starts_at,1,10)=?", (*LIVE_STATUSES, today.isoformat()))["n"],
+            visitsToday=sum(1 for v in data.rows("appointments", status=live)
+                            if v["starts_at"][:10] == today.isoformat()),
             booked=my_bookings(user_id))
     elif kind == "FS":
         booked = my_bookings(user_id)
         out.update(
             booked=booked,
-            bookedWeek=q1(f"SELECT COUNT(*) AS n FROM appointments WHERE created_by=? AND status IN ({live})"
-                          " AND substr(starts_at,1,10) BETWEEN ? AND ?",
-                          (user_id, *LIVE_STATUSES, week[0], week[-1]))["n"],
-            requestsOpen=q1("SELECT COUNT(*) AS n FROM special_requests WHERE created_by=?"
-                            " AND status IN ('OPEN','TAKEN')", (user_id,))["n"])
+            bookedWeek=sum(1 for v in data.rows("appointments", created_by=user_id, status=live)
+                           if week[0] <= v["starts_at"][:10] <= week[-1]),
+            requestsOpen=data.count("special_requests", created_by=user_id, status=["OPEN", "TAKEN"]))
     elif kind == "ONSITE":
-        rows = q(f"SELECT * FROM appointments WHERE specialist_id=? AND status IN ({live})"
-                 " AND substr(starts_at,1,10) BETWEEN ? AND ? ORDER BY starts_at",
-                 (user_id, *LIVE_STATUSES, week[0], week[-1]))
+        rows = sorted((v for v in data.rows("appointments", specialist_id=user_id, status=live)
+                       if week[0] <= v["starts_at"][:10] <= week[-1]), key=lambda v: span_of(v)[0])
         todays = [r for r in rows if r["starts_at"][:10] == today.isoformat()]
         nxt = next((r for r in todays if span_of(r)[1] > now()), None) or next(
             (r for r in rows if r["starts_at"][:10] > today.isoformat()), None)
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        me = work_place(user_id)
         out.update(
             next={**visit_item(nxt, "specialist"),
                   "day": span_of(nxt)[0].strftime("%a %-d %b")} if nxt else None,
             todayVisits=[visit_item(r, "specialist") for r in todays],
             weekVisits=len(rows),
-            waiting=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='WAITING' AND country=?",
-                       ((me["country"] if me else "") or "SG",))["n"],
+            waiting=data.count("appointments", status="WAITING", country=(me["country"] if me else "") or "SG"),
             pay={**{k: v for k, v in pay_summary(user_id, today.replace(day=1)).items()
                     if k in ("count", "total")},
                  "label": today.strftime("%B") + " so far"},
-            arranging=q1("SELECT COUNT(*) AS n FROM appointments WHERE status='ARRANGING' AND specialist_id=?",
-                         (user_id,))["n"])
+            arranging=data.count("appointments", status="ARRANGING", specialist_id=user_id))
     elif kind == "ON":
         mine = online_channels(user_id)
-        running = [r for r in q("SELECT * FROM ho_cases WHERE closed=0 AND on_closed=0 ORDER BY id")
+        running = [r for r in data.rows("ho_cases", closed=False, on_closed=False, order="created_at")
                    if r["channel"] in mine]
         out.update(
             channels=[{"key": key, "name": f"{name}", "n": sum(1 for r in running if r["channel"] == key)}
@@ -329,8 +305,8 @@ def team_home_payload(user_id: int) -> dict:
 def my_bookings(user_id: int, limit: int = 3) -> list:
     """Appointments this person booked that haven't happened yet, soonest first."""
     since = (now() - timedelta(hours=2)).isoformat()
-    rows = q("SELECT * FROM appointments WHERE created_by=? AND status IN ('SCHEDULED','ONSITE')"
-             " AND starts_at >= ? ORDER BY starts_at LIMIT ?", (user_id, since, limit))
+    rows = data.rows("appointments", created_by=user_id, status=list(LIVE_STATUSES), starts_at=("gte", since),
+                     order="starts_at", limit=limit)
     out = []
     for v in rows:
         start, _ = span_of(v)
@@ -341,22 +317,10 @@ def my_bookings(user_id: int, limit: int = 3) -> list:
 
 def home_payload(user_id: int) -> dict:
     """What an agent needs to see mid-shift."""
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
-        a = conn.execute(
-            "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
-        ).fetchone()
-        name = (a["name"]) if a else "You"
-    finally:
-        conn.close()
+    name = display_name_of(user_id, "You")
 
     today = now().date()
-    openrow = q1(
-        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
-        "ORDER BY id DESC LIMIT 1",
-        (user_id,),
-    )
+    openrow = data.row("time_entries", agent_id=user_id, clock_out=None, order="-clock_in")
     on_shift = bool(openrow)
     since = label = ""
     elapsed = ""
@@ -365,19 +329,12 @@ def home_payload(user_id: int) -> dict:
         since = started.strftime("%H:%M")
         label = openrow["shift_label"] or ""
         if not label and openrow["slot_id"]:
-            r = q1("SELECT label FROM slots WHERE id=?", (openrow["slot_id"],))
+            r = data.slot_info(openrow["slot_id"])
             label = r["label"] if r else ""
         elapsed = hhmm(int((now() - started).total_seconds() // 60))
 
     # next rostered shift from now on
-    nxt = q1(
-        """SELECT s.label, s.start_min, d.name AS day_name, d.the_date
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE su.user_id=? AND d.the_date >= ?
-           ORDER BY d.the_date, s.start_min LIMIT 1""",
-        (user_id, today.isoformat()),
-    )
+    nxt = next((s for s in signups_between(today.isoformat(), "9999-12-31") if s["user_id"] == user_id), None)
     next_shift = ""
     if nxt:
         d = date.fromisoformat(nxt["the_date"])
@@ -419,28 +376,23 @@ def home_payload(user_id: int) -> dict:
 
 def web_clock_in(user_id: int, label: str = "") -> dict:
     """Clock in from the app. Mirrors /clockin, minus the chat conversation."""
-    if q1("SELECT 1 FROM time_entries WHERE agent_id=? AND clock_out IS NULL",
-          (user_id,)):
+    if data.row("time_entries", agent_id=user_id, clock_out=None):
         return {"ok": False, "error": "You're already clocked in."}
 
     when = now()
     slot = None
     if label:
         d = day_row_for(when.date().isoformat())
-        slot = q1(
-            "SELECT id, label FROM slots WHERE day_id=? AND lower(label)=lower(?)",
-            (d["id"], label),
-        ) if d else None
+        slot = next((s for s in data.board(d["week_id"])["slots"][d["id"]]
+                     if s["label"].lower() == label.lower()), None) if d else None
     else:
         slot = current_slot_for(user_id, when)
 
     shown = (slot["label"] if slot else label) or ""
-    run(
-        "INSERT INTO time_entries (agent_id, slot_id, the_date, clock_in, status,"
-        " shift_label, opening_posted) VALUES (?,?,?,?,'open',?,?)",
-        (user_id, slot["id"] if slot else None, when.date().isoformat(),
-         when.isoformat(), shown, 1 if shown else 0),
-    )
+    data.add("time_entries", {"agent_id": user_id, "slot_id": slot["id"] if slot else None,
+                              "the_date": when.date().isoformat(), "clock_in": when.isoformat(),
+                              "status": "open", "shift_label": shown, "opening_posted": bool(shown)},
+             returning=False)
 
     posted = False
     if shown:
@@ -457,18 +409,12 @@ def web_clock_in(user_id: int, label: str = "") -> dict:
 
 def web_clock_out(user_id: int) -> dict:
     """Clock out from the app."""
-    row = q1(
-        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
-        "ORDER BY id DESC LIMIT 1",
-        (user_id,),
-    )
+    row = data.row("time_entries", agent_id=user_id, clock_out=None, order="-clock_in")
     if not row:
         return {"ok": False, "error": "You're not clocked in."}
 
     when = now()
-    run("UPDATE time_entries SET clock_out=?, status='closed' WHERE id=?",
-        (when.isoformat(), row["id"]))
-    fresh = q1("SELECT * FROM time_entries WHERE id=?", (row["id"],))
+    fresh = data.change("time_entries", {"clock_out": when.isoformat(), "status": "closed"}, id=row["id"])[0]
     base, ot = entry_split(fresh)
     cents = round((base + ot) / 60 * rate_for(user_id, date.fromisoformat(row["the_date"])))
     # Same as clocking out in the chat: the bot asks for the closing handover.
@@ -490,8 +436,7 @@ def todays_slots(user_id: int) -> list:
     d = day_row_for(now().date().isoformat())
     if not d:
         return []
-    return [r["label"] for r in
-            q("SELECT label FROM slots WHERE day_id=? ORDER BY idx", (d["id"],))]
+    return [r["label"] for r in data.board(d["week_id"])["slots"][d["id"]]]
 
 
 def week_payload(user_id: int, which: str = "now") -> dict:
@@ -509,10 +454,11 @@ def week_payload(user_id: int, which: str = "now") -> dict:
 
     today = now().date()
     days = []
-    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (w["id"],)):
+    board = data.board(w["id"])
+    for d in board["days"]:
         the_date = date.fromisoformat(d["the_date"])
         slots = []
-        for sl in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (d["id"],)):
+        for sl in board["slots"][d["id"]]:
             holders = slot_holders(sl["id"])
             cap = sl["capacity"] or SLOT_CAPACITY
             mine = any(h["user_id"] == user_id for h in holders)
@@ -563,19 +509,13 @@ def week_payload(user_id: int, which: str = "now") -> dict:
     }
 
 
-def web_claim(user_id: int, slot_id: int, want: bool) -> dict:
+def web_claim(user_id: int, slot_id: str, want: bool) -> dict:
     """Take or release a slot from the app.
 
     The server decides, not the screen — two people tapping the same free slot
     can't both win.
     """
-    slot = q1(
-        """SELECT s.id, s.label, s.capacity, d.id AS day_id, d.name AS day_name,
-                  d.the_date, w.id AS week_id, w.status
-           FROM slots s JOIN days d ON d.id = s.day_id
-           JOIN weeks w ON w.id = d.week_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    slot = data.slot_info(slot_id)
     if not slot:
         return {"ok": False, "error": "That slot no longer exists."}
     if slot["status"] != "open":
@@ -599,16 +539,10 @@ def web_claim(user_id: int, slot_id: int, want: bool) -> dict:
     if not want and not mine:
         return {"ok": True, "state": "free", "quiet": True}
 
-    name = display_name_of(user_id, "")
     if want:
-        run(
-            "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) "
-            "VALUES (?,?,?,?)",
-            (slot["id"], user_id, name, now().isoformat()),
-        )
+        give_slot(slot["id"], user_id)
     else:
-        run("DELETE FROM signups WHERE slot_id=? AND user_id=?",
-            (slot["id"], user_id))
+        take_slot(slot["id"], user_id)
 
     # redraw the group board through the bot
     on_bot_loop(refresh_group_for(slot["week_id"], slot["day_id"]))
@@ -638,6 +572,7 @@ def case_shape(r, today: date, closed: bool = False) -> dict:
     due = case_due(added, r["prio"])
     out = {
         "id": r["id"],
+        "seq": r["created_at"] or "",    # raised order, for sorting
         "prio": r["prio"] or "",
         "username": r["username"] or "",
         "platform": r["platform"] or "",
@@ -691,13 +626,11 @@ def may_post_handover(user_id: int) -> bool:
 def handover_payload(user_id: int) -> dict:
     """Open cases, recently closed ones, and the pickers for a new case."""
     today = now().date()
-    open_rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    open_rows = data.rows("ho_cases", closed=False, order="created_at")
     if online_view(user_id):            # Not needed: off the Online team's list
         skipped = skipped_ids()
         open_rows = [r for r in open_rows if r["id"] not in skipped]
-    closed_rows = q(
-        "SELECT * FROM ho_cases WHERE closed=1 ORDER BY closed_at DESC LIMIT 12"
-    )
+    closed_rows = data.rows("ho_cases", closed=True, order="-closed_at", limit=12)
 
 
     return {
@@ -726,7 +659,7 @@ def handover_payload(user_id: int) -> dict:
     }
 
 
-def case_history_lines(case_id: int, limit: int = 8) -> list:
+def case_history_lines(case_id: str, limit: int = 8) -> list:
     out = []
     for h in case_history(case_id)[-limit:]:
         when = datetime.fromisoformat(h["created_at"]).strftime("%-d %b %H:%M")
@@ -743,11 +676,11 @@ ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback",
                 "/api/case/edit", "/api/case", "/api/case/pick"}
 
 
-def web_case_pick(user_id: int, case_id: int, help: bool) -> dict:
+def web_case_pick(user_id: int, case_id: str, help: bool) -> dict:
     """A PM's I'll help / Not needed on a new SH case."""
     if not online_view(user_id):
         return {"ok": False, "error": "This is for the platform managers."}
-    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    row = data.row("ho_cases", id=case_id)
     if not row or not awaiting_pm(row):
         return {"ok": False, "error": "Someone already answered this one."}
     if help:
@@ -759,11 +692,11 @@ def web_case_pick(user_id: int, case_id: int, help: bool) -> dict:
     return {"ok": True}
 
 
-def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
+def web_case_edit(user_id: int, case_id: str, changes: dict) -> dict:
     """Online team and admins: change a case's urgency or its parts."""
     if not (is_online(user_id) or admin_for(user_id, "ON")):
         return {"ok": False, "error": "Only the Online team and admins edit cases."}
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return {"ok": False, "error": "That case is gone."}
     allowed = ([k for k, _, _ in CASE_FIELDS] if r["order_no"] is not None
@@ -796,6 +729,8 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
     out times (the specialist themselves)."""
     role = visit_role(user_id)
     def num(k):
+        if k == "id":                     # a visit's uuid
+            return str(b.get(k) or "")
         try:
             return int(b.get(k) or 0)
         except (TypeError, ValueError):
@@ -804,7 +739,7 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         # A specialist adds a customer they've agreed a time with, as their own visit.
         if role != "specialist":
             return {"ok": False, "error": "SH and FS hand customers over instead."}
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        me = work_place(user_id)
         b = dict(b, country=(me["country"] if me else "") or "SG", specialist_id=user_id)
         vid, err = create_visit(user_id, b)
         if err:
@@ -836,12 +771,12 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
         if not ok:
             return {"ok": False, "error": err}
         on_bot_loop(notify_booked_fyi(bot_ref(), num("id")))
-        v = q1("SELECT followup_of FROM appointments WHERE id=?", (num("id"),))
+        v = visit(num("id"))
         if v and v["followup_of"]:
             on_bot_loop(pin_next_visit(bot_ref(), num("id")))
         return {"ok": True}
     if path == "/api/visit/one":
-        v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))
+        v = visit(num("id"))
         if not v or v["specialist_id"] != user_id:
             return {"ok": False, "error": "That's not your visit."}
         return {"ok": True, "visit": visit_screen(v, user_id)}
@@ -873,7 +808,7 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
                                           str(b.get("cust_email") or "")), timeout=15)
         return {"ok": True, "posted": bool(posted)}
     if path == "/api/visit/paynow":
-        v = q1("SELECT * FROM appointments WHERE id=?", (num("id"),))
+        v = visit(num("id"))
         if not v or v["specialist_id"] != user_id:
             return {"ok": False, "error": "That's not your visit."}
         try:
@@ -929,17 +864,17 @@ def web_visit_post(user_id: int, path: str, b: dict) -> dict:
     return {"ok": False, "error": "Unknown action."}
 
 
-async def _take(appt_id: int, user_id: int) -> tuple:
+async def _take(appt_id: str, user_id: int) -> tuple:
     """On the bot's loop, under the write lock, so two taps can't both win."""
     async with write_lock:
         return take_handover(appt_id, user_id)
 
 
-def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
+def web_case_handback(user_id: int, case_id: str, note: str) -> dict:
     if not is_online(user_id):
         return {"ok": False, "error": "Only the Online team hands cases back."}
     note = (note or "").strip()[:500]
-    row = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
+    row = data.row("ho_cases", id=case_id)
     if not row:
         return {"ok": False, "error": "That case is gone."}
     reuse = None
@@ -955,11 +890,11 @@ def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
     return {"ok": True, "username": row["username"]}
 
 
-def web_case_note(user_id: int, case_id: int, note: str) -> dict:
+def web_case_note(user_id: int, case_id: str, note: str) -> dict:
     note = (note or "").strip()
     if len(note) < 2:
         return {"ok": False, "error": "Type a few words first."}
-    row = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
+    row = data.row("ho_cases", id=case_id)
     if not row:
         return {"ok": False, "error": "That case is gone."}
     log_case(case_id, user_id, "on" if online_view(user_id) else "sh", "note", note[:500])
@@ -968,8 +903,8 @@ def web_case_note(user_id: int, case_id: int, note: str) -> dict:
     return {"ok": True, "username": row["username"]}
 
 
-def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
-    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+def web_case_toggle(user_id: int, case_id: str, close: bool) -> dict:
+    row = data.row("ho_cases", id=case_id)
     if not row:
         return {"ok": False, "error": "That case is gone."}
     if close:
@@ -1023,12 +958,7 @@ def web_handover_post(user_id: int) -> dict:
     cases = [case_row_to_dict(r) for r in open_cases()]
     text, closed = render_shift_summary(user_id, display_name_of(user_id, ""))
 
-    run(
-        "INSERT INTO handovers (agent_id, the_date, body, created_at) "
-        "VALUES (?,?,?,?)",
-        (user_id, today.isoformat(),
-         "\n\n".join(render_case(c) for c in cases), now().isoformat()),
-    )
+    add_handover(user_id, today, "\n\n".join(render_case(c) for c in cases))
     posted = bool(text and on_bot_loop(post_ops(bot_ref(), text)))
     on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
     on_bot_loop(notify_pms(bot_ref(), user_id), timeout=30)
@@ -1064,10 +994,9 @@ def agent_payload(agent_id: int, mode: str, first: date) -> dict:
         r = sh["row"]
         a_t = datetime.fromisoformat(r["clock_in"])
         b_t = datetime.fromisoformat(r["clock_out"])
-        slot = q1("SELECT label FROM slots WHERE id=?", (r["slot_id"],)) \
-            if r["slot_id"] else None
+        slot = data.slot_info(r["slot_id"]) if r["slot_id"] else None
         shifts.append({
-            "id": r["id"],
+            "id": ref(r["id"]),
             "date": sh["date"].strftime("%a %-d %b"),
             "times": f"{a_t.strftime('%H:%M')}\u2013{b_t.strftime('%H:%M')}",
             "hours": hhmm(sh["minutes"]),
@@ -1082,18 +1011,10 @@ def agent_payload(agent_id: int, mode: str, first: date) -> dict:
     # anything rostered but never clocked
     missed = []
     today = now().date()
-    for row in q(
-        """SELECT s.label, d.name AS day_name, d.the_date
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE su.user_id=? AND d.the_date BETWEEN ? AND ? AND d.the_date < ?
-           ORDER BY d.the_date""",
-        (agent_id, first.isoformat(), last.isoformat(), today.isoformat()),
-    ):
-        if not q1(
-            "SELECT 1 FROM time_entries WHERE agent_id=? AND the_date=?",
-            (agent_id, row["the_date"]),
-        ):
+    clocked = {e["the_date"] for e in data.rows("time_entries", agent_id=agent_id,
+                                                the_date=(("gte", first.isoformat()), ("lte", last.isoformat())))}
+    for row in signups_between(first.isoformat(), last.isoformat()):
+        if row["user_id"] == agent_id and row["the_date"] < today.isoformat() and row["the_date"] not in clocked:
             missed.append(f"{row['day_name']} {row['label']}")
 
     a = data.agent(agent_id)
@@ -1128,11 +1049,7 @@ def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
         return {"ok": False, "error": "No such agent."}
 
     if field == "name":
-        nm = str(value).strip()
-        if not 2 <= len(nm) <= 40:
-            return {"ok": False, "error": "Give a name between 2 and 40 characters."}
-        run("UPDATE agents SET display_name=? WHERE user_id=?", (nm, agent_id))
-        return {"ok": True, "field": field, "value": nm}
+        return {"ok": False, "error": NAME_ON_RECORD}
 
     column = {
         "avails": "on_avails",
@@ -1143,10 +1060,8 @@ def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
         return {"ok": False, "error": "Unknown setting."}
 
     want = bool(value)
-    stored = 0 if (column == "salaried" and want) else (1 if want else 0)
-    if column == "salaried":
-        stored = 0 if want else 1          # paid hourly on  → salaried off
-    run(f"UPDATE agents SET {column}=? WHERE user_id=?", (stored, agent_id))
+    stored = (not want) if column == "salaried" else want     # paid hourly on → salaried off
+    data.set_agent(agent_id, **{column: stored})
     log.info("%s set %s=%s for %s", admin_id, field, want, agent_id)
     return {"ok": True, "field": field, "value": want}
 
@@ -1158,6 +1073,10 @@ def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
 # --------------------------------------------------------------------------
 
 ADMIN_POSTS = {"/api/admin/approve", "/api/admin/decline", "/api/admin/person", "/api/admin/update"}
+# Names and countries are on the people record every TC app shares: the bot reads them, but can't change them.
+NAME_ON_RECORD = "Names come from their people record, which every TC app shares. Ask the platform owner to change it."
+COUNTRY_ON_RECORD = ("Countries come from their people record, which every TC app shares. "
+                     "Ask the platform owner to change it.")
 
 # --------------------------------------------------------------------------
 # What's new: short updates for everyone or chosen teams, shown on Home.
@@ -1261,7 +1180,7 @@ def admin_tabs(user_id: int) -> list:
 
 def teams_of(user_id: int) -> list:
     """Someone's own teams (not what the owner is viewing as)."""
-    have = {r["dept"] for r in q("SELECT dept FROM memberships WHERE user_id=?", (user_id,))}
+    have = data.teams(user_id)
     return [k for k, _ in DEPARTMENTS if k in have]
 
 
@@ -1283,7 +1202,7 @@ def person_dict(r) -> dict:
 
 def admin_people_payload(user_id: int) -> dict:
     pending = []
-    for r in q("SELECT * FROM agents WHERE status='pending' ORDER BY requested_at DESC"):
+    for r in reversed(data.agents(status="pending")):
         at = datetime.fromisoformat(r["requested_at"]) if r["requested_at"] else None
         pending.append({
             "id": r["user_id"], "name": r["name"] or "",
@@ -1293,9 +1212,7 @@ def admin_people_payload(user_id: int) -> dict:
             "time": at.strftime("%-I:%M%p").lower() if at else "",
             "today": bool(at and at.date() == now().date()),
         })
-    people = [person_dict(r) for r in q(
-        "SELECT * FROM agents WHERE status='active' AND active=1 "
-        "ORDER BY lower(COALESCE(display_name, name))")]
+    people = [person_dict(r) for r in data.agents(status="active", active=True)]
     return {
         "pending": pending, "people": people,
         "teams": [[k, "Online" if k == "ON" else n] for k, n in DEPARTMENTS],
@@ -1312,11 +1229,11 @@ def save_teams(uid: int, want: list) -> None:
     had = teams_of(uid)
     set_depts(uid, want)
     if "LIVECHAT" in want and "LIVECHAT" not in had:
-        run("UPDATE agents SET on_avails=1, tag_calls=1 WHERE user_id=?", (uid,))
+        data.set_agent(uid, on_avails=True, tag_calls=True)
     if "ON" in want and "ON" not in had:
-        run("UPDATE agents SET channels=COALESCE(channels, '[]') WHERE user_id=?", (uid,))
+        data.set_agent(uid, channels=online_channels(uid))
     if "ON" not in want and "ON" in had:
-        run("UPDATE agents SET channels=NULL WHERE user_id=?", (uid,))
+        data.set_agent(uid, channels=None)
 
 
 def clean_list(value, allowed) -> list:
@@ -1342,13 +1259,13 @@ def web_admin_approve(admin_id: int, body: dict) -> dict:
         channels = []
     if "ONSITE" in teams and admin_for(admin_id, "ONSITE") and country not in COUNTRY_NAMES:
         return {"ok": False, "error": "Pick the country they do visits in."}
-    run("UPDATE agents SET status='active', decided_by=?, decided_at=? WHERE user_id=?",
-        (admin_id, now().isoformat(), uid))
+    # A new person is added with that country; someone already on the people record keeps theirs.
+    if not data.decide(uid, approve=True, by=admin_id,
+                       country=country if "ONSITE" in teams and country in COUNTRY_NAMES else None):
+        return {"ok": False, "error": "That request was already handled."}
     save_teams(uid, teams)
     if "ON" in teams:
-        run("UPDATE agents SET channels=? WHERE user_id=?", (json.dumps(channels), uid))
-    if "ONSITE" in teams and admin_for(admin_id, "ONSITE"):
-        run("UPDATE agents SET country=? WHERE user_id=?", (country, uid))
+        data.set_agent(uid, channels=channels)
     log.info("%s approved %s in the App: %s", admin_id, uid, teams)
     on_bot_loop(after_access(bot_ref(), row, admin_id, True), timeout=20)
     return {"ok": True}
@@ -1360,10 +1277,8 @@ def web_admin_decline(admin_id: int, body: dict) -> dict:
     except (TypeError, ValueError):
         uid = 0
     row = data.agent(uid)
-    if not row or row["status"] != "pending":
+    if not row or row["status"] != "pending" or not data.decide(uid, approve=False, by=admin_id):
         return {"ok": False, "error": "That request was already handled."}
-    run("UPDATE agents SET status='declined', decided_by=?, decided_at=? WHERE user_id=?",
-        (admin_id, now().isoformat(), uid))
     log.info("%s declined %s in the App", admin_id, uid)
     on_bot_loop(after_access(bot_ref(), row, admin_id, False), timeout=20)
     return {"ok": True}
@@ -1375,10 +1290,7 @@ async def after_access(bot, row, admin_id: int, approve: bool) -> None:
     uid = row["user_id"]
     shown = row["name"]
     verdict = "approved ✅" if approve else "declined 🚫"
-    try:
-        sent = json.loads(row["req_msgs"] or "[]")
-    except (json.JSONDecodeError, TypeError):
-        sent = []
+    sent = row["req_msgs"] or []
     if sent:
         await settle_admin_messages(
             bot, sent, f"🔔 <b>Access request</b>\n\n<b>{esc(shown)}</b>\n\n"
@@ -1408,8 +1320,8 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         uid = int(body.get("id", 0))
     except (TypeError, ValueError):
         uid = 0
-    row = q1("SELECT * FROM agents WHERE user_id=? AND status='active'", (uid,))
-    if not row:
+    row = data.agent(uid)
+    if not row or row["status"] != "active":
         return {"ok": False, "error": "That person isn't on the list any more."}
     field, value = str(body.get("field") or ""), body.get("value")
     menus = False
@@ -1424,18 +1336,18 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
     elif field == "channels":
         if not admin_for(admin_id, "ON"):
             return {"ok": False, "error": "Only Online admins change channels."}
-        run("UPDATE agents SET channels=? WHERE user_id=?",
-            (json.dumps(clean_list(value, [k for k, _, _ in CHANNELS])), uid))
+        data.set_agent(uid, channels=clean_list(value, [k for k, _, _ in CHANNELS]))
     elif field == "country":
         if not admin_for(admin_id, "ONSITE") or value not in COUNTRY_NAMES:
             return {"ok": False, "error": "Only On-Site admins set the country."}
-        run("UPDATE agents SET country=? WHERE user_id=?", (value, uid))
+        if value != row["country"]:
+            return {"ok": False, "error": COUNTRY_ON_RECORD}
     elif field == "admin":
         if not is_owner(admin_id):
             return {"ok": False, "error": "Only the owner makes or removes admins."}
         if is_owner(uid):
             return {"ok": False, "error": "The owner is set in the bot's settings, not here."}
-        run("UPDATE agents SET role=? WHERE user_id=?", ("admin" if value else "agent", uid))
+        data.set_agent(uid, role="admin" if value else "agent")
         if not value:
             set_setting(f"full_admin:{uid}", "")     # no longer an admin: not a full one either
             set_setting(f"admin_teams:{uid}", "")
@@ -1466,11 +1378,7 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
         set_setting(f"admin_teams:{uid}", "" if set(teams) == set(teams_of(uid)) else ",".join(teams))
         menus = True
     elif field == "name":
-        nm = " ".join(str(value or "").split())
-        if not 2 <= len(nm) <= 40:
-            return {"ok": False, "error": "Give a name between 2 and 40 characters."}
-        run("UPDATE agents SET display_name=? WHERE user_id=?", (nm, uid))
-        run("UPDATE signups SET name=? WHERE user_id=?", (nm, uid))
+        return {"ok": False, "error": NAME_ON_RECORD}
     elif field == "remove":
         if is_owner(uid) or uid == admin_id:
             return {"ok": False, "error": "You can't remove yourself or the owner."}
@@ -1490,15 +1398,9 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
 def web_has_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    try:
-        row = conn.execute(
-            "SELECT status, role FROM agents WHERE user_id=?", (user_id,)
-        ).fetchone()
-    finally:
-        conn.close()
+    row = data.agent(user_id)
     if row:
-        return row[0] == "active"
+        return row["status"] == "active"
     return not ADMIN_IDS
 
 
@@ -1940,10 +1842,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         elif path == "/api/case":
             out = web_case_add(uid, body if isinstance(body, dict) else {})
         elif path == "/api/case/toggle":
-            try:
-                cid = int(body.get("id", 0))
-            except (TypeError, ValueError):
-                cid = 0
+            cid = uuid_of(body.get("id"))
             out = (web_case_toggle(uid, cid, bool(body.get("close", True)))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/request":
@@ -1951,41 +1850,26 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         elif path in VISIT_POSTS:
             out = web_visit_post(uid, path, body if isinstance(body, dict) else {})
         elif path == "/api/case/pick":
-            try:
-                cid = int(body.get("id", 0))
-            except (TypeError, ValueError):
-                cid = 0
+            cid = uuid_of(body.get("id"))
             out = (web_case_pick(uid, cid, bool(body.get("help")))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/case/handback":
-            try:
-                cid = int(body.get("id", 0))
-            except (TypeError, ValueError):
-                cid = 0
+            cid = uuid_of(body.get("id"))
             out = (web_case_handback(uid, cid, str(body.get("note", "")))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/case/edit":
-            try:
-                cid = int(body.get("id", 0))
-            except (TypeError, ValueError):
-                cid = 0
+            cid = uuid_of(body.get("id"))
             changes = body.get("changes") if isinstance(body.get("changes"), dict) else {}
             out = (web_case_edit(uid, cid, changes)
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/case/note":
-            try:
-                cid = int(body.get("id", 0))
-            except (TypeError, ValueError):
-                cid = 0
+            cid = uuid_of(body.get("id"))
             out = (web_case_note(uid, cid, str(body.get("note", "")))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/handover/post":
             out = web_handover_post(uid)
         elif path == "/api/claim":
-            try:
-                sid = int(body.get("slot", 0))
-            except (TypeError, ValueError):
-                sid = 0
+            sid = uuid_of(body.get("slot"))
             async_safe = bool(body.get("want", True))
             out = web_claim(uid, sid, async_safe) if sid else {
                 "ok": False, "error": "No slot given."}

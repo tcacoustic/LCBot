@@ -2248,7 +2248,7 @@ def online_covers(channel: str | None) -> bool:
     true once someone in the Online role looks after that channel."""
     if not channel:
         return False
-    return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
+    return any(channel in (r["channels"] or []) for r in online_team())
 
 
 def pm_pick(case_id: str) -> tuple[str, int] | None:
@@ -2638,7 +2638,7 @@ async def notify_reply(bot, case_id: str, author_id: int, note: str | None = Non
     else:
         if setting("pm_alerts", "on") != "off":
             for pm in online_team():
-                if r["channel"] in json.loads(pm["channels"] or "[]"):
+                if r["channel"] in (pm["channels"] or []):
                     sends[pm["user_id"]] = (f"💬 <b>{esc(who)} added a note</b>\n{about}\n\n"
                                             f"{esc(note)}\n\nOpen the App to see the case.")
         if waiting:
@@ -2666,7 +2666,7 @@ async def notify_pms(bot, agent_id: int) -> None:
     who = display_name_of(agent_id, "SH")
     names = {key: name for key, _, name in CHANNELS}
     for pm in online_team():
-        mine = set(json.loads(pm["channels"] or "[]"))
+        mine = set((pm["channels"] or []))
         blocks = []
         for r in (r for r in rows if r["channel"] in mine):
             lines = [f"🆕 New case from {who} · {CHANNEL_NAMES.get(r['channel'], r['channel'])}",
@@ -4396,7 +4396,7 @@ async function loadHandover() {
        + 'Cases waiting on Online stay here until they close it too.</div>';
     // Anything Online handed back goes first: someone is waiting on SH.
     const first = c => c.onlineDone ? 2 : (c.handedBack || (c.request && !c.shClosed)) ? 1 : 0;
-    const order = [...d.openCases].sort((a, b) => (first(b) - first(a)) || (a.id - b.id));
+    const order = [...d.openCases].sort((a, b) => (first(b) - first(a)) || String(a.seq).localeCompare(String(b.seq)));
     for (const c of order) h += caseCard(c, false);
   }
 
@@ -4417,7 +4417,7 @@ function wireHandover() {
   document.querySelectorAll('.tick').forEach(el => {
     el.onclick = async () => {
       const out = await post('/api/case/toggle',
-        { id: Number(el.dataset.id), close: el.dataset.close === '1' });
+        { id: el.dataset.id, close: el.dataset.close === '1' });
       if (!out.ok) { toast(out.error || 'Could not change that.'); return; }
       toast(out.closed ? 'Closed ' + out.username : 'Reopened ' + out.username);
       await loadHandover();
@@ -4430,7 +4430,7 @@ function wireHandover() {
       const note = box ? box.value.trim() : '';
       if (!note) { toast('Type a note first.'); return; }
       el.disabled = true;
-      const out = await post('/api/case/note', { id: Number(id), note });
+      const out = await post('/api/case/note', { id: id, note });
       el.disabled = false;
       if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
       toast('Note added');
@@ -4649,7 +4649,7 @@ function renderOnline(d) {
 
   const shown = open
     .filter(c => c.group === ON_GROUP && (!ON_REGION || c.region === ON_REGION))
-    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (b.canPick - a.canPick) || (a.id - b.id));
+    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (b.canPick - a.canPick) || String(a.seq).localeCompare(String(b.seq)));
   if (!shown.length) h += '<div class="note">Nothing open here 🎉</div>';
   for (const c of shown) h += onlineCard(c, mine.has(c.channel));
 
@@ -4673,7 +4673,7 @@ function renderOnline(d) {
     el.onclick = async () => {
       el.disabled = true;
       const help = el.dataset.help === '1';
-      const out = await post('/api/case/pick', { id: Number(el.dataset.pick), help });
+      const out = await post('/api/case/pick', { id: el.dataset.pick, help });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not save that.'); return; }
       toast(help ? 'On your list' : 'Off your list');
       await loadHandover();
@@ -4690,7 +4690,7 @@ function renderOnline(d) {
   });
   document.querySelectorAll('[data-edit]').forEach(el => {
     el.onclick = () => {
-      const c = open.find(x => x.id === Number(el.dataset.edit));
+      const c = open.find(x => x.id === el.dataset.edit);
       if (!c) return;
       ON_EDIT[c.id] = Object.assign({ prio: c.prio }, c.fields);
       renderOnline(d);
@@ -4698,18 +4698,18 @@ function renderOnline(d) {
   });
   document.querySelectorAll('[data-eprio]').forEach(el => {
     el.onclick = () => {
-      const id = Number(el.dataset.eprio);
+      const id = el.dataset.eprio;
       keepEdit(id);
       ON_EDIT[id].prio = el.dataset.v;
       renderOnline(d);
     };
   });
   document.querySelectorAll('[data-ecancel]').forEach(el => {
-    el.onclick = () => { delete ON_EDIT[Number(el.dataset.ecancel)]; renderOnline(d); };
+    el.onclick = () => { delete ON_EDIT[el.dataset.ecancel]; renderOnline(d); };
   });
   document.querySelectorAll('[data-esave]').forEach(el => {
     el.onclick = async () => {
-      const id = Number(el.dataset.esave);
+      const id = el.dataset.esave;
       keepEdit(id);
       el.disabled = true; el.textContent = 'Saving…';
       const out = await post('/api/case/edit', { id, changes: ON_EDIT[id] });
@@ -4726,7 +4726,7 @@ function renderOnline(d) {
       // An empty box hands it back with the note they already left.
       const note = box ? box.value.trim() : '';
       el.disabled = true;
-      const out = await post('/api/case/handback', { id: Number(id), note });
+      const out = await post('/api/case/handback', { id: id, note });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not hand that back.'); return; }
       toast('Handed back to SH');
       await loadHandover();
@@ -4966,7 +4966,7 @@ function rqForm(v) {
   const f = VS.rq;
   const pick = (k, val, name) => '<button data-rqf="' + k + '" data-v="' + val + '" class="' + (f[k] === val ? 'on' : '') + '">' + name + '</button>';
   let h = '<h2>Replacement / payment request</h2><div class="note">Goes to the SH x Ops chat. No customer phone or address is posted.</div>';
-  h += '<div class="fld"><label>Visit</label><input value="#' + v.id + ' · ' + esc(v.product || v.type) + '" disabled></div>';
+  h += '<div class="fld"><label>Visit</label><input value="#' + String(v.id).slice(0, 8) + ' · ' + esc(v.product || v.type) + '" disabled></div>';
   h += '<div class="fld"><label>Need</label><div class="pick">' + pick('need', 'REPLACEMENT', 'Replacement unit') + pick('need', 'PART', 'Part') + pick('need', 'OTHER', 'Other') + '</div></div>';
   h += '<div class="fld"><label>Reason</label><textarea id="rq_reason" rows="2" placeholder="Won’t power on, fault confirmed on site">' + esc(f.reason || '') + '</textarea></div>';
   h += '<div class="fld"><label>Warranty</label><div class="pick">' + pick('warranty', 'IN', 'In warranty') + pick('warranty', 'OUT', 'Out of warranty') + '</div></div>';
@@ -4984,7 +4984,7 @@ function rqForm(v) {
 // The customer signs on the specialist's phone: what was done, their name, the consent tick and a signature.
 function signForm(v) {
   const f = VS.sign, done = (v.checklist || []).filter((x, i) => (v.ticks || []).includes(i));
-  return '<div class="case"><div class="nm">Visit #' + v.id + ' · ' + esc(v.type) + (v.product ? ' · ' + esc(v.product) : '') + '</div>'
+  return '<div class="case"><div class="nm">Visit #' + String(v.id).slice(0, 8) + ' · ' + esc(v.type) + (v.product ? ' · ' + esc(v.product) : '') + '</div>'
     + (done.length ? '<div class="meta" style="margin-top:6px">Done: ' + done.map(esc).join('; ') + '</div>' : '') + '</div>'
     + '<div class="fld"><label>Your name</label><input id="sg_name" autocomplete="off" value="' + esc(f.name || '') + '"></div>'
     + '<div class="top" data-sgok="1" style="padding:6px 0;cursor:pointer"><div class="tick' + (f.consent ? ' on' : '') + '">' + (f.consent ? '✓' : '') + '</div><div style="padding-top:3px">' + esc(v.signText) + '</div></div>'
@@ -5354,7 +5354,7 @@ function requestsView(d) {
   }
   h += '<h2>New request or cab claim</h2><div class="note">Pick the visit, then tap 📦 Replacement / payment request or 🚕 Cab claim.</div>';
   h += recent.length ? recent.slice(0, 12).map(v => '<div class="case tk-v" data-vv="' + v.id + '"><div class="nm"><span>'
-      + esc(v.when) + ' · ' + esc(v.customer) + '</span></div><div class="meta">#' + v.id + ' · ' + esc(v.type) + ' ›</div></div>').join('')
+      + esc(v.when) + ' · ' + esc(v.customer) + '</span></div><div class="meta">#' + String(v.id).slice(0, 8) + ' · ' + esc(v.type) + ' ›</div></div>').join('')
     : '<div class="empty">No visits this week.</div>';
   return h;
 }
@@ -5389,7 +5389,7 @@ function meView(d) {
 
 function pastDetail(p) {
   const row = (k, v) => v ? '<div class="pd"><span>' + k + '</span><b>' + esc(v) + '</b></div>' : '';
-  let h = '<div class="more" id="pastBack">‹ Me</div><h1>Visit #' + p.id + '</h1><div class="sub">' + esc(p.when) + '</div>';
+  let h = '<div class="more" id="pastBack">‹ Me</div><h1>Visit #' + String(p.id).slice(0, 8) + '</h1><div class="sub">' + esc(p.when) + '</div>';
   h += '<div class="case">' + row('Customer', p.name) + row('Area', p.postal) + row('Type', p.type) + row('Product', p.product)
      + row('Issue', p.issue) + row('Outcome', p.outcomeName) + row('Time on site', p.onSite) + row('Charge', p.charge)
      + row('Why it didn’t finish', p.why) + row('Next visit', p.next) + row('Signed off by', p.signed)
@@ -5401,7 +5401,7 @@ function pastDetail(p) {
 function wireSpecTabs() {
   const fb = document.getElementById('meFb');
   if (fb) fb.onclick = () => { FB.back = VIEW; VIEW = 'fb'; render(); };
-  document.querySelectorAll('[data-past]').forEach(el => el.onclick = () => openPast(Number(el.dataset.past), 'Me', () => render()));
+  document.querySelectorAll('[data-past]').forEach(el => el.onclick = () => openPast(el.dataset.past, 'Me', () => render()));
   document.querySelectorAll('[data-gopay]').forEach(el => el.onclick = () => { VIEW = 'pay'; PAY_MONTH = ''; render(); });
 }
 
@@ -5442,7 +5442,7 @@ function wireVisits(d) {
     const date = document.getElementById('mv_d_' + id).value, time = document.getElementById('mv_t_' + id).value;
     if (!date || !time) { toast('Pick the new date and time.'); return; }
     el.disabled = true;
-    const out = await post('/api/visit/reschedule', { id: Number(id), date, time });
+    const out = await post('/api/visit/reschedule', { id: id, date, time });
     el.disabled = false;
     if (!out.ok) { toast(out.error || 'Could not ask for that.'); return; }
     delete VS.move[id]; toast('Sent to the specialist to accept'); loadVisits();
@@ -5450,7 +5450,7 @@ function wireVisits(d) {
   on('[data-cxsend]', async el => {
     const id = el.dataset.cxsend;
     el.disabled = true;
-    const out = await post('/api/visit/cancel', { id: Number(id), reason: document.getElementById('cx_' + id).value });
+    const out = await post('/api/visit/cancel', { id: id, reason: document.getElementById('cx_' + id).value });
     el.disabled = false;
     if (!out.ok) { toast(out.error || 'Could not cancel that.'); return; }
     delete VS.cancel[id]; toast('Cancelled. The specialist has been told.'); loadVisits();
@@ -5478,7 +5478,7 @@ function wireVisits(d) {
   };
   on('[data-take]', async el => {
     el.disabled = true;
-    const out = await post('/api/visit/take', { id: Number(el.dataset.take) });
+    const out = await post('/api/visit/take', { id: el.dataset.take });
     if (!out.ok) { toast(out.error || 'Could not take it.'); loadVisits(); return; }
     toast('It’s yours. Call the customer, then set the time.'); loadVisits();
   });
@@ -5487,20 +5487,20 @@ function wireVisits(d) {
     const date = document.getElementById('st_d_' + id).value, time = document.getElementById('st_t_' + id).value;
     if (!date || !time) { toast('Pick the date and time you agreed.'); return; }
     el.disabled = true;
-    const out = await post('/api/visit/settime', { id: Number(id), date, time });
+    const out = await post('/api/visit/settime', { id: id, date, time });
     el.disabled = false;
     if (!out.ok) { toast(out.error || 'Could not book that.'); return; }
     VS.week = date; toast('Booked'); loadVisits();
   });
   on('[data-giveback]', async el => {
     if (!await askSure('Give this back so another specialist can take it?')) return;
-    const out = await post('/api/visit/giveback', { id: Number(el.dataset.giveback) });
+    const out = await post('/api/visit/giveback', { id: el.dataset.giveback });
     if (!out.ok) { toast(out.error || 'Could not give it back.'); return; }
     toast('Given back. The other specialists have been told.'); loadVisits();
   });
   on('[data-hcancel]', async el => {
     if (!await askSure('Cancel this handover? The specialist is told if someone took it.')) return;
-    const out = await post('/api/visit/cancel', { id: Number(el.dataset.hcancel), reason: '' });
+    const out = await post('/api/visit/cancel', { id: el.dataset.hcancel, reason: '' });
     if (!out.ok) { toast(out.error || 'Could not cancel it.'); return; }
     toast('Cancelled'); loadVisits();
   });
@@ -5589,7 +5589,7 @@ async function claim(el) {
   el.classList.add('busy');
   const want = el.dataset.want === '1';
   try {
-    const out = await post('/api/claim', { slot: Number(el.dataset.slot), want });
+    const out = await post('/api/claim', { slot: el.dataset.slot, want });
     if (!out.ok) {
       toast(out.error || 'Could not change that.');
       await loadWeek();
@@ -5789,7 +5789,7 @@ function requestTags(r) {
 }
 function requestCards(list) {
   return list.map(r => '<div class="p' + (r.statusKey === 'DONE' ? ' quiet' : '') + '">' + requestTags(r)
-    + '<div class="pn">#' + r.id + ' · ' + esc(r.category) + '</div>'
+    + '<div class="pn">#' + String(r.id).slice(0, 8) + ' · ' + esc(r.category) + '</div>'
     + '<div class="t">' + esc(r.order) + ' · ' + esc(r.delivery) + '</div>'
     + (r.reason ? '<div class="t">Reason: ' + esc(r.reason) + '</div>' : '')
     + (r.note ? '<div class="t">Ops note: ' + esc(r.note) + '</div>' : '') + '</div>').join('');
@@ -5980,7 +5980,7 @@ async function loadPay() {
   wireMonthNav(m => { PAY_MONTH = m; loadPay(); });
   const pb = document.getElementById('payBack');
   if (pb) pb.onclick = () => { VIEW = 'prof'; render(); };
-  document.querySelectorAll('[data-pvisit]').forEach(el => el.onclick = () => openPast(Number(el.dataset.pvisit), 'Pay', () => loadPay()));
+  document.querySelectorAll('[data-pvisit]').forEach(el => el.onclick = () => openPast(el.dataset.pvisit, 'Pay', () => loadPay()));
 }
 async function loadTeamOnsite() {
   const app = document.getElementById('app');

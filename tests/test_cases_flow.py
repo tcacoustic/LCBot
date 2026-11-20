@@ -52,7 +52,7 @@ class CasesFlowTest(LiveTestCase):
         core.set_depts(990000001, ["SH"])
         self.data.add_member(self.person(990000002, "Pm Person"))
         core.set_depts(990000002, ["ON"])
-        self.data.set_agent(990000002, channels=json.dumps(["LAZADA_SG"]))
+        self.data.set_agent(990000002, channels=["LAZADA_SG"])
         self.today = core.now().date()
 
     def raise_case(self, **over):

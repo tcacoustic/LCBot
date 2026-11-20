@@ -466,7 +466,7 @@ class Data(_Tables):
     def set_request_messages(self, tg: int, sent: list) -> None:
         self.db.update("join_requests", {"request_message_ids": sent}, telegram_id=f"eq.{tg}", status="eq.pending")
 
-    def decide(self, tg: int, *, approve: bool, by: int) -> dict | None:
+    def decide(self, tg: int, *, approve: bool, by: int, country: str | None = None) -> dict | None:
         """Settle a pending request. Returns it as it was, or None if there's no pending one."""
         pending = self.db.select("join_requests", telegram_id=f"eq.{tg}", status="eq.pending")
         if not pending:
@@ -477,7 +477,7 @@ class Data(_Tables):
                                              "decided_by_person_id": decider}, id=f"eq.{r['id']}")
             return self._request_row(r)
         pid = self.db.rpc("add_person", {"p_telegram_id": tg, "p_full_name": r["given_name"],
-                                         "p_nickname": None, "p_country_code": None})
+                                         "p_nickname": None, "p_country_code": country})
         self._pid[tg] = pid
         self.add_member(pid, requested_at=r["requested_at"], decided_at=at, decided_by_person_id=decider,
                         request_message_ids=r["request_message_ids"], dms_allowed=True)
