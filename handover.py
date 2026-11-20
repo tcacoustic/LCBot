@@ -745,9 +745,9 @@ def may_edit_cases(user_id: int) -> bool:
     return is_online(user_id) or admin_for(user_id, "ON")
 
 
-def case_button_label(r) -> str:
-    """One case on its button: order number and store (what tells cases apart);
-    the name only when there's no order number. Kept short to fit a phone."""
+def case_list_line(n: int, r) -> str:
+    """One case in the /cases message: number, name, order number and store,
+    in full (a button is one line on a phone, so it only carries the number)."""
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
     order = (r["order_no"] or "").strip()
     if order.lower() in ("none", "-", "na", "n/a"):
@@ -756,8 +756,8 @@ def case_button_label(r) -> str:
     mark = "↩️ " if r["handed_back"] else ("📣 " if r["origin"] == "on" and not r["sh_closed"] else "")
     tail = " ☑️SH" if r["sh_closed"] and not r["handed_back"] else (" ☑️ON" if r["on_closed"] else "")
     sla = f" {sla_mark(due)}" if sla_mark(due) else ""
-    who = order or (r["username"] or "?")
-    return f"{mark}{r['prio']} {who} · {store}{tail}{sla}"[:64]
+    parts = [esc(r["username"] or "?")] + ([f"<code>{esc(order)}</code>"] if order else []) + ([esc(store)] if store else [])
+    return f"<b>{n}.</b> {mark}{r['prio']} " + " · ".join(parts) + tail + sla
 
 
 CASES_PER_PAGE = 15
@@ -860,15 +860,19 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     lines = ["📋 <b>Open cases</b>", "", f"{len(rows)} open"]
     lines += ["", "📣 Online request · ↩️ handed back to SH",
               "☑️SH / ☑️ON one side has closed it",
-              "⏰ due today · 🚨 overdue", "", "<i>Tap a case to open it.</i>"]
+              "⏰ due today · 🚨 overdue", ""]
     # Own channels first, a page at a time: keeps it scannable on a phone and
     # well under Telegram's 100-button limit.
     ordered = [(r, True) for r in own] + [(r, False) for r in rest]
     pages = max(1, -(-len(ordered) // CASES_PER_PAGE))
     page = min(max(page, 0), pages - 1)
     here = f"cs:l:{page}"
-    buttons = [[InlineKeyboardButton(case_button_label(r), callback_data=f"cs:v:{r['id']}")]
-               for r, _ in ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]]
+    buttons = []
+    for i, (r, _) in enumerate(ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]):
+        n = page * CASES_PER_PAGE + i + 1
+        lines.append(case_list_line(n, r))
+        buttons.append([InlineKeyboardButton(str(n), callback_data=f"cs:v:{r['id']}")])
+    lines += ["", "<i>Tap a number to open that case.</i>"]
     if pages > 1:
         nav = []
         if page > 0:
