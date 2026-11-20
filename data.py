@@ -8,6 +8,7 @@ person is a `join_requests` row.
 from __future__ import annotations
 
 import datetime
+import json
 import time
 
 ROSTER_TTL_S = 60
@@ -29,13 +30,232 @@ def _in(values) -> str:
     return "in.(" + ",".join(str(v) for v in values) + ")"
 
 
-class Data:
+# ---------------------------------------------------------------------------- tables in the old shape
+# Feature code reads and writes the bot's own tables under their SQLite names and columns. Each entry:
+# new table name, {old column: new column}, and which old columns hold a person (a Telegram id in the
+# old shape, a person_id in the database).
+P = "person"
+TABLES: dict[str, tuple[str, dict[str, str], set[str]]] = {
+    "weeks": ("weeks", {"start_date": "starts_on", "end_date": "ends_on", "deadline": "deadline_at",
+                        "header_msg_id": "header_message_id"}, set()),
+    "days": ("days", {"the_date": "day_on", "msg_id": "message_id"}, set()),
+    "slots": ("slots", {}, set()),
+    "signups": ("signups", {"user_id": "person_id", "ts": "signed_at"}, {"user_id"}),
+    "confirmations": ("confirmations", {"user_id": "person_id", "ts": "confirmed_at"}, {"user_id"}),
+    "fixed_slots": ("fixed_slots", {"user_id": "person_id"}, {"user_id"}),
+    "presets": ("presets", {}, set()),
+    "drop_requests": ("drop_requests", {"agent_id": "agent_person_id", "target_id": "target_person_id",
+                                        "decided_by": "decided_by_person_id"},
+                      {"agent_id", "target_id", "decided_by"}),
+    "ot_claims": ("ot_claims", {"entry_id": "time_entry_id", "agent_id": "agent_person_id",
+                                "claimed_out": "claimed_out_at", "decided_by": "decided_by_person_id"},
+                  {"agent_id", "decided_by"}),
+    "reviews": ("reviews", {"agent_id": "agent_person_id", "the_date": "reviewed_on", "photo_id": "photo_file_id",
+                            "added_by": "added_by_person_id"}, {"agent_id", "added_by"}),
+    "pay_rates": ("pay_rates", {"agent_id": "agent_person_id", "effective_from": "effective_on",
+                                "created_by": "created_by_person_id"}, {"agent_id", "created_by"}),
+    "time_entries": ("time_entries", {"agent_id": "agent_person_id", "the_date": "worked_on",
+                                      "clock_in": "clock_in_at", "clock_out": "clock_out_at"}, {"agent_id"}),
+    "time_edits": ("time_edits", {"entry_id": "time_entry_id", "changed_by": "changed_by_person_id"},
+                   {"changed_by"}),
+    "handovers": ("handovers", {"agent_id": "agent_person_id", "the_date": "handover_on"}, {"agent_id"}),
+    "ho_cases": ("handover_cases", {"agent_id": "agent_person_id", "the_date": "handover_on", "prio": "priority",
+                                    "platform": "chat_platform", "store": "shop", "username": "customer_username",
+                                    "closed_by": "closed_by_person_id", "channel": "online_channel",
+                                    "sh_closed_by": "sh_closed_by_person_id", "on_closed_by": "on_closed_by_person_id",
+                                    "post_id": "chat_post_id"},
+                 {"agent_id", "closed_by", "sh_closed_by", "on_closed_by"}),
+}
+# Columns that were 0/1 integers in SQLite and are booleans now.
+BOARD_TABLES = {"weeks", "days", "slots", "signups", "confirmations"}
+BOOLEANS = {"closed", "sh_closed", "on_closed", "chat_posted", "handed_back", "pm_notified", "opening_posted",
+            "followup_done", "after_cutoff", "urgent", "sheet_dirty"}
+# jsonb columns the old code kept as JSON text: given and taken as text, so json.loads still works.
+JSON_TEXT = {("presets", "config")}
+
+
+class _Tables:
+    """Mixed into Data: rows(), row(), add(), change(), remove() on the old table names."""
+
+    def _spec(self, table):
+        return TABLES[table]
+
+    def _out_value(self, table, col, v):
+        new, cols, people = self._spec(table)
+        if col in people:
+            return self.person_id(v) if v is not None else None
+        if col in BOOLEANS and v is not None:
+            return bool(v)
+        if (table, col) in JSON_TEXT and isinstance(v, str):
+            return json.loads(v)
+        return v
+
+    def _filter(self, table, col, v) -> tuple[str, str]:
+        new, cols, people = self._spec(table)
+        name = cols.get(col, col)
+        if isinstance(v, tuple):              # ("gte", x), ("neq", x), ("not.is", None) ...
+            op, val = v
+            if op.endswith("is"):
+                return name, f"{op}.null" if val is None else f"{op}.{str(val).lower()}"
+            return name, f"{op}.{self._out_value(table, col, val)}"
+        if isinstance(v, (list, set, frozenset)):
+            vals = [self._out_value(table, col, x) for x in v]
+            return name, "in.(" + ",".join(f'"{x}"' for x in vals) + ")"
+        if v is None:
+            return name, "is.null"
+        val = self._out_value(table, col, v)
+        if isinstance(val, bool):
+            return name, f"is.{str(val).lower()}"
+        return name, f"eq.{val}"
+
+    def _filters(self, table, filters: dict) -> dict:
+        out, ands = {}, []
+        for col, v in filters.items():
+            if isinstance(v, tuple) and v and isinstance(v[0], tuple):   # (("gte", a), ("lt", b)) on one column
+                for cond in v:
+                    name, f = self._filter(table, col, cond)
+                    ands.append(f"{name}.{f}")
+                continue
+            name, f = self._filter(table, col, v)
+            out[name] = f
+        if ands:
+            out["and"] = "(" + ",".join(ands) + ")"
+        return out
+
+    def _back(self, table, rows: list[dict]) -> list[dict]:
+        new, cols, people = self._spec(table)
+        rev = {v: k for k, v in cols.items()}
+        pids = {r[cols.get(c, c)] for r in rows for c in people if r.get(cols.get(c, c))}
+        unknown = [p for p in pids if p not in self._tg]
+        if unknown:
+            self._people(id=_in(unknown))
+        out = []
+        for r in rows:
+            o = {}
+            for k, v in r.items():
+                old = rev.get(k, k)
+                if old in people:
+                    v = self._tg.get(v) if v else None
+                elif (table, old) in JSON_TEXT and v is not None and not isinstance(v, str):
+                    v = json.dumps(v)
+                o[old] = v
+            if table == "signups":             # the name on the board is the person's, as it is now
+                o["name"] = self._shown(o["user_id"])
+            out.append(o)
+        return out
+
+    def _board_changed(self, table):
+        if table in BOARD_TABLES:
+            self._boards.clear()
+
+    def board(self, week_id) -> dict | None:
+        """A week whole, in four reads, kept until the next write to the board:
+        {"week", "days": [...by idx], "slots": {day_id: [...by idx]}, "signups": {slot_id: [...by ts]},
+         "slot": {slot_id: slot + the_date, day_name, week_id}, "confirmed": {telegram id}}."""
+        if week_id in self._boards:
+            return self._boards[week_id]
+        week = self.row("weeks", id=week_id)
+        if not week:
+            return None
+        days = self.rows("days", week_id=week_id, order="idx")
+        slots = self.rows("slots", day_id=[x["id"] for x in days], order="idx") if days else []
+        signups = self.rows("signups", slot_id=[s["id"] for s in slots], order="ts") if slots else []
+        by_day, by_slot, slot = {x["id"]: [] for x in days}, {s["id"]: [] for s in slots}, {}
+        day_of = {x["id"]: x for x in days}
+        for s in slots:
+            by_day[s["day_id"]].append(s)
+            dd = day_of[s["day_id"]]
+            slot[s["id"]] = {**s, "the_date": dd["the_date"], "day_name": dd["name"], "week_id": week_id}
+        for su in signups:
+            by_slot[su["slot_id"]].append(su)
+        confirmed = {c["user_id"] for c in self.rows("confirmations", week_id=week_id)}
+        b = {"week": week, "days": days, "slots": by_day, "signups": by_slot, "slot": slot, "confirmed": confirmed}
+        self._boards[week_id] = b
+        return b
+
+    def slot_info(self, slot_id) -> dict | None:
+        """A slot with its day's date and name and its week: through the board, so cheap when it's loaded."""
+        for b in self._boards.values():
+            if slot_id in b["slot"]:
+                return b["slot"][slot_id]
+        s = self.row("slots", id=slot_id)
+        if not s:
+            return None
+        day = self.row("days", id=s["day_id"])
+        b = self.board(day["week_id"])
+        return b["slot"].get(slot_id) if b else None
+
+    def _shown(self, tg):
+        row = self._roster().get(tg)
+        return row["name"] if row else ""
+
+    def _order(self, table, order: str | None) -> dict:
+        if not order:
+            return {}
+        new, cols, people = self._spec(table)
+        parts = []
+        for o in order.split(","):
+            o = o.strip()
+            desc = o.startswith("-")
+            c = o.lstrip("-")
+            parts.append(cols.get(c, c) + (".desc" if desc else ""))
+        return {"order": ",".join(parts)}
+
+    def rows(self, table: str, *, order: str | None = None, limit: int | None = None, **filters) -> list[dict]:
+        params = {**self._filters(table, filters), **self._order(table, order)}
+        if limit:
+            params["limit"] = str(limit)
+        return self._back(table, self.db.select(self._spec(table)[0], **params))
+
+    def row(self, table: str, *, order: str | None = None, **filters) -> dict | None:
+        rows = self.rows(table, order=order, limit=1, **filters)
+        return rows[0] if rows else None
+
+    def count(self, table: str, **filters) -> int:
+        return len(self.db.select(self._spec(table)[0], select=self._count_col(table), **self._filters(table, filters)))
+
+    def _count_col(self, table):
+        new, cols, people = self._spec(table)
+        return "id" if table not in ("signups", "confirmations", "fixed_slots", "presets") else \
+            {"signups": "slot_id", "confirmations": "week_id", "fixed_slots": "label", "presets": "name"}[table]
+
+    def _values(self, table, values: dict) -> dict:
+        new, cols, people = self._spec(table)
+        return {cols.get(k, k): self._out_value(table, k, v) for k, v in values.items() if not
+                (table == "signups" and k == "name")}
+
+    def add(self, table: str, values, *, on_conflict: str | None = None, returning: bool = True):
+        """Insert one row (dict) or many (list). Returns the row(s) written, in the old shape."""
+        many = isinstance(values, list)
+        body = [self._values(table, v) for v in values] if many else self._values(table, values)
+        if on_conflict:
+            new, cols, people = self._spec(table)
+            on_conflict = ",".join(cols.get(c.strip(), c.strip()) for c in on_conflict.split(","))
+        out = self.db.insert(self._spec(table)[0], body, on_conflict=on_conflict, returning=returning)
+        self._board_changed(table)
+        if not returning:
+            return None
+        out = self._back(table, out or [])
+        return out if many else (out[0] if out else None)
+
+    def change(self, table: str, values: dict, **filters) -> list[dict]:
+        self._board_changed(table)
+        return self._back(table, self.db.update(self._spec(table)[0], self._values(table, values),
+                                                **self._filters(table, filters)))
+
+    def remove(self, table: str, **filters) -> list[dict]:
+        self._board_changed(table)
+        return self._back(table, self.db.delete(self._spec(table)[0], **self._filters(table, filters)))
+
+
+class Data(_Tables):
     def __init__(self, rest, *, clock=time.monotonic):
         self.db, self._clock = rest, clock
         self._pid: dict[int, str] = {}   # telegram id -> person id; neither changes once set
         self._tg: dict[str, int] = {}
         self._cache: tuple[float, dict] | None = None
         self._settings: tuple[float, dict] | None = None
+        self._boards: dict = {}
 
     # ------------------------------------------------------------------ identity
     def _people(self, **filters) -> list[dict]:

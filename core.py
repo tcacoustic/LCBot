@@ -981,22 +981,17 @@ def slot_run_from(slot_id: int):
     Someone rostered 10-12 and 12-2 clocks in once, so the entry has to cover
     both blocks rather than stopping at the end of the first.
     """
-    first = q1(
-        """SELECT s.id, s.label, s.start_min, s.day_id, d.the_date
-           FROM slots s JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    first = data.slot_info(slot_id)
     if not first:
         return []
-    holder = q1("SELECT user_id FROM signups WHERE slot_id=?", (slot_id,))
-    if not holder:
+    b = data.board(first["week_id"])
+    holders = b["signups"][slot_id]
+    if not holders:
         return [first]
-    same_day = q(
-        """SELECT s.id, s.label, s.start_min FROM slots s
-           JOIN signups su ON su.slot_id = s.id
-           WHERE s.day_id=? AND su.user_id=? ORDER BY s.start_min""",
-        (first["day_id"], holder["user_id"]),
-    )
+    holder = holders[0]["user_id"]
+    same_day = sorted((s for s in b["slots"][first["day_id"]]
+                       if any(h["user_id"] == holder for h in b["signups"][s["id"]])),
+                      key=lambda s: s["start_min"])
     run_ = [first]
     cursor = first["start_min"] + slot_minutes(first["label"])
     for cand in same_day:
@@ -1190,8 +1185,6 @@ DEPARTMENTS = [
     ("OPS", "Ops"),
 ]
 DEPT_NAMES = dict(DEPARTMENTS)
-# Livechat people, for the lists that are about shifts, avails and pay.
-IN_LIVECHAT = "user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT')"
 
 
 def viewing_as(user_id: int) -> str:
@@ -1272,17 +1265,14 @@ def role_of(user_id: int) -> str:
     return row["role"] if row and row["active"] else "agent"
 
 
-def open_week() -> sqlite3.Row | None:
-    return q1("SELECT * FROM weeks WHERE status='open' ORDER BY id DESC LIMIT 1")
+def open_week() -> dict | None:
+    return data.row("weeks", status="open", order="-start_date")
 
 
-def week_containing(d: date) -> sqlite3.Row | None:
+def week_containing(d: date) -> dict | None:
     """The week whose dates cover this day, whatever its status."""
-    return q1(
-        "SELECT * FROM weeks WHERE ? BETWEEN start_date AND end_date "
-        "ORDER BY id DESC LIMIT 1",
-        (d.isoformat(),),
-    )
+    return data.row("weeks", start_date=("lte", d.isoformat()), end_date=("gte", d.isoformat()),
+                    order="-start_date")
 
 
 def this_week() -> sqlite3.Row | None:
@@ -1302,23 +1292,13 @@ def latest_week() -> sqlite3.Row | None:
     stray test week posted later hides the week everyone is working.
     """
     today = now().date().isoformat()
-    row = q1("SELECT * FROM weeks WHERE status='open' ORDER BY id DESC LIMIT 1")
+    row = open_week() or week_containing(now().date())
     if row:
         return row
-    row = q1(
-        "SELECT * FROM weeks WHERE ? BETWEEN start_date AND end_date "
-        "ORDER BY id DESC LIMIT 1",
-        (today,),
-    )
+    row = data.row("weeks", start_date=("gte", today), order="start_date")
     if row:
         return row
-    row = q1(
-        "SELECT * FROM weeks WHERE start_date >= ? ORDER BY start_date LIMIT 1",
-        (today,),
-    )
-    if row:
-        return row
-    return q1("SELECT * FROM weeks ORDER BY end_date DESC, id DESC LIMIT 1")
+    return data.row("weeks", order="-end_date,-start_date")
 
 
 def touch_agent(user, dm_ok: int | None = None) -> None:
@@ -1336,9 +1316,9 @@ def touch_agent(user, dm_ok: int | None = None) -> None:
 
 
 def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    day = q1("SELECT * FROM days WHERE id=?", (day_id,))
-    week = q1("SELECT * FROM weeks WHERE id=?", (day["week_id"],))
-    slots = q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (day_id,))
+    day = data.row("days", id=day_id)
+    b = data.board(day["week_id"])
+    week, slots = b["week"], b["slots"][day_id]
     closed = week["status"] != "open"
 
     d = date.fromisoformat(day["the_date"])
@@ -1346,12 +1326,7 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
     buttons = []
 
     for s in slots:
-        names = [
-            r["name"]
-            for r in q(
-                "SELECT name FROM signups WHERE slot_id=? ORDER BY ts", (s["id"],)
-            )
-        ]
+        names = [r["name"] for r in b["signups"][s["id"]]]
         cap = s["capacity"] or SLOT_CAPACITY
         filled = ", ".join(names)
         if cap > 1 and names:
@@ -1381,44 +1356,28 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
 def apply_fixed_slots(week_id: int) -> int:
     """Put people with a fixed weekly pattern straight onto the new board."""
     filled = 0
-    rows = q(
-        """SELECT f.user_id, f.day_name, f.label, a.display_name, a.name
-           FROM fixed_slots f JOIN agents a ON a.user_id = f.user_id
-           WHERE a.status='active'"""
-    )
-    for r in rows:
-        slot = q1(
-            """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
-            (week_id, r["day_name"], r["label"]),
-        )
-        if not slot:
+    active = {a["user_id"] for a in data.agents(status="active")}
+    b = data.board(week_id)
+    for r in data.rows("fixed_slots"):
+        if r["user_id"] not in active:
             continue
-        taken = q1("SELECT 1 FROM signups WHERE slot_id=?", (slot["id"],))
-        if taken:
+        slot = next((s for s in b["slot"].values()
+                     if s["day_name"] == r["day_name"] and s["label"].lower() == r["label"].lower()), None)
+        if not slot or b["signups"][slot["id"]]:
             continue
-        cur = run(
-            "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-            (slot["id"], r["user_id"],
-             r["display_name"] or r["name"], now().isoformat()),
-        )
-        filled += cur.rowcount
+        if data.add("signups", {"slot_id": slot["id"], "user_id": r["user_id"], "ts": now().isoformat()},
+                    on_conflict="slot_id,user_id"):
+            filled += 1
     return filled
 
 
 def week_stats(week_id: int) -> dict:
-    roster = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND on_avails=1")
-    confirmed = {
-        r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
-    }
-    gaps = q(
-        """SELECT d.name, d.the_date, s.label, s.capacity,
-                  (SELECT COUNT(*) FROM signups WHERE slot_id = s.id) AS n
-           FROM slots s JOIN days d ON d.id = s.day_id
-           WHERE d.week_id = ?
-           ORDER BY d.idx, s.idx""",
-        (week_id,),
-    )
+    roster = data.agents(status="active", team="LIVECHAT", on_avails=True)
+    b = data.board(week_id)
+    confirmed = set(b["confirmed"])
+    gaps = [{"name": d["name"], "the_date": d["the_date"], "label": s["label"], "capacity": s["capacity"],
+             "n": len(b["signups"][s["id"]])}
+            for d in b["days"] for s in b["slots"][d["id"]]]
     return {
         "roster": roster,
         "confirmed": confirmed,
@@ -1431,15 +1390,14 @@ def week_stats(week_id: int) -> dict:
     }
 
 
-def slot_holders(slot_id: int) -> list[sqlite3.Row]:
-    return q(
-        "SELECT user_id, name FROM signups WHERE slot_id=? ORDER BY ts", (slot_id,)
-    )
+def slot_holders(slot_id) -> list[dict]:
+    info = data.slot_info(slot_id)
+    return list(data.board(info["week_id"])["signups"][slot_id]) if info else []
 
 
-def slot_capacity(slot_id: int) -> int:
+def slot_capacity(slot_id) -> int:
     """How many agents this particular slot takes."""
-    row = q1("SELECT capacity FROM slots WHERE id=?", (slot_id,))
+    row = data.slot_info(slot_id)
     if row and row["capacity"]:
         return row["capacity"]
     return SLOT_CAPACITY
@@ -1457,17 +1415,15 @@ def slot_taken_by(slot_id: int, user_id: int) -> str | None:
 
 def is_locked(week_id: int, user_id: int) -> bool:
     """A confirmed week is locked until the agent unlocks it."""
-    return bool(
-        q1("SELECT 1 FROM confirmations WHERE week_id=? AND user_id=?", (week_id, user_id))
-    )
+    b = data.board(week_id)
+    return bool(b and user_id in b["confirmed"])
 
 
 def tag_list(people, room: int = TG_LIMIT, ping: bool = True) -> str:
     """Everyone's @handle, or just their names when ping is off so a repost
     doesn't notify them again. Only cut short with +N if the message would
     otherwise go over Telegram's length limit."""
-    tags = [f"@{p['username']}" if ping and p["username"]
-            else esc(p["display_name"] or p["name"]) for p in people]
+    tags = [mention(p["user_id"], p["name"]) if ping else esc(p["name"]) for p in people]
     shown = []
     for i, tag in enumerate(tags):
         left = len(tags) - i - 1
@@ -1480,7 +1436,7 @@ def tag_list(people, room: int = TG_LIMIT, ping: bool = True) -> str:
 def render_board(week_id: int, compact: bool = False,
                  ping: bool = True) -> tuple[str, InlineKeyboardMarkup]:
     """The whole week in one message."""
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     st = week_stats(week_id)
     a, b = date.fromisoformat(w["start_date"]), date.fromisoformat(w["end_date"])
     deadline = datetime.fromisoformat(w["deadline"])
@@ -1502,17 +1458,13 @@ def render_board(week_id: int, compact: bool = False,
 
     rows: list[list[InlineKeyboardButton]] = []
 
-    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
+    bd = data.board(week_id)
+    for d in bd["days"]:
         the_date = date.fromisoformat(d["the_date"])
         lines += ["", f"<b>{d['name']} — {fmt_day(the_date)}</b>"]
         slot_buttons = []
-        for s in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (d["id"],)):
-            names = [
-                r["name"]
-                for r in q(
-                    "SELECT name FROM signups WHERE slot_id=? ORDER BY ts", (s["id"],)
-                )
-            ]
+        for s in bd["slots"][d["id"]]:
+            names = [r["name"] for r in bd["signups"][s["id"]]]
             cap = s["capacity"] or SLOT_CAPACITY
             if not names:
                 shown = "" if cap == 1 else f"(0/{cap})"
@@ -1562,7 +1514,7 @@ def render_board(week_id: int, compact: bool = False,
 
 
 async def refresh_board(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or not w["header_msg_id"]:
         return
     text, kb = render_board(week_id)
@@ -1591,7 +1543,7 @@ async def refresh_group(context: ContextTypes.DEFAULT_TYPE, week_id: int,
 
 
 def render_header(week_id: int, ping: bool = True) -> tuple[str, InlineKeyboardMarkup]:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     st = week_stats(week_id)
     a, b = date.fromisoformat(w["start_date"]), date.fromisoformat(w["end_date"])
     deadline = datetime.fromisoformat(w["deadline"])
@@ -1627,7 +1579,7 @@ def render_header(week_id: int, ping: bool = True) -> tuple[str, InlineKeyboardM
 
 
 async def refresh_day(context: ContextTypes.DEFAULT_TYPE, day_id: int) -> None:
-    day = q1("SELECT * FROM days WHERE id=?", (day_id,))
+    day = data.row("days", id=day_id)
     if not day or not day["msg_id"]:
         return
     text, kb = render_day(day_id)
@@ -1645,7 +1597,7 @@ async def refresh_day(context: ContextTypes.DEFAULT_TYPE, day_id: int) -> None:
 
 
 async def refresh_header(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or not w["header_msg_id"]:
         return
     text, kb = render_header(week_id)
@@ -1684,16 +1636,12 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer()
         return
 
-    slot_id = int(raw)
+    slot_id = raw
     user = query.from_user
 
-    row = q1(
-        """SELECT s.id, s.label, d.id AS day_id, d.name AS day_name,
-                  w.id AS week_id, w.status
-           FROM slots s JOIN days d ON d.id = s.day_id
-           JOIN weeks w ON w.id = d.week_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    row = data.slot_info(slot_id)
+    if row:
+        row = {**row, "status": data.board(row["week_id"])["week"]["status"]}
     if not row:
         await query.answer("That slot no longer exists.", show_alert=True)
         return
@@ -1710,9 +1658,7 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     async with write_lock:
         touch_agent(user)
-        existing = q1(
-            "SELECT 1 FROM signups WHERE slot_id=? AND user_id=?", (slot_id, user.id)
-        )
+        existing = any(h["user_id"] == user.id for h in slot_holders(slot_id))
         if not existing:
             holder = slot_taken_by(slot_id, user.id)
             if holder:
@@ -1722,14 +1668,10 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
         if existing:
-            run("DELETE FROM signups WHERE slot_id=? AND user_id=?", (slot_id, user.id))
+            data.remove("signups", slot_id=slot_id, user_id=user.id)
             note = f"Dropped {row['day_name']} {row['label']}"
         else:
-            run(
-                "INSERT INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                (slot_id, user.id, display_name_of(user.id, user.full_name),
-                 now().isoformat()),
-            )
+            data.add("signups", {"slot_id": slot_id, "user_id": user.id, "ts": now().isoformat()})
             note = f"✅ {row['day_name']} {row['label']}"
 
     await query.answer(note)
@@ -1741,9 +1683,9 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate_cb(query):
         return
     kind, raw = query.data.split(":", 1)
-    week_id = int(raw)
+    week_id = raw
     user = query.from_user
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
         await query.answer("This week is already closed.", show_alert=True)
         return
@@ -1759,10 +1701,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     show_alert=True,
                 )
                 return
-            run(
-                "DELETE FROM confirmations WHERE week_id=? AND user_id=?",
-                (week_id, user.id),
-            )
+            data.remove("confirmations", week_id=week_id, user_id=user.id)
             note = "🔓 Unlocked. Change your slots, then confirm again."
         else:
             if already:
@@ -1771,16 +1710,8 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     show_alert=True,
                 )
                 return
-            n = q1(
-                """SELECT COUNT(*) AS n FROM signups su
-                   JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
-                   WHERE d.week_id=? AND su.user_id=?""",
-                (week_id, user.id),
-            )["n"]
-            run(
-                "INSERT INTO confirmations (week_id, user_id, ts) VALUES (?,?,?)",
-                (week_id, user.id, now().isoformat()),
-            )
+            n = len(_my_slots(user.id, week_id))
+            data.add("confirmations", {"week_id": week_id, "user_id": user.id, "ts": now().isoformat()})
             note = (
                 f"✅ Confirmed — {n} slot(s), now locked."
                 if n
@@ -1792,15 +1723,8 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def _my_slots(user_id: int, week_id: int) -> set:
-    return {
-        r["slot_id"]
-        for r in q(
-            """SELECT su.slot_id FROM signups su
-               JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
-               WHERE d.week_id=? AND su.user_id=?""",
-            (week_id, user_id),
-        )
-    }
+    b = data.board(week_id)
+    return {sid for sid, hs in b["signups"].items() if any(h["user_id"] == user_id for h in hs)} if b else set()
 
 
 def _plan_footer(user_id: int, week_id: int, total: int) -> list:
@@ -1825,14 +1749,14 @@ def _plan_footer(user_id: int, week_id: int, total: int) -> list:
 
 def render_plan(user_id: int, week_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """Overview: one button per day, showing how many slots you hold."""
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     mine = _my_slots(user_id, week_id)
     confirmed = is_locked(week_id, user_id)
 
     lines = [f"🗓 <b>Your week — {w['label']}</b>", ""]
     rows = []
-    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
-        slots = q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (d["id"],))
+    for d in data.board(week_id)["days"]:
+        slots = data.board(week_id)["slots"][d["id"]]
         picked = [s["label"] for s in slots if s["id"] in mine]
         free = sum(
             1 for s in slots
@@ -1867,7 +1791,7 @@ def render_plan(user_id: int, week_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
 def render_plan_day(user_id: int, day_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """One day at a time — far less to read than the whole week."""
-    d = q1("SELECT * FROM days WHERE id=?", (day_id,))
+    d = data.row("days", id=day_id)
     week_id = d["week_id"]
     mine = _my_slots(user_id, week_id)
     confirmed = is_locked(week_id, user_id)
@@ -1875,7 +1799,7 @@ def render_plan_day(user_id: int, day_id: int) -> tuple[str, InlineKeyboardMarku
 
     lines = [f"🗓 <b>{d['name']} — {fmt_day(the_date)}</b>", ""]
     rows = []
-    for s in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (day_id,)):
+    for s in data.board(week_id)["slots"][day_id]:
         holders = slot_holders(s["id"])
         cap = s["capacity"] or SLOT_CAPACITY
         if s["id"] in mine:
@@ -1980,13 +1904,25 @@ def day_row_for(the_date: str):
     Old closed weeks can cover the same dates, so always prefer the newest —
     otherwise the rota is read out of a week nobody is working any more.
     """
-    return q1(
-        """SELECT d.* FROM days d JOIN weeks w ON w.id = d.week_id
-           WHERE d.the_date=?
-           ORDER BY CASE w.status WHEN 'open' THEN 0 ELSE 1 END, w.id DESC
-           LIMIT 1""",
-        (the_date,),
-    )
+    days = data.rows("days", the_date=the_date)
+    if not days:
+        return None
+    weeks = {w["id"]: w for w in data.rows("weeks", id=[d["week_id"] for d in days])}
+    days.sort(key=lambda d: weeks[d["week_id"]]["start_date"], reverse=True)   # newest week first
+    days.sort(key=lambda d: weeks[d["week_id"]]["status"] != "open")             # the open one before all
+    return days[0]
+
+
+def signups_on(the_date: str) -> list[dict]:
+    """Every signup on a date, across weeks, with the slot's label, start and day name, by start time."""
+    out = []
+    for d in data.rows("days", the_date=the_date):
+        b = data.board(d["week_id"])
+        for s in b["slots"][d["id"]]:
+            for h in b["signups"][s["id"]]:
+                out.append({**h, "label": s["label"], "start_min": s["start_min"], "day_name": d["name"],
+                            "the_date": the_date, "slot_id": s["id"]})
+    return sorted(out, key=lambda r: r["start_min"])
 
 
 def current_slot_for(agent_id: int, when: datetime):
@@ -1995,13 +1931,10 @@ def current_slot_for(agent_id: int, when: datetime):
     day = day_row_for(when.date().isoformat())
     if not day:
         return None
-    rows = q(
-        """SELECT s.id, s.label, s.start_min, d.name AS day_name, d.the_date
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE su.user_id=? AND d.id=? ORDER BY s.start_min""",
-        (agent_id, day["id"]),
-    )
+    b = data.board(day["week_id"])
+    rows = sorted((b["slot"][s["id"]] for s in b["slots"][day["id"]]
+                   if any(h["user_id"] == agent_id for h in b["signups"][s["id"]])),
+                  key=lambda s: s["start_min"])
     if not rows:
         return None
     # closest slot start within a couple of hours either side
@@ -2252,13 +2185,11 @@ def online_team() -> list:
     """Everyone in the Online team. On the test bot (TEST_MODE) the owner
     counts too once they've picked channels, even while back on the SH side,
     so one person can test both sides."""
-    rows = q("SELECT * FROM agents WHERE status='active' AND user_id IN "
-             "(SELECT user_id FROM memberships WHERE dept='ON')")
+    rows = data.agents(status="active", team="ON")
     if TEST_MODE:
         seen = {r["user_id"] for r in rows}
-        rows += [r for r in q("SELECT * FROM agents WHERE channels IS NOT NULL "
-                              "AND channels <> '[]'")
-                 if is_owner(r["user_id"]) and r["user_id"] not in seen]
+        rows += [r for r in data.agents() if r["channels"]
+                 and is_owner(r["user_id"]) and r["user_id"] not in seen]
     return rows
 
 
@@ -3027,7 +2958,7 @@ def inspect_db(path: str) -> dict:
 
 
 async def nudge(context: ContextTypes.DEFAULT_TYPE, week_id: int, prefix: str) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
         return
     st = week_stats(week_id)
@@ -3061,14 +2992,14 @@ async def job_nudge(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def close_week(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
         return
-    run("UPDATE weeks SET status='closed' WHERE id=?", (week_id,))
+    data.change("weeks", {"status": "closed"}, id=week_id)
     if BOARD_MODE == "single":
         await refresh_board(context, week_id)
     else:
-        for d in q("SELECT id FROM days WHERE week_id=?", (week_id,)):
+        for d in data.board(week_id)["days"]:
             await refresh_day(context, d["id"])
         await refresh_header(context, week_id)
 
@@ -3098,31 +3029,22 @@ async def job_close(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def mention(user_id: int, name: str) -> str:
-    """@handle if they have one, otherwise a clickable name that still pings."""
-    a = q1("SELECT username FROM agents WHERE user_id=?", (user_id,))
-    if a and a["username"]:
-        return f"@{a['username']}"
-    return f'<a href="tg://user?id={user_id}">{esc(name)}</a>'
+    """A clickable name that pings its person, by Telegram id: no @username needed."""
+    return f'<a href="tg://user?id={int(user_id)}">{esc(name)}</a>'
 
 
 async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Every evening, DM everyone working tomorrow."""
     tomorrow = (now() + timedelta(days=1)).date()
-    rows = q(
-        """SELECT su.user_id, su.name, s.label, s.start_min, d.name AS day_name
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE d.the_date = ? ORDER BY s.start_min""",
-        (tomorrow.isoformat(),),
-    )
+    rows = signups_on(tomorrow.isoformat())
     if not rows:
         return
-    by_user: dict[int, list[sqlite3.Row]] = {}
+    by_user: dict[int, list[dict]] = {}
     for r in rows:
         by_user.setdefault(r["user_id"], []).append(r)
 
     for user_id, shifts in by_user.items():
-        agent = q1("SELECT * FROM agents WHERE user_id=?", (user_id,))
+        agent = data.agent(user_id)
         if agent and not agent["dm_ok"]:
             continue
         slots = "\n".join(f"  • {s['label']}" for s in shifts)
@@ -3134,7 +3056,7 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.send_message(user_id, text)
         except Forbidden:
-            run("UPDATE agents SET dm_ok=0 WHERE user_id=?", (user_id,))
+            data.set_agent(user_id, dm_ok=False)
         except Exception as e:
             log.warning("Reminder to %s failed: %s", user_id, e)
         await asyncio.sleep(0.05)
@@ -3408,10 +3330,10 @@ async def publish_command_menus(app: Application) -> None:
             )
             elevated = set(ADMIN_IDS) | {
                 r["user_id"]
-                for r in q("SELECT user_id FROM agents WHERE role='admin' AND active=1")
+                for r in data.agents(role="admin", active=True)
             } | {
                 r["user_id"]            # anyone in a team other than Livechat
-                for r in q("SELECT user_id FROM memberships WHERE dept<>'LIVECHAT'")
+                for r in data.agents() if r["teams"] - {"LIVECHAT"}
             }
             for uid in elevated:
                 await refresh_menu_for(bot, uid)
