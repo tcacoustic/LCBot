@@ -350,7 +350,7 @@ async def cmd_addreview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     context.user_data["review_for"] = row["user_id"]
     context.user_data["review_note"] = " ".join(context.args[1:]).strip()
-    nm = row["display_name"] or row["name"]
+    nm = row["name"]
     await update.message.reply_text(
         f"Crediting a review to <b>{esc(nm)}</b>.\n\n"
         "Send the screenshot now, or <code>skip</code> to record it without one.",
@@ -522,7 +522,7 @@ async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("No one matches that. Check /roster.")
             return
         agent_id = row["user_id"]
-        who = row["display_name"] or row["name"]
+        who = row["name"]
 
     today = now().date()
     async with write_lock:
@@ -551,7 +551,7 @@ def week_report(first: date, last: date) -> str:
     # ---- hours and pay per agent
     people = []
     total_min = total_cents = 0
-    for a in q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name"):
+    for a in data.agents(status="active", team="LIVECHAT"):
         t = timesheet(a["user_id"], first, last)
         revs = len(reviews_for(a["user_id"], first, last))
         if not t["shifts"] and not revs and not t["open"]:
@@ -564,7 +564,7 @@ def week_report(first: date, last: date) -> str:
     if people:
         lines.append("<b>Worked</b>")
         for a, t, revs, rc in sorted(people, key=lambda x: -x[1]["minutes"]):
-            nm = a["display_name"] or a["name"]
+            nm = a["name"]
             bit = f"{esc(nm)} — {len(t['shifts'])} shift(s), {hhmm(t['minutes'])}"
             if t.get("overtime"):
                 bit += f" (+{hhmm(t['overtime'])} OT)"
@@ -591,7 +591,7 @@ def week_report(first: date, last: date) -> str:
     for r in auto:
         if is_salaried(r["agent_id"]):
             continue
-        who = r["display_name"] or r["name"]
+        who = r["name"]
         flags.append(
             f"⏰ {esc(who)} missed a clock-out on "
             f"{date.fromisoformat(r['the_date']).strftime('%a')} "
@@ -605,7 +605,7 @@ def week_report(first: date, last: date) -> str:
         (first.isoformat(), last.isoformat()),
     )
     for r in unros:
-        who = r["display_name"] or r["name"]
+        who = r["name"]
         flags.append(
             f"❓ {esc(who)} clocked in unrostered on "
             f"{date.fromisoformat(r['the_date']).strftime('%a')} (#{r['id']})"
@@ -629,7 +629,7 @@ def week_report(first: date, last: date) -> str:
         (first.isoformat(), last.isoformat(), today.isoformat()),
     )
     for r in noshow:
-        who = r["display_name"] or r["name"]
+        who = r["name"]
         flags.append(
             f"🚫 {esc(who)} never clocked in for "
             f"{r['day_name']} {r['label']}"
@@ -781,7 +781,7 @@ async def cmd_addtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     fresh = q1("SELECT * FROM time_entries WHERE id=?", (new_id,))
     base, ot = entry_split(fresh)
     cents = round((base + ot) / 60 * rate_for(row["user_id"], the_day))
-    nm = row["display_name"] or row["name"]
+    nm = row["name"]
 
     msg = [
         f"✅ Added <code>#{new_id}</code> for <b>{esc(nm)}</b>",
@@ -872,7 +872,7 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         (who["user_id"], first.isoformat(), last.isoformat()),
     )
 
-    nm = who["display_name"] or who["name"]
+    nm = who["name"]
     lines = [f"🔍 <b>{esc(nm)} — {esc(span)}</b>", ""]
 
     covered, merged, missed = set(), [], []
@@ -989,7 +989,7 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if who:
         t = timesheet(who["user_id"], first, last)
-        nm = who["display_name"] or who["name"]
+        nm = who["name"]
         lines = [
             f"🕐 <b>{esc(nm)} — {esc(span)}</b>", ""
         ]
@@ -1037,12 +1037,12 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines = [f"🕐 <b>Team hours — {esc(span)}</b>", ""]
     total_min = total_cents = 0
     any_rows = False
-    for a in q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name"):
+    for a in data.agents(status="active", team="LIVECHAT"):
         t = timesheet(a["user_id"], first, last)
         if not t["shifts"] and not t["open"]:
             continue
         any_rows = True
-        nm = a["display_name"] or a["name"]
+        nm = a["name"]
         row = f"{esc(nm)} — {t['days']}d · {hhmm(t['minutes'])}"
         if is_salaried(a["user_id"]):
             row += " · salaried"
@@ -1092,7 +1092,7 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ) if r["slot_id"] else None
             wr.writerow([
                 r["id"],
-                a["display_name"] or a["name"],
+                a["name"],
                 a["user_id"],
                 "yes" if is_salaried(a["user_id"]) else "no",
                 sh["date"].isoformat(),
@@ -1412,7 +1412,7 @@ async def cmd_clockoutfor(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     if not entry:
         await update.message.reply_text(
-            f"{esc(row['display_name'] or row['name'])} isn't clocked in.",
+            f"{esc(row["name"])} isn't clocked in.",
             parse_mode=constants.ParseMode.HTML,
         )
         return
@@ -1447,7 +1447,7 @@ async def cmd_clockoutfor(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     fresh = q1("SELECT * FROM time_entries WHERE id=?", (entry["id"],))
     mins = entry_minutes(fresh)
-    nm = row["display_name"] or row["name"]
+    nm = row["name"]
     await update.message.reply_text(
         f"✅ Clocked out <b>{esc(nm)}</b> at {out.strftime('%-d %b %H:%M')}\n"
         f"Shift logged: <b>{hhmm(mins)}</b>\n\n"

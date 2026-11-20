@@ -235,13 +235,13 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await ask_store(context.bot, update.effective_user.id, row["user_id"])
             return
         await update.message.reply_text(
-            f"<b>Which country does {esc(row['display_name'] or row['name'])} do visits in?</b>",
+            f"<b>Which country does {esc(row["name"])} do visits in?</b>",
             parse_mode=constants.ParseMode.HTML, reply_markup=country_picker(row["user_id"]))
         return
     lines = ["<b>On-Site Specialists</b>", ""]
     for c, flag, name, _ in COUNTRIES:
         team = specialists_in(c)
-        lines.append(f"{flag} {name}: " + (", ".join(esc(r["display_name"] or r["name"])
+        lines.append(f"{flag} {name}: " + (", ".join(esc(r["name"])
                                                     for r in team) or "<i>none</i>"))
     fs = q("SELECT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
            "WHERE m.dept='FS' AND a.status='active' ORDER BY a.name")
@@ -251,12 +251,12 @@ async def cmd_specialists(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             here = [r for r in fs if r["store"] == code]
             if here:
                 lines.append(f"{COUNTRY_NAMES[c]} {esc(name)}: " + ", ".join(
-                    esc(r["display_name"] or r["name"]) for r in here))
+                    esc(r["name"]) for r in here))
     unset = q("SELECT DISTINCT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
               "WHERE a.status='active' AND ((m.dept='ONSITE' AND a.country IS NULL) "
               "OR (m.dept='FS' AND a.store IS NULL))")
     if unset:
-        lines += ["", "No country or store yet: " + ", ".join(esc(r["display_name"] or r["name"])
+        lines += ["", "No country or store yet: " + ", ".join(esc(r["name"])
                                                       for r in unset)]
     lines += ["", "Set someone's country: <code>/specialists @username</code>"]
     await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
@@ -975,7 +975,7 @@ def visits_payload(user_id: int, week: str = "", country: str = "", spec: str = 
                    avail: str = "") -> dict:
     role = visit_role(user_id)
     countries = [{"code": c, "name": COUNTRY_NAMES[c],
-                  "specialists": [{"id": r["user_id"], "name": r["display_name"] or r["name"]}
+                  "specialists": [{"id": r["user_id"], "name": r["name"]}
                                   for r in specialists_in(c)]} for c, _, _, _ in COUNTRIES]
     if role == "specialist":
         me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))

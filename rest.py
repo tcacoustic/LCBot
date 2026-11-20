@@ -62,10 +62,12 @@ class RestClient:
     def select(self, table: str, *, schema: str | None = None, **params) -> list[dict]:
         return self._call("GET", table, params, schema=schema)
 
-    def insert(self, table: str, rows, *, on_conflict: str | None = None, returning: bool = True) -> list[dict] | None:
-        """`returning=False` for a table the role may write but not read (time_edits): the answer would need select."""
+    def insert(self, table: str, rows, *, on_conflict: str | None = None, returning: bool = True,
+               ignore: bool = False) -> list[dict] | None:
+        """`returning=False` for a table the role may write but not read (time_edits): the answer would need select.
+        With on_conflict, a clash updates the row, or with ignore=True leaves it (and isn't returned)."""
         prefer = ("return=representation" if returning else "return=minimal") + (
-            ",resolution=merge-duplicates" if on_conflict else "")
+            (",resolution=ignore-duplicates" if ignore else ",resolution=merge-duplicates") if on_conflict else "")
         params = {"on_conflict": on_conflict} if on_conflict else {}
         return self._call("POST", table, params, rows, prefer=prefer)
 

@@ -165,7 +165,8 @@ class _Tables:
         for s in slots:
             by_day[s["day_id"]].append(s)
             dd = day_of[s["day_id"]]
-            slot[s["id"]] = {**s, "the_date": dd["the_date"], "day_name": dd["name"], "week_id": week_id}
+            slot[s["id"]] = {**s, "the_date": dd["the_date"], "day_name": dd["name"], "week_id": week_id,
+                             "status": week["status"]}
         for su in signups:
             by_slot[su["slot_id"]].append(su)
         confirmed = {c["user_id"] for c in self.rows("confirmations", week_id=week_id)}
@@ -224,14 +225,15 @@ class _Tables:
         return {cols.get(k, k): self._out_value(table, k, v) for k, v in values.items() if not
                 (table == "signups" and k == "name")}
 
-    def add(self, table: str, values, *, on_conflict: str | None = None, returning: bool = True):
+    def add(self, table: str, values, *, on_conflict: str | None = None, returning: bool = True,
+            ignore: bool = False):
         """Insert one row (dict) or many (list). Returns the row(s) written, in the old shape."""
         many = isinstance(values, list)
         body = [self._values(table, v) for v in values] if many else self._values(table, values)
         if on_conflict:
             new, cols, people = self._spec(table)
             on_conflict = ",".join(cols.get(c.strip(), c.strip()) for c in on_conflict.split(","))
-        out = self.db.insert(self._spec(table)[0], body, on_conflict=on_conflict, returning=returning)
+        out = self.db.insert(self._spec(table)[0], body, on_conflict=on_conflict, returning=returning, ignore=ignore)
         self._board_changed(table)
         if not returning:
             return None

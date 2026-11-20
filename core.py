@@ -1366,7 +1366,7 @@ def apply_fixed_slots(week_id: int) -> int:
         if not slot or b["signups"][slot["id"]]:
             continue
         if data.add("signups", {"slot_id": slot["id"], "user_id": r["user_id"], "ts": now().isoformat()},
-                    on_conflict="slot_id,user_id"):
+                    on_conflict="slot_id,user_id", ignore=True):
             filled += 1
     return filled
 
@@ -1388,6 +1388,52 @@ def week_stats(week_id: int) -> dict:
         ],
         "total_slots": len(gaps),
     }
+
+
+def week_slots(week_id, since: str | None = None, held_by: int | None = None) -> list[dict]:
+    """A week's slots in board order (day, then slot), each with its day's the_date, day_name and
+    week_id (and "name" = the day name, as the old joins selected it). Optionally only from a date
+    on, or only the ones someone holds."""
+    b = data.board(week_id)
+    if not b:
+        return []
+    out = []
+    for d in b["days"]:
+        if since and d["the_date"] < since:
+            continue
+        for s in b["slots"][d["id"]]:
+            if held_by is not None and not any(h["user_id"] == held_by for h in b["signups"][s["id"]]):
+                continue
+            out.append({**b["slot"][s["id"]], "name": d["name"], "n": len(b["signups"][s["id"]])})
+    return out
+
+
+def find_slot(week_id, day: str | None, label: str) -> dict | None:
+    """A slot by day name and label (label case-blind). Day None: the first with that label."""
+    return next((s for s in week_slots(week_id)
+                 if (day is None or s["day_name"] == day) and s["label"].lower() == label.lower()), None)
+
+
+def give_slot(slot_id, user_id: int) -> bool:
+    """Put someone on a slot unless they're already on it. True if they weren't."""
+    return bool(data.add("signups", {"slot_id": slot_id, "user_id": user_id, "ts": now().isoformat()},
+                         on_conflict="slot_id,user_id", ignore=True))
+
+
+def take_slot(slot_id, user_id: int) -> bool:
+    """Take someone off a slot. True if they were on it."""
+    return bool(data.remove("signups", slot_id=slot_id, user_id=user_id))
+
+
+def reorder_day(day_id) -> None:
+    """Number a day's slots in time order again, after one is added or removed."""
+    for i, s in enumerate(sorted(data.rows("slots", day_id=day_id), key=lambda s: (s["start_min"], s["idx"]))):
+        if s["idx"] != i:
+            data.change("slots", {"idx": i}, id=s["id"])
+
+
+def holds(slot_id, user_id: int) -> bool:
+    return any(h["user_id"] == user_id for h in slot_holders(slot_id))
 
 
 def slot_holders(slot_id) -> list[dict]:
@@ -1640,8 +1686,6 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = query.from_user
 
     row = data.slot_info(slot_id)
-    if row:
-        row = {**row, "status": data.board(row["week_id"])["week"]["status"]}
     if not row:
         await query.answer("That slot no longer exists.", show_alert=True)
         return

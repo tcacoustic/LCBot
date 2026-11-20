@@ -778,9 +778,9 @@ async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         on = data.agents(status="active", team="LIVECHAT", tag_calls=True)
         off = data.agents(status="active", team="LIVECHAT", tag_calls=False)
         lines = [f"<b>Tagged in the nightly post ({len(on)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in on] or ["  nobody"]
         lines += ["", f"<b>Not tagged ({len(off)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in off] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in off] or ["  nobody"]
         lines += [
             "",
             "<code>/tag off @handle</code> — stop pinging them",
@@ -825,9 +825,9 @@ async def cmd_salaried(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         sal = data.agents(status="active", team="LIVECHAT", salaried=True)
         hourly = data.agents(status="active", team="LIVECHAT", salaried=False)
         lines = [f"<b>Salaried — no hourly pay ({len(sal)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in sal] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in sal] or ["  nobody"]
         lines += ["", f"<b>Paid hourly ({len(hourly)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in hourly] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in hourly] or ["  nobody"]
         lines += [
             "",
             "<code>/salaried on @handle</code> — stop hourly pay",
@@ -879,9 +879,9 @@ async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         on = data.agents(status="active", team="LIVECHAT", on_avails=True)
         off = data.agents(status="active", team="LIVECHAT", on_avails=False)
         lines = [f"<b>On the avails roster ({len(on)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in on] or ["  nobody"]
         lines += ["", f"<b>Not tagged or chased ({len(off)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in off] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in off] or ["  nobody"]
         lines += [
             "",
             "<code>/avails off @handle</code> — stop tagging them",

@@ -72,3 +72,12 @@ class TablesTest(LiveTestCase):
         self.assertEqual([s["name"] for s in b["signups"][self.slot["id"]]], ["Jia"])
         info = self.data.slot_info(self.slot["id"])
         self.assertEqual((info["the_date"], info["day_name"], info["week_id"]), ("2026-11-23", "MON", self.week["id"]))
+
+    def test_insert_or_ignore_keeps_the_first(self):
+        first = self.data.add("signups", {"slot_id": self.slot["id"], "user_id": 990000001, "ts": "2026-11-20T10:00:00+08:00"},
+                              on_conflict="slot_id,user_id", ignore=True)
+        again = self.data.add("signups", {"slot_id": self.slot["id"], "user_id": 990000001, "ts": "2026-11-21T10:00:00+08:00"},
+                              on_conflict="slot_id,user_id", ignore=True)
+        self.assertIsNotNone(first)
+        self.assertIsNone(again)
+        self.assertEqual(self.data.rows("signups")[0]["ts"], "2026-11-20T10:00:00+08:00")

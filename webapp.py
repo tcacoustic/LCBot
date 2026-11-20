@@ -37,7 +37,7 @@ def miniapp_payload(user_id: int) -> dict:
         agent = conn.execute(
             "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
         ).fetchone()
-        name = (agent["display_name"] or agent["name"] or "You") if agent else "You"
+        name = (agent["name"] or "You") if agent else "You"
 
         today = now().date()
         first = today.replace(day=1)
@@ -164,7 +164,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
         rows.append({
             "id": a["user_id"],
             "idle": idle,
-            "name": a["display_name"] or a["name"],
+            "name": a["name"],
             "shifts": len(t["shifts"]),
             "minutes": t["minutes"],
             "hours": hhmm(t["minutes"]),
@@ -347,7 +347,7 @@ def home_payload(user_id: int) -> dict:
         a = conn.execute(
             "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
         ).fetchone()
-        name = (a["display_name"] or a["name"]) if a else "You"
+        name = (a["name"]) if a else "You"
     finally:
         conn.close()
 
@@ -1096,7 +1096,7 @@ def agent_payload(agent_id: int, mode: str, first: date) -> dict:
         ):
             missed.append(f"{row['day_name']} {row['label']}")
 
-    a = q1("SELECT * FROM agents WHERE user_id=?", (agent_id,))
+    a = data.agent(agent_id)
     return {
         "id": agent_id,
         "name": display_name_of(agent_id, ""),
@@ -1123,7 +1123,7 @@ def agent_payload(agent_id: int, mode: str, first: date) -> dict:
 
 def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
     """Change one of an agent's settings from the Team screen."""
-    row = q1("SELECT * FROM agents WHERE user_id=?", (agent_id,))
+    row = data.agent(agent_id)
     if not row:
         return {"ok": False, "error": "No such agent."}
 
@@ -1269,7 +1269,7 @@ def person_dict(r) -> dict:
     uid = r["user_id"]
     teams = teams_of(uid)
     return {
-        "id": uid, "name": r["display_name"] or r["name"] or "", "username": r["username"] or "",
+        "id": uid, "name": r["name"] or "", "username": r["username"] or "",
         "teams": teams, "admin": bool(is_owner(uid) or r["role"] == "admin"), "owner": is_owner(uid),
         "fullAdmin": r["role"] == "admin" and is_full_admin(uid),
         "adminTeams": [k for k, _ in DEPARTMENTS if k in admin_teams(uid)] if r["role"] == "admin" else [],
@@ -1286,7 +1286,7 @@ def admin_people_payload(user_id: int) -> dict:
     for r in q("SELECT * FROM agents WHERE status='pending' ORDER BY requested_at DESC"):
         at = datetime.fromisoformat(r["requested_at"]) if r["requested_at"] else None
         pending.append({
-            "id": r["user_id"], "name": r["display_name"] or r["name"] or "",
+            "id": r["user_id"], "name": r["name"] or "",
             "username": r["username"] or "",
             "tgName": r["name"] if (r["name"] or "").lower() != (r["display_name"] or "").lower() else "",
             "day": at.strftime("%a %-d %b") if at else "",
@@ -1328,7 +1328,7 @@ def web_admin_approve(admin_id: int, body: dict) -> dict:
         uid = int(body.get("id", 0))
     except (TypeError, ValueError):
         uid = 0
-    row = q1("SELECT * FROM agents WHERE user_id=?", (uid,))
+    row = data.agent(uid)
     if not row:
         return {"ok": False, "error": "That request no longer exists."}
     if row["status"] != "pending":
@@ -1359,7 +1359,7 @@ def web_admin_decline(admin_id: int, body: dict) -> dict:
         uid = int(body.get("id", 0))
     except (TypeError, ValueError):
         uid = 0
-    row = q1("SELECT * FROM agents WHERE user_id=?", (uid,))
+    row = data.agent(uid)
     if not row or row["status"] != "pending":
         return {"ok": False, "error": "That request was already handled."}
     run("UPDATE agents SET status='declined', decided_by=?, decided_at=? WHERE user_id=?",
@@ -1373,7 +1373,7 @@ async def after_access(bot, row, admin_id: int, approve: bool) -> None:
     """The Telegram side of a decision made in the App: the request messages
     the admins got say who decided, and the person is told."""
     uid = row["user_id"]
-    shown = row["display_name"] or row["name"]
+    shown = row["name"]
     verdict = "approved ✅" if approve else "declined 🚫"
     try:
         sent = json.loads(row["req_msgs"] or "[]")
@@ -1484,7 +1484,7 @@ def web_admin_person(admin_id: int, body: dict) -> dict:
     log.info("%s set %s for %s in the App", admin_id, field, uid)
     if menus:
         on_bot_loop(refresh_menu_for(bot_ref(), uid))
-    return {"ok": True, "person": person_dict(q1("SELECT * FROM agents WHERE user_id=?", (uid,)))}
+    return {"ok": True, "person": person_dict(data.agent(uid))}
 
 
 def web_has_access(user_id: int) -> bool:
