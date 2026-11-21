@@ -14,11 +14,7 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     when = now()
 
-    open_row = q1(
-        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
-        "ORDER BY id DESC LIMIT 1",
-        (user.id,),
-    )
+    open_row = data.row("time_entries", agent_id=user.id, clock_out=None, order="-clock_in")
     if open_row:
         started = datetime.fromisoformat(open_row["clock_in"])
         given = " ".join(context.args).strip() if context.args else ""
@@ -35,17 +31,10 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # They're mid-shift and now telling me which one it is.
             nice_name = display_name_of(user.id, user.full_name)
             _d = day_row_for(open_row["the_date"])
-            match = q1(
-                """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
-                   WHERE d.id=? AND lower(s.label)=lower(?)""",
-                (_d["id"], given),
-            ) if _d else None
+            match = find_slot(_d["week_id"], _d["name"], given) if _d else None
             async with write_lock:
-                run(
-                    "UPDATE time_entries SET slot_id=COALESCE(?, slot_id), "
-                    "shift_label=?, opening_posted=1 WHERE id=?",
-                    (match["id"] if match else None, given, open_row["id"]),
-                )
+                data.change("time_entries", {"slot_id": match["id"] if match else open_row["slot_id"],
+                                             "shift_label": given, "opening_posted": 1}, id=open_row["id"])
             block = opening_block(user.id, nice_name, given)
             posted = await post_ops(context.bot, block)
             if not posted:
@@ -78,44 +67,28 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if override:
         # Covering a shift, or clocking in for a block they aren't rostered on.
         _d = day_row_for(when.date().isoformat())
-        slot = q1(
-            """SELECT s.id, s.label, s.start_min, d.name AS day_name
-               FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.id=? AND lower(s.label)=lower(?)""",
-            (_d["id"], override),
-        ) if _d else None
+        slot = find_slot(_d["week_id"], _d["name"], override) if _d else None
         slot_text = slot["label"] if slot else override
     else:
         slot = current_slot_for(user.id, when)
         slot_text = slot["label"] if slot else "—"
 
     async with write_lock:
-        run(
-            "INSERT INTO time_entries (agent_id, slot_id, the_date, clock_in, status) "
-            "VALUES (?,?,?,?,'open')",
-            (user.id, slot["id"] if slot else None,
-             when.date().isoformat(), when.isoformat()),
-        )
+        entry = data.add("time_entries", {"agent_id": user.id, "slot_id": slot["id"] if slot else None,
+                                          "the_date": when.date().isoformat(), "clock_in": when.isoformat(),
+                                          "status": "open"})
 
     nice_name = display_name_of(user.id, user.full_name)
 
     if not slot and not override:
         # Nothing to name the shift after — ask rather than posting a dash.
-        entry = q1(
-            "SELECT id FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
-            "ORDER BY id DESC LIMIT 1",
-            (user.id,),
-        )
         today_row = day_row_for(when.date().isoformat())
-        today_slots = q(
-            "SELECT id, label FROM slots WHERE day_id=? ORDER BY idx",
-            (today_row["id"],),
-        ) if today_row else []
+        today_slots = data.board(today_row["week_id"])["slots"][today_row["id"]] if today_row else []
         rows, row = [], []
         for sl in today_slots:
             row.append(
                 InlineKeyboardButton(
-                    sl["label"], callback_data=f"ci:{entry['id']}:{sl['id']}"
+                    sl["label"], callback_data=f"ci:{ref(entry['id'])}:{sl['idx']}"
                 )
             )
             if len(row) == 2:
@@ -147,11 +120,8 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     block = opening_block(user.id, nice_name, slot_text)
-    run(
-        "UPDATE time_entries SET shift_label=?, opening_posted=1 "
-        "WHERE agent_id=? AND clock_out IS NULL",
-        (slot_text, user.id),
-    )
+    data.change("time_entries", {"shift_label": slot_text, "opening_posted": 1},
+                agent_id=user.id, clock_out=None)
 
     posted = await post_ops(context.bot, block)
     if not posted:
@@ -219,10 +189,10 @@ async def on_clockin_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     if not await gate_cb(query):
         return
-    _, entry_id, slot_id = query.data.split(":")
+    _, entry_ref, slot_idx = query.data.split(":")
     user = query.from_user
 
-    entry = q1("SELECT * FROM time_entries WHERE id=?", (int(entry_id),))
+    entry = data.by_ref("time_entries", entry_ref)
     if not entry or entry["agent_id"] != user.id:
         await query.answer("That clock-in has gone.", show_alert=True)
         return
@@ -230,21 +200,16 @@ async def on_clockin_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("That shift is already closed.", show_alert=True)
         return
 
-    slot = q1(
-        """SELECT s.id, s.label, d.name AS day_name FROM slots s
-           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (int(slot_id),),
-    )
+    _d = day_row_for(entry["the_date"])
+    slot = next((x for x in data.board(_d["week_id"])["slots"][_d["id"]] if str(x["idx"]) == slot_idx),
+                None) if _d else None
     if not slot:
         await query.answer("That slot no longer exists.", show_alert=True)
         return
 
     async with write_lock:
-        run(
-            "UPDATE time_entries SET slot_id=?, shift_label=?, opening_posted=1 "
-            "WHERE id=?",
-            (slot["id"], slot["label"], entry["id"]),
-        )
+        data.change("time_entries", {"slot_id": slot["id"], "shift_label": slot["label"], "opening_posted": 1},
+                    id=entry["id"])
 
     nice_name = display_name_of(user.id, user.full_name)
     block = opening_block(user.id, nice_name, slot["label"])
@@ -282,11 +247,7 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user = update.effective_user
     when = now()
 
-    open_row = q1(
-        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
-        "ORDER BY id DESC LIMIT 1",
-        (user.id,),
-    )
+    open_row = data.row("time_entries", agent_id=user.id, clock_out=None, order="-clock_in")
     if not open_row:
         await update.message.reply_text(
             "You're not clocked in. Tap Clock in when you start a shift.",
@@ -295,11 +256,8 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     async with write_lock:
-        run(
-            "UPDATE time_entries SET clock_out=?, status='closed' WHERE id=?",
-            (when.isoformat(), open_row["id"]),
-        )
-    fresh = q1("SELECT * FROM time_entries WHERE id=?", (open_row["id"],))
+        data.change("time_entries", {"clock_out": when.isoformat(), "status": "closed"}, id=open_row["id"])
+    fresh = data.row("time_entries", id=open_row["id"])
     mins = entry_paid_minutes(fresh)
     actual = entry_minutes(fresh)
     day = date.fromisoformat(fresh["the_date"])
@@ -350,7 +308,7 @@ async def cmd_addreview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     context.user_data["review_for"] = row["user_id"]
     context.user_data["review_note"] = " ".join(context.args[1:]).strip()
-    nm = row["display_name"] or row["name"]
+    nm = row["name"]
     await update.message.reply_text(
         f"Crediting a review to <b>{esc(nm)}</b>.\n\n"
         "Send the screenshot now, or <code>skip</code> to record it without one.",
@@ -380,12 +338,8 @@ async def got_review_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     today = now().date()
     async with write_lock:
-        run(
-            "INSERT INTO reviews (agent_id, the_date, photo_id, note, added_by, "
-            "created_at) VALUES (?,?,?,?,?,?)",
-            (agent_id, today.isoformat(), photo_id, note,
-             update.effective_user.id, now().isoformat()),
-        )
+        data.add("reviews", {"agent_id": agent_id, "the_date": today.isoformat(), "photo_id": photo_id,
+                             "note": note, "added_by": update.effective_user.id, "created_at": now().isoformat()})
 
     first, last = month_bounds(today)
     total = len(reviews_for(agent_id, first, last))
@@ -414,11 +368,10 @@ async def cmd_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     first = parse_month(context.args)
     _, last = month_bounds(first)
-    rows = q(
-        "SELECT agent_id, COUNT(*) c FROM reviews WHERE the_date BETWEEN ? AND ? "
-        "GROUP BY agent_id",
-        (first.isoformat(), last.isoformat()),
-    )
+    counts: dict[int, int] = {}
+    for r in data.rows("reviews", the_date=(("gte", first.isoformat()), ("lte", last.isoformat()))):
+        counts[r["agent_id"]] = counts.get(r["agent_id"], 0) + 1
+    rows = [{"agent_id": a, "c": c} for a, c in counts.items()]
     lines = [f"⭐ <b>Reviews — {first.strftime('%B %Y')}</b>", ""]
     if not rows:
         lines.append("None credited yet.")
@@ -459,7 +412,7 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ot = f"  (+{hhmm(sh['ot'])} OT)" if sh.get("ot") else ""
         lines.append(
             f"{sh['date'].strftime('%a %-d %b')}  {a}–{b}  "
-            f"<b>{hhmm(sh['minutes'])}</b>{ot}{pay}{flag}  <code>#{r['id']}</code>"
+            f"<b>{hhmm(sh['minutes'])}</b>{ot}{pay}{flag}  <code>#{ref(r['id'])}</code>"
         )
     if t["shifts"]:
         lines += [
@@ -513,25 +466,17 @@ async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     agent_id, who = None, "the whole team"
     if len(context.args) > 1:
         target = context.args[1]
-        row = None
-        if target.startswith("@"):
-            row = q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
-        elif target.isdigit():
-            row = q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
+        row = find_agent(target)
         if not row:
             await update.message.reply_text("No one matches that. Check /roster.")
             return
         agent_id = row["user_id"]
-        who = row["display_name"] or row["name"]
+        who = row["name"]
 
     today = now().date()
     async with write_lock:
-        run(
-            "INSERT INTO pay_rates (agent_id, cents, effective_from, created_by, created_at) "
-            "VALUES (?,?,?,?,?)",
-            (agent_id, cents, today.isoformat(),
-             update.effective_user.id, now().isoformat()),
-        )
+        data.add("pay_rates", {"agent_id": agent_id, "cents": cents, "effective_from": today.isoformat(),
+                               "created_by": update.effective_user.id, "created_at": now().isoformat()})
     await update.message.reply_text(
         f"Rate for <b>{esc(who)}</b> set to <b>{money(cents)}</b>/hour, "
         f"from {today.strftime('%-d %b %Y')}.\n\n"
@@ -551,7 +496,7 @@ def week_report(first: date, last: date) -> str:
     # ---- hours and pay per agent
     people = []
     total_min = total_cents = 0
-    for a in q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name"):
+    for a in data.agents(status="active", team="LIVECHAT"):
         t = timesheet(a["user_id"], first, last)
         revs = len(reviews_for(a["user_id"], first, last))
         if not t["shifts"] and not revs and not t["open"]:
@@ -564,7 +509,7 @@ def week_report(first: date, last: date) -> str:
     if people:
         lines.append("<b>Worked</b>")
         for a, t, revs, rc in sorted(people, key=lambda x: -x[1]["minutes"]):
-            nm = a["display_name"] or a["name"]
+            nm = a["name"]
             bit = f"{esc(nm)} — {len(t['shifts'])} shift(s), {hhmm(t['minutes'])}"
             if t.get("overtime"):
                 bit += f" (+{hhmm(t['overtime'])} OT)"
@@ -582,54 +527,33 @@ def week_report(first: date, last: date) -> str:
     # ---- things worth a look
     flags = []
 
-    auto = q(
-        """SELECT te.*, a.display_name, a.name FROM time_entries te
-           JOIN agents a ON a.user_id = te.agent_id
-           WHERE te.status='auto' AND te.the_date BETWEEN ? AND ?""",
-        (first.isoformat(), last.isoformat()),
-    )
+    in_range = (("gte", first.isoformat()), ("lte", last.isoformat()))
+    auto = named(data.rows("time_entries", status="auto", the_date=in_range))
     for r in auto:
         if is_salaried(r["agent_id"]):
             continue
-        who = r["display_name"] or r["name"]
+        who = r["name"]
         flags.append(
             f"⏰ {esc(who)} missed a clock-out on "
             f"{date.fromisoformat(r['the_date']).strftime('%a')} "
-            f"(#{r['id']})"
+            f"(#{ref(r['id'])})"
         )
 
-    unros = q(
-        """SELECT te.*, a.display_name, a.name FROM time_entries te
-           JOIN agents a ON a.user_id = te.agent_id
-           WHERE te.slot_id IS NULL AND te.the_date BETWEEN ? AND ?""",
-        (first.isoformat(), last.isoformat()),
-    )
+    unros = named(data.rows("time_entries", slot_id=None, the_date=in_range))
     for r in unros:
-        who = r["display_name"] or r["name"]
+        who = r["name"]
         flags.append(
             f"❓ {esc(who)} clocked in unrostered on "
-            f"{date.fromisoformat(r['the_date']).strftime('%a')} (#{r['id']})"
+            f"{date.fromisoformat(r['the_date']).strftime('%a')} (#{ref(r['id'])})"
         )
 
     # rostered, the slot has passed, but never clocked in
     today = now().date()
-    noshow = q(
-        """SELECT su.user_id, s.label, d.name AS day_name, d.the_date,
-                  a.display_name, a.name
-           FROM signups su
-           JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           JOIN agents a ON a.user_id = su.user_id
-           WHERE d.the_date BETWEEN ? AND ? AND d.the_date < ?
-             AND NOT EXISTS (
-               SELECT 1 FROM time_entries te
-               WHERE te.agent_id = su.user_id AND te.the_date = d.the_date
-             )
-           ORDER BY d.the_date""",
-        (first.isoformat(), last.isoformat(), today.isoformat()),
-    )
+    clocked = {(e["agent_id"], e["the_date"]) for e in data.rows("time_entries", the_date=in_range)}
+    noshow = [r for r in signups_between(first.isoformat(), last.isoformat())
+              if r["the_date"] < today.isoformat() and (r["user_id"], r["the_date"]) not in clocked]
     for r in noshow:
-        who = r["display_name"] or r["name"]
+        who = r["name"]
         flags.append(
             f"🚫 {esc(who)} never clocked in for "
             f"{r['day_name']} {r['label']}"
@@ -643,10 +567,7 @@ def week_report(first: date, last: date) -> str:
         lines += ["", "✅ <i>Nothing flagged.</i>"]
 
     # ---- coverage of the live week
-    w = q1(
-        "SELECT * FROM weeks WHERE start_date=? ORDER BY id DESC LIMIT 1",
-        (first.isoformat(),),
-    )
+    w = data.row("weeks", start_date=first.isoformat())
     if w:
         st = week_stats(w["id"])
         if st["gaps"]:
@@ -739,52 +660,39 @@ async def cmd_addtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if d:
         mins = a_t.hour * 60 + a_t.minute
         best, gap = None, 10 ** 9
-        for sl in q(
-            """SELECT s.id, s.label, s.start_min FROM slots s
-               JOIN signups su ON su.slot_id = s.id
-               WHERE s.day_id=? AND su.user_id=?""",
-            (d["id"], row["user_id"]),
-        ):
+        for sl in [x for x in week_slots(d["week_id"], held_by=row["user_id"]) if x["day_id"] == d["id"]]:
             delta = abs(sl["start_min"] - mins)
             if delta < gap:
                 best, gap = sl, delta
         if best and gap <= 150:
             slot = best
 
-    dupe = q1(
-        "SELECT id FROM time_entries WHERE agent_id=? AND the_date=? "
-        "AND clock_in=?",
-        (row["user_id"], the_day.isoformat(), a_t.isoformat()),
-    )
+    dupe = data.row("time_entries", agent_id=row["user_id"], the_date=the_day.isoformat(),
+                    clock_in=a_t.isoformat())
     if dupe:
         await update.message.reply_text(
-            f"There's already an entry for that exact start — #{dupe['id']}."
+            f"There's already an entry for that exact start — #{ref(dupe['id'])}."
         )
         return
 
     async with write_lock:
-        cur = run(
-            "INSERT INTO time_entries (agent_id, slot_id, the_date, clock_in, "
-            "clock_out, status, source, note) "
-            "VALUES (?,?,?,?,?,'edited','admin',?)",
-            (row["user_id"], slot["id"] if slot else None, the_day.isoformat(),
-             a_t.isoformat(), b_t.isoformat(),
-             "added by admin — no clock-in recorded"),
-        )
-        new_id = cur.lastrowid
+        new_id = data.add("time_entries", {
+            "agent_id": row["user_id"], "slot_id": slot["id"] if slot else None, "the_date": the_day.isoformat(),
+            "clock_in": a_t.isoformat(), "clock_out": b_t.isoformat(), "status": "edited", "source": "admin",
+            "note": "added by admin — no clock-in recorded"})["id"]
         log_edit(
             new_id, update.effective_user.id, {"existed": False},
             {"clock_in": a_t.isoformat(), "clock_out": b_t.isoformat()},
             "admin added a missing shift",
         )
 
-    fresh = q1("SELECT * FROM time_entries WHERE id=?", (new_id,))
+    fresh = data.row("time_entries", id=new_id)
     base, ot = entry_split(fresh)
     cents = round((base + ot) / 60 * rate_for(row["user_id"], the_day))
-    nm = row["display_name"] or row["name"]
+    nm = row["name"]
 
     msg = [
-        f"✅ Added <code>#{new_id}</code> for <b>{esc(nm)}</b>",
+        f"✅ Added <code>#{ref(new_id)}</code> for <b>{esc(nm)}</b>",
         f"{the_day.strftime('%a %-d %b')}  "
         f"{a_t.strftime('%H:%M')}–{b_t.strftime('%H:%M')}",
         f"Shift: <b>{hhmm(base)}</b>" + (f" · Overtime: <b>+{hhmm(ot)}</b>" if ot else ""),
@@ -858,21 +766,11 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         first, last = month_bounds(now().date())
         span = first.strftime("%B %Y")
 
-    rostered = q(
-        """SELECT s.id, s.label, s.start_min, d.name AS day_name, d.the_date
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE su.user_id=? AND d.the_date BETWEEN ? AND ?
-           ORDER BY d.the_date, s.start_min""",
-        (who["user_id"], first.isoformat(), last.isoformat()),
-    )
-    entries = q(
-        "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
-        "ORDER BY the_date, clock_in",
-        (who["user_id"], first.isoformat(), last.isoformat()),
-    )
+    rostered = [r for r in signups_between(first.isoformat(), last.isoformat()) if r["user_id"] == who["user_id"]]
+    entries = data.rows("time_entries", agent_id=who["user_id"],
+                        the_date=(("gte", first.isoformat()), ("lte", last.isoformat())), order="the_date,clock_in")
 
-    nm = who["display_name"] or who["name"]
+    nm = who["name"]
     lines = [f"🔍 <b>{esc(nm)} — {esc(span)}</b>", ""]
 
     covered, merged, missed = set(), [], []
@@ -895,9 +793,9 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             covered.add(slot["id"])
             if hit["slot_id"] != slot["id"]:
                 merged.append((tag, hit["id"]))
-                lines.append(f"🔗 {tag} — covered by entry #{hit['id']}")
+                lines.append(f"🔗 {tag} — covered by entry #{ref(hit['id'])}")
             else:
-                lines.append(f"✅ {tag} — entry #{hit['id']}")
+                lines.append(f"✅ {tag} — entry #{ref(hit['id'])}")
         elif day < today:
             missed.append(tag)
             lines.append(f"❌ {tag} — <b>no clock-in</b>")
@@ -908,7 +806,7 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for e in extra:
         a = datetime.fromisoformat(e["clock_in"])
         lines.append(f"❓ {a.strftime('%a %-d %b %H:%M')} — clocked in unrostered "
-                     f"(#{e['id']})")
+                     f"(#{ref(e['id'])})")
 
     t = timesheet(who["user_id"], first, last)
     lines += [
@@ -989,7 +887,7 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if who:
         t = timesheet(who["user_id"], first, last)
-        nm = who["display_name"] or who["name"]
+        nm = who["name"]
         lines = [
             f"🕐 <b>{esc(nm)} — {esc(span)}</b>", ""
         ]
@@ -1004,12 +902,10 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 flag = " ✏️"
             if sh.get("duplicate"):
                 flag += " ♻️ already paid"
-            slot = q1(
-                "SELECT label FROM slots WHERE id=?", (r["slot_id"],)
-            ) if r["slot_id"] else None
+            slot = data.slot_info(r["slot_id"]) if r["slot_id"] else None
             where = slot["label"] if slot else "unrostered"
             lines.append(
-                f"<code>#{r['id']}</code>  "
+                f"<code>#{ref(r['id'])}</code>  "
                 f"{sh['date'].strftime('%a %-d %b')}  {a_t}–{b_t}  "
                 f"{hhmm(sh['minutes'])}  {money(sh['cents'])}{flag}"
                 f"\n      <i>{esc(where)}</i>"
@@ -1024,8 +920,8 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             lines.append("⏱ Still clocked in.")
         lines += [
             "",
-            "<code>/fixtime 42 11:00 17:30</code> to correct one",
-            "<code>/fixtime 42 delete</code> to remove it",
+            "<code>/fixtime 1a2b3c4d 11:00 17:30</code> to correct one",
+            "<code>/fixtime 1a2b3c4d delete</code> to remove it",
             f"<code>/timesheet {esc(context.args[0] if context.args else '@handle')}"
             + ("</code> for the month" if weekly else " week</code> for this week"),
         ]
@@ -1037,12 +933,12 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines = [f"🕐 <b>Team hours — {esc(span)}</b>", ""]
     total_min = total_cents = 0
     any_rows = False
-    for a in q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name"):
+    for a in data.agents(status="active", team="LIVECHAT"):
         t = timesheet(a["user_id"], first, last)
         if not t["shifts"] and not t["open"]:
             continue
         any_rows = True
-        nm = a["display_name"] or a["name"]
+        nm = a["name"]
         row = f"{esc(nm)} — {t['days']}d · {hhmm(t['minutes'])}"
         if is_salaried(a["user_id"]):
             row += " · salaried"
@@ -1081,18 +977,15 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "paid_hours", "rate", "pay", "status",
     ])
     rows_written = 0
-    for a in q("SELECT * FROM agents ORDER BY name"):
+    for a in data.agents():
         t = timesheet(a["user_id"], first, last)
         for sh in t["shifts"]:
             r = sh["row"]
-            slot = q1(
-                "SELECT s.label, d.name FROM slots s JOIN days d ON d.id=s.day_id "
-                "WHERE s.id=?",
-                (r["slot_id"],),
-            ) if r["slot_id"] else None
+            slot = data.slot_info(r["slot_id"]) if r["slot_id"] else None
+            slot = {**slot, "name": slot["day_name"]} if slot else None
             wr.writerow([
                 r["id"],
-                a["display_name"] or a["name"],
+                a["name"],
                 a["user_id"],
                 "yes" if is_salaried(a["user_id"]) else "no",
                 sh["date"].isoformat(),
@@ -1115,39 +1008,33 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"No shifts logged in {first.strftime('%B %Y')}."
         )
         return
-    data = io.BytesIO(buf.getvalue().encode())
-    data.name = f"payroll_{first.strftime('%Y_%m')}.csv"
+    out = io.BytesIO(buf.getvalue().encode())
+    out.name = f"payroll_{first.strftime('%Y_%m')}.csv"
     await update.message.reply_document(
-        data, filename=data.name,
+        out, filename=out.name,
         caption=f"{rows_written} shift(s) — {first.strftime('%B %Y')}. Estimates, not payroll.",
     )
 
 
 def log_edit(entry_id: int, by: int, before: dict, after: dict, reason: str) -> None:
-    run(
-        "INSERT INTO time_edits (entry_id, changed_by, before, after, reason, changed_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (entry_id, by, json.dumps(before), json.dumps(after), reason,
-         now().isoformat()),
-    )
+    # Write-only for the bot (it never reads the log back), so no rows are asked for.
+    data.add("time_edits", {"entry_id": entry_id, "changed_by": by, "before": json.dumps(before),
+                            "after": json.dumps(after), "reason": reason, "changed_at": now().isoformat()},
+             returning=False)
 
 
 async def job_ask_overtime(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Morning after: ask anyone whose shift was auto-closed whether that was right."""
     yesterday = (now().date() - timedelta(days=1)).isoformat()
-    rows = q(
-        "SELECT * FROM time_entries WHERE status='auto' AND the_date=?",
-        (yesterday,),
-    )
+    rows = data.rows("time_entries", status="auto", the_date=yesterday)
     asked = 0
     for r in rows:
-        if q1("SELECT 1 FROM ot_claims WHERE entry_id=?", (r["id"],)):
+        if data.row("ot_claims", entry_id=r["id"]):
             continue                              # already asked about this one
         if is_salaried(r["agent_id"]):
             continue                              # not paid hourly, so no overtime
         out = datetime.fromisoformat(r["clock_out"])
-        slot = q1("SELECT label FROM slots WHERE id=?", (r["slot_id"],)) \
-            if r["slot_id"] else None
+        slot = data.slot_info(r["slot_id"]) if r["slot_id"] else None
         where = slot["label"] if slot else (r["shift_label"] or "your shift")
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"✅ Yes, {out.strftime('%H:%M')}",
@@ -1172,12 +1059,14 @@ async def job_ask_overtime(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_ot_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    eid = int(query.data.split(":")[2])
+    eid = query.data.split(":")[2]
     await query.answer("Thanks")
+    entry = data.row("time_entries", id=eid)
     async with write_lock:
-        run("INSERT INTO ot_claims (entry_id, agent_id, claimed_out, ot_minutes,"
-            " status, asked_at) VALUES (?,?,?,0,'confirmed',?)",
-            (eid, query.from_user.id, "", now().isoformat()))
+        # "Yes, that's when I finished": the claim is the clock-out they confirmed.
+        data.add("ot_claims", {"entry_id": eid, "agent_id": query.from_user.id,
+                               "claimed_out": (entry or {}).get("clock_out") or now().isoformat(),
+                               "ot_minutes": 0, "status": "confirmed", "asked_at": now().isoformat()})
     await query.edit_message_text(
         "👍 Thanks — nothing changed.\n\n"
         "<i>Clocking out yourself is still best, it's how overtime gets paid.</i>",
@@ -1187,8 +1076,8 @@ async def on_ot_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_ot_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    eid = int(query.data.split(":")[2])
-    row = q1("SELECT * FROM time_entries WHERE id=?", (eid,))
+    eid = query.data.split(":")[2]
+    row = data.row("time_entries", id=eid)
     if not row:
         await query.answer()
         await query.edit_message_text("That shift has gone.")
@@ -1210,7 +1099,7 @@ async def got_ot_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if not eid:
         await update.message.reply_text("That expired. Tell your manager instead.")
         return ConversationHandler.END
-    row = q1("SELECT * FROM time_entries WHERE id=?", (eid,))
+    row = data.row("time_entries", id=eid)
     if not row:
         await update.message.reply_text("That shift has gone.")
         return ConversationHandler.END
@@ -1237,37 +1126,32 @@ async def got_ot_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if extra <= OT_SELF_LIMIT_MIN:
         async with write_lock:
             before = dict(row)
-            run("UPDATE time_entries SET clock_out=?, status='edited' WHERE id=?",
-                (new_out.isoformat(), eid))
+            data.change("time_entries", {"clock_out": new_out.isoformat(), "status": "edited"}, id=eid)
             log_edit(eid, user.id, before, {"clock_out": new_out.isoformat()},
                      "agent corrected a forgotten clock-out")
-            run("INSERT INTO ot_claims (entry_id, agent_id, claimed_out,"
-                " ot_minutes, status, asked_at) VALUES (?,?,?,?,'applied',?)",
-                (eid, user.id, new_out.isoformat(), extra, now().isoformat()))
-        fresh = q1("SELECT * FROM time_entries WHERE id=?", (eid,))
+            data.add("ot_claims", {"entry_id": eid, "agent_id": user.id, "claimed_out": new_out.isoformat(),
+                                   "ot_minutes": extra, "status": "applied", "asked_at": now().isoformat()})
+        fresh = data.row("time_entries", id=eid)
         base, ot = entry_split(fresh)
         await update.message.reply_text(
             f"✅ Updated to <b>{new_out.strftime('%H:%M')}</b>.\n"
             f"Shift {hhmm(base)}" + (f" · Overtime <b>+{hhmm(ot)}</b>" if ot else "")
-            + f"\n\n<code>#{eid}</code>",
+            + f"\n\n<code>#{ref(eid)}</code>",
             parse_mode=constants.ParseMode.HTML,
         )
         await flag_to_admins(
             context.bot,
             f"✏️ <b>{esc(nm)}</b> corrected a forgotten clock-out to "
             f"{new_out.strftime('%H:%M')} (+{hhmm(extra)}). "
-            f"<code>#{eid}</code>",
+            f"<code>#{ref(eid)}</code>",
         )
         return ConversationHandler.END
 
     # more than we let anyone claim for themselves
     async with write_lock:
-        cur = run(
-            "INSERT INTO ot_claims (entry_id, agent_id, claimed_out, ot_minutes,"
-            " status, asked_at) VALUES (?,?,?,?,'pending',?)",
-            (eid, user.id, new_out.isoformat(), extra, now().isoformat()),
-        )
-        claim_id = cur.lastrowid
+        claim_id = data.add("ot_claims", {"entry_id": eid, "agent_id": user.id, "claimed_out": new_out.isoformat(),
+                                          "ot_minutes": extra, "status": "pending",
+                                          "asked_at": now().isoformat()})["id"]
 
     await update.message.reply_text(
         f"That's <b>{hhmm(extra)}</b> past the end, so a manager needs to "
@@ -1280,22 +1164,21 @@ async def got_ot_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         f"<b>{new_out.strftime('%H:%M')}</b> on "
         f"{date.fromisoformat(row['the_date']).strftime('%a %-d %b')}, not "
         f"{old_out.strftime('%H:%M')}.\n"
-        f"That's <b>{hhmm(extra)}</b> of overtime. <code>#{eid}</code>"
+        f"That's <b>{hhmm(extra)}</b> of overtime. <code>#{ref(eid)}</code>"
     )
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"oc:a:{claim_id}"),
         InlineKeyboardButton("🚫 Decline", callback_data=f"oc:d:{claim_id}"),
     ]])
     sent = await notify_admins(context.bot, text, kb)
-    run("UPDATE ot_claims SET notified=? WHERE id=?",
-        (json.dumps(sent), claim_id))
+    data.change("ot_claims", {"notified": json.dumps(sent)}, id=claim_id)
     return ConversationHandler.END
 
 
 async def on_ot_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     _, action, raw = query.data.split(":")
-    claim = q1("SELECT * FROM ot_claims WHERE id=?", (int(raw),))
+    claim = data.row("ot_claims", id=raw)
     if not claim:
         await query.answer("That claim has gone.", show_alert=True)
         return
@@ -1308,16 +1191,14 @@ async def on_ot_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     approve = action == "a"
     nm = display_name_of(claim["agent_id"], str(claim["agent_id"]))
-    row = q1("SELECT * FROM time_entries WHERE id=?", (claim["entry_id"],))
+    row = data.row("time_entries", id=claim["entry_id"])
 
     async with write_lock:
-        run("UPDATE ot_claims SET status=?, decided_by=?, decided_at=? WHERE id=?",
-            ("approved" if approve else "declined", query.from_user.id,
-             now().isoformat(), claim["id"]))
+        data.change("ot_claims", {"status": "approved" if approve else "declined",
+                                  "decided_by": query.from_user.id, "decided_at": now().isoformat()}, id=claim["id"])
         if approve and row:
             before = dict(row)
-            run("UPDATE time_entries SET clock_out=?, status='edited' WHERE id=?",
-                (claim["claimed_out"], claim["entry_id"]))
+            data.change("time_entries", {"clock_out": claim["claimed_out"], "status": "edited"}, id=claim["entry_id"])
             log_edit(claim["entry_id"], query.from_user.id, before,
                      {"clock_out": claim["claimed_out"]},
                      "overtime claim approved")
@@ -1346,7 +1227,7 @@ async def on_ot_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         if approve:
-            fresh = q1("SELECT * FROM time_entries WHERE id=?", (claim["entry_id"],))
+            fresh = data.row("time_entries", id=claim["entry_id"])
             base, ot = entry_split(fresh)
             await context.bot.send_message(
                 claim["agent_id"],
@@ -1367,9 +1248,7 @@ async def cmd_openshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Who is clocked in right now."""
     if not is_admin(update.effective_user.id):
         return
-    rows = q(
-        "SELECT * FROM time_entries WHERE clock_out IS NULL ORDER BY clock_in"
-    )
+    rows = data.rows("time_entries", clock_out=None, order="clock_in")
     if not rows:
         await update.message.reply_text("Nobody is clocked in right now.")
         return
@@ -1405,14 +1284,10 @@ async def cmd_clockoutfor(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("No one matches that. Check /roster.")
         return
 
-    entry = q1(
-        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
-        "ORDER BY id DESC LIMIT 1",
-        (row["user_id"],),
-    )
+    entry = data.row("time_entries", agent_id=row["user_id"], clock_out=None, order="-clock_in")
     if not entry:
         await update.message.reply_text(
-            f"{esc(row['display_name'] or row['name'])} isn't clocked in.",
+            f"{esc(row["name"])} isn't clocked in.",
             parse_mode=constants.ParseMode.HTML,
         )
         return
@@ -1439,19 +1314,16 @@ async def cmd_clockoutfor(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             {"clock_out": out.isoformat(), "status": "edited"},
             "admin clocked out on their behalf",
         )
-        run(
-            "UPDATE time_entries SET clock_out=?, status='edited', source='admin' "
-            "WHERE id=?",
-            (out.isoformat(), entry["id"]),
-        )
+        data.change("time_entries", {"clock_out": out.isoformat(), "status": "edited", "source": "admin"},
+                    id=entry["id"])
 
-    fresh = q1("SELECT * FROM time_entries WHERE id=?", (entry["id"],))
+    fresh = data.row("time_entries", id=entry["id"])
     mins = entry_minutes(fresh)
-    nm = row["display_name"] or row["name"]
+    nm = row["name"]
     await update.message.reply_text(
         f"✅ Clocked out <b>{esc(nm)}</b> at {out.strftime('%-d %b %H:%M')}\n"
         f"Shift logged: <b>{hhmm(mins)}</b>\n\n"
-        f"<i>Entry #{entry['id']} · change recorded</i>",
+        f"<i>Entry #{ref(entry['id'])} · change recorded</i>",
         parse_mode=constants.ParseMode.HTML,
     )
     try:
@@ -1472,16 +1344,12 @@ async def cmd_fixtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(
             "Usage:\n"
             "<code>/fixtime 42 10:00 18:00</code> — set both times\n"
-            "<code>/fixtime 42 delete</code> — remove the entry\n\n"
+            "<code>/fixtime 1a2b3c4d delete</code> — remove the entry\n\n"
             "Entry numbers show in /mytime and /payroll.",
             parse_mode=constants.ParseMode.HTML,
         )
         return
-    if not context.args[0].isdigit():
-        await update.message.reply_text("First give the entry number, e.g. /fixtime 42 ...")
-        return
-
-    entry = q1("SELECT * FROM time_entries WHERE id=?", (int(context.args[0]),))
+    entry = data.by_ref("time_entries", context.args[0])
     if not entry:
         await update.message.reply_text("No entry with that number.")
         return
@@ -1494,9 +1362,9 @@ async def cmd_fixtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 {"clock_in": entry["clock_in"], "clock_out": entry["clock_out"]},
                 {"deleted": True}, "admin deleted the entry",
             )
-            run("DELETE FROM time_entries WHERE id=?", (entry["id"],))
+            data.remove("time_entries", id=entry["id"])
         await update.message.reply_text(
-            f"Deleted entry #{entry['id']} for <b>{esc(nm)}</b>.",
+            f"Deleted entry #{ref(entry['id'])} for <b>{esc(nm)}</b>.",
             parse_mode=constants.ParseMode.HTML,
         )
         return
@@ -1519,16 +1387,13 @@ async def cmd_fixtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             {"clock_in": a.isoformat(), "clock_out": b.isoformat()},
             "admin corrected the times",
         )
-        run(
-            "UPDATE time_entries SET clock_in=?, clock_out=?, status='edited', "
-            "source='admin' WHERE id=?",
-            (a.isoformat(), b.isoformat(), entry["id"]),
-        )
+        data.change("time_entries", {"clock_in": a.isoformat(), "clock_out": b.isoformat(), "status": "edited",
+                                     "source": "admin"}, id=entry["id"])
 
-    fresh = q1("SELECT * FROM time_entries WHERE id=?", (entry["id"],))
+    fresh = data.row("time_entries", id=entry["id"])
     mins = entry_minutes(fresh)
     await update.message.reply_text(
-        f"✅ Entry #{entry['id']} for <b>{esc(nm)}</b> is now "
+        f"✅ Entry #{ref(entry['id'])} for <b>{esc(nm)}</b> is now "
         f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')} (<b>{hhmm(mins)}</b>).\n\n"
         "<i>Change recorded.</i>",
         parse_mode=constants.ParseMode.HTML,
@@ -1549,7 +1414,7 @@ async def job_auto_close(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Close forgotten clock-ins, but only once the agent's whole run of
     back-to-back shifts has finished."""
     cutoff = now() - timedelta(minutes=AUTO_CLOSE_GRACE_MIN)
-    for r in q("SELECT * FROM time_entries WHERE clock_out IS NULL"):
+    for r in data.rows("time_entries", clock_out=None):
         started = datetime.fromisoformat(r["clock_in"])
         if started > cutoff:
             continue
@@ -1570,12 +1435,9 @@ async def job_auto_close(context: ContextTypes.DEFAULT_TYPE) -> None:
             end = started + timedelta(hours=2)
 
         async with write_lock:
-            run(
-                "UPDATE time_entries SET clock_out=?, status='auto', "
-                "note='auto-closed, agent did not clock out' WHERE id=?",
-                (end.isoformat(), r["id"]),
-            )
-        fresh = q1("SELECT * FROM time_entries WHERE id=?", (r["id"],))
+            data.change("time_entries", {"clock_out": end.isoformat(), "status": "auto",
+                                         "note": "auto-closed, agent did not clock out"}, id=r["id"])
+        fresh = data.row("time_entries", id=r["id"])
         paid = entry_paid_minutes(fresh)
         try:
             await context.bot.send_message(
