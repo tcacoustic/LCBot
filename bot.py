@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from core import *  # noqa: F401,F403
-from core import db  # noqa: F401  (restore overwrites it in place)
 from board import *  # noqa: F401,F403
 from people import *  # noqa: F401,F403
 from shifts import *  # noqa: F401,F403
@@ -82,255 +81,6 @@ async def cmd_shiftcall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("Posted to the group ✅")
 
 
-def snapshot_db() -> tuple[io.BytesIO, dict]:
-    """A consistent copy of the database, safe to take while the bot is running."""
-    import tempfile
-
-    counts = {}
-    for t in ("agents", "weeks", "signups", "time_entries", "pay_rates"):
-        try:
-            counts[t] = q1(f"SELECT COUNT(*) c FROM {t}")["c"]
-        except Exception:
-            counts[t] = 0
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp.close()
-    dest = sqlite3.connect(tmp.name)
-    with dest, db_lock:
-        db.backup(dest)
-    dest.close()
-
-    with open(tmp.name, "rb") as fh:
-        data = io.BytesIO(fh.read())
-    os.unlink(tmp.name)
-    data.name = f"avails_{now().strftime('%Y-%m-%d_%H%M')}.db"
-    return data, counts
-
-
-def backup_caption(counts: dict) -> str:
-    return (
-        f"🗄 Backup — {now().strftime('%-d %b %Y, %H:%M')}\n"
-        f"{counts['agents']} agents · {counts['weeks']} weeks · "
-        f"{counts['signups']} signups · {counts['time_entries']} shifts\n\n"
-        "Keep this somewhere safe. It's the only copy outside the server."
-    )
-
-
-async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Put a backup file back. Owner only, and it asks twice."""
-    if not is_owner(update.effective_user.id):
-        return ConversationHandler.END
-    if update.effective_chat.type != constants.ChatType.PRIVATE:
-        return ConversationHandler.END
-
-    cur = inspect_db(DB_PATH)
-    lines = [
-        "♻️ <b>Restore from a backup</b>",
-        "",
-        "<b>What's live right now</b>",
-    ]
-    if cur["ok"]:
-        lines += [
-            f"  {cur['counts']['agents']} agents · "
-            f"{cur['counts']['weeks']} weeks · "
-            f"{cur['counts']['time_entries']} time entries",
-            f"  newest shift: {cur['newest'] or '—'}",
-        ]
-    lines += [
-        "",
-        "Send me the <code>.db</code> file to restore.",
-        "",
-        "<i>I'll check it, show you what's inside, and send you a copy of the "
-        "current database before anything is replaced. /cancel to stop.</i>",
-    ]
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=constants.ParseMode.HTML
-    )
-    return RESTORE_FILE
-
-
-async def got_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    doc = update.message.document
-    if not doc:
-        await update.message.reply_text("Send the .db file, or /cancel.")
-        return RESTORE_FILE
-    if doc.file_size and doc.file_size > 40 * 1024 * 1024:
-        await update.message.reply_text("That's too big to be our database.")
-        return RESTORE_FILE
-
-    tmp = f"{DB_PATH}.incoming"
-    try:
-        f = await context.bot.get_file(doc.file_id)
-        await f.download_to_drive(tmp)
-    except Exception as e:
-        await update.message.reply_text(f"Couldn't download it: {e}")
-        return ConversationHandler.END
-
-    info = inspect_db(tmp)
-    if not info["ok"]:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        await update.message.reply_text(
-            f"❌ {info.get('error', 'That file looks wrong.')}\n\n"
-            "Nothing has changed. Send another file, or /cancel."
-        )
-        return RESTORE_FILE
-
-    cur = inspect_db(DB_PATH)
-    context.user_data["restore_path"] = tmp
-    c, n = info["counts"], cur["counts"] if cur["ok"] else {}
-
-    def cmp(k, label):
-        was = n.get(k, 0)
-        now = c.get(k, 0)
-        arrow = "→"
-        note = ""
-        if now < was:
-            note = f"  ⚠️ {was - now} fewer"
-        return f"  {label}: {was} {arrow} <b>{now}</b>{note}"
-
-    lines = [
-        "📋 <b>That file contains</b>", "",
-        cmp("agents", "Agents"),
-        cmp("weeks", "Weeks"),
-        cmp("time_entries", "Time entries"),
-        cmp("signups", "Signups"),
-        cmp("handovers", "Handovers"),
-        cmp("reviews", "Reviews"),
-        "",
-        f"  Newest shift in it: <b>{info['newest'] or '—'}</b>",
-        f"  Newest shift live now: {cur.get('newest') or '—'}",
-        "",
-        "<b>This replaces everything.</b> Anything recorded since that backup "
-        "will be gone.",
-    ]
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("♻️ Replace the database", callback_data="rs:go")],
-        [InlineKeyboardButton("Cancel", callback_data="rs:no")],
-    ])
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=constants.ParseMode.HTML, reply_markup=kb
-    )
-    return RESTORE_OK
-
-
-async def on_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    tmp = context.user_data.pop("restore_path", None)
-    if query.data.endswith(":no") or not tmp:
-        await query.answer()
-        await query.edit_message_text("Cancelled — nothing was changed.")
-        if tmp:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        return ConversationHandler.END
-
-    await query.answer("Restoring…")
-    stamp = now().strftime("%Y%m%d-%H%M")
-
-    # send the current database back first, so there's always a way out
-    safety = f"{DB_PATH}.before-restore-{stamp}"
-    try:
-        async with write_lock:
-            snap = sqlite3.connect(safety)
-            with db_lock:
-                db.backup(snap)
-            snap.close()
-        with open(safety, "rb") as fh:
-            await query.message.reply_document(
-                document=fh, filename=f"before-restore-{stamp}.db",
-                caption="The database as it was a moment ago. Keep this.",
-            )
-    except Exception as e:
-        log.warning("Couldn't send the safety copy: %s", e)
-        await query.message.reply_text(
-            "⚠️ I couldn't send a safety copy, so I've stopped. Nothing changed."
-        )
-        return ConversationHandler.END
-
-    # overwrite in place through the existing connection, so every module
-    # keeps working against the same handle
-    try:
-        async with write_lock:
-            with db_lock:
-                db.rollback()                  # nothing half-finished
-                src = sqlite3.connect(tmp)
-                src.backup(db)
-                src.close()
-                db.commit()
-                db.execute("PRAGMA journal_mode=WAL")
-                db.execute("PRAGMA busy_timeout=8000")
-                db.commit()
-    except Exception as e:
-        log.warning("Restore failed: %s", e)
-        await query.message.reply_text(
-            f"❌ The restore failed: {e}\n\nThe database is unchanged."
-        )
-        return ConversationHandler.END
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-
-    after = inspect_db(DB_PATH)
-    await query.edit_message_text(
-        "✅ <b>Restored.</b>\n\n"
-        f"{after['counts'].get('agents', 0)} agents · "
-        f"{after['counts'].get('weeks', 0)} weeks · "
-        f"{after['counts'].get('time_entries', 0)} time entries\n"
-        f"Newest shift: {after.get('newest') or '—'}\n\n"
-        "<i>Check /roster and /timesheet. Then redeploy on Railway — it "
-        "reopens the database cleanly, and the Mini App needs that.</i>",
-        parse_mode=constants.ParseMode.HTML,
-    )
-    log.info("Database restored by %s", query.from_user.id)
-    return ConversationHandler.END
-
-
-async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update.effective_user.id):
-        return
-    try:
-        data, counts = snapshot_db()
-    except Exception as e:
-        await update.message.reply_text(f"Backup failed: {e}")
-        log.warning("Manual backup failed: %s", e)
-        return
-    await update.message.reply_document(
-        data, filename=data.name, caption=backup_caption(counts)
-    )
-
-
-async def job_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Weekly database copy, DM'd to owners."""
-    if now().weekday() != BACKUP_DAY:
-        return
-    targets = list(ADMIN_IDS) or admin_ids()
-    if not targets:
-        log.warning("Backup due but no owner to send it to.")
-        return
-    try:
-        data, counts = snapshot_db()
-    except Exception as e:
-        log.warning("Scheduled backup failed: %s", e)
-        return
-    body = data.getvalue()
-    for uid in targets:
-        try:
-            await context.bot.send_document(
-                uid, io.BytesIO(body), filename=data.name,
-                caption=backup_caption(counts),
-            )
-        except Exception as e:
-            log.info("Couldn't send backup to %s: %s", uid, e)
-    log.info("Backup sent to %d owner(s).", len(targets))
-
-
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
@@ -338,21 +88,18 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not w:
         await update.message.reply_text("No week has been posted yet.")
         return
-    rows = q(
-        """SELECT d.name AS day, d.the_date, s.label, su.name AS agent
-           FROM slots s JOIN days d ON d.id = s.day_id
-           LEFT JOIN signups su ON su.slot_id = s.id
-           WHERE d.week_id=? ORDER BY d.idx, s.idx, su.ts""",
-        (w["id"],),
-    )
+    b = data.board(w["id"])
+    rows = [{"day": d["name"], "the_date": d["the_date"], "label": sl["label"], "agent": su["name"]}
+            for d in b["days"] for sl in b["slots"][d["id"]]
+            for su in (b["signups"][sl["id"]] or [{"name": None}])]
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["day", "date", "slot", "agent"])
     for r in rows:
         writer.writerow([r["day"], r["the_date"], r["label"], r["agent"] or ""])
-    data = io.BytesIO(buf.getvalue().encode())
-    data.name = f"{w['label'].replace(' ', '_')}_avails.csv"
-    await update.message.reply_document(data, filename=data.name)
+    out = io.BytesIO(buf.getvalue().encode())
+    out.name = f"{w['label'].replace(' ', '_')}_avails.csv"
+    await update.message.reply_document(out, filename=out.name)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -395,7 +142,7 @@ def build_shift_call(for_date: date | None = None) -> tuple[str | None, str]:
     lines = [f"\U0001F4E2 <b>On duty tomorrow \u2014 {day['name']} {fmt_day(target)}</b>", ""]
     working: dict[int, str] = {}
     gaps = 0
-    for s_ in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (day["id"],)):
+    for s_ in data.board(day["week_id"])["slots"][day["id"]]:
         holders = slot_holders(s_["id"])
         if holders:
             lines.append(f"{s_['label']}: " + esc(", ".join(h["name"] for h in holders)))
@@ -411,7 +158,7 @@ def build_shift_call(for_date: date | None = None) -> tuple[str | None, str]:
         lines.append(f"\n\u26A0\uFE0F {gaps} slot(s) with nobody on")
     taggable = []
     for uid, nm in working.items():
-        row = q1("SELECT tag_calls FROM agents WHERE user_id=?", (uid,))
+        row = data.agent(uid)
         if row is None or row["tag_calls"]:
             taggable.append(mention(uid, nm))
     if taggable:
@@ -421,6 +168,7 @@ def build_shift_call(for_date: date | None = None) -> tuple[str | None, str]:
 
 async def post_init(app: Application) -> None:
     """Re-arm jobs after a restart."""
+    seed_presets()
     start_web_server(app)
     if PUBLIC_URL:
         try:
@@ -450,10 +198,6 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(
         job_auto_close, interval=timedelta(minutes=30),
         first=timedelta(minutes=5), name="auto-close",
-    )
-    bmins = parse_time_token(BACKUP_TIME)
-    app.job_queue.run_daily(
-        job_backup, time(bmins // 60, bmins % 60, tzinfo=TZ), name="backup",
     )
     omins = parse_time_token(OT_ASK_TIME or "10:00")
     app.job_queue.run_daily(
@@ -495,11 +239,6 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_daily(
         job_case_report, time(rmins // 60, rmins % 60, tzinfo=TZ),
         name="case-report",
-    )
-    log.info(
-        "Weekly backup scheduled for %s at %s",
-        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][BACKUP_DAY % 7],
-        BACKUP_TIME,
     )
     if DM_REMINDERS:
         app.job_queue.run_daily(
@@ -613,7 +352,7 @@ def main() -> None:
             conversation_timeout=1800,
         )
     )
-    app.add_handler(CallbackQueryHandler(on_exchange_answer, pattern=r"^xa:[yn]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_exchange_answer, pattern=r"^xa:[yn]:[0-9a-f-]{36}$"))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("pickup", cmd_pickup)],
@@ -629,7 +368,7 @@ def main() -> None:
         )
     )
     app.add_handler(CommandHandler("dropreqs", cmd_dropreqs))
-    app.add_handler(CallbackQueryHandler(on_drop_decision, pattern=r"^dq:[ad]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_drop_decision, pattern=r"^dq:[ad]:[0-9a-f-]{36}$"))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
     app.add_handler(CommandHandler("mytime", cmd_mytime))
     app.add_handler(CommandHandler("support", cmd_support))
@@ -658,23 +397,6 @@ def main() -> None:
     app.add_handler(CommandHandler("openshifts", cmd_openshifts))
     app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
     app.add_handler(CommandHandler("fixtime", cmd_fixtime))
-    app.add_handler(CommandHandler("backup", cmd_backup))
-    app.add_handler(
-        ConversationHandler(
-            entry_points=[CommandHandler("restore", cmd_restore)],
-            states={
-                RESTORE_FILE: [
-                    MessageHandler(filters.Document.ALL, got_restore_file)
-                ],
-                RESTORE_OK: [
-                    CallbackQueryHandler(on_restore_confirm, pattern=r"^rs:")
-                ],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-            allow_reentry=True,
-            conversation_timeout=1800,
-        )
-    )
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("avails", cmd_avails))
     app.add_handler(CommandHandler("salaried", cmd_salaried))
@@ -691,11 +413,11 @@ def main() -> None:
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("presets", cmd_presets))
     app.add_handler(CommandHandler("savepreset", cmd_savepreset))
-    app.add_handler(CallbackQueryHandler(on_toggle, pattern=r"^t:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^[cu]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_toggle, pattern=r"^t:[0-9a-f-]{36}$"))
+    app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^[cu]:[0-9a-f-]{36}$"))
     app.add_handler(CallbackQueryHandler(on_plan_toggle, pattern=r"^p:"))
     app.add_handler(CallbackQueryHandler(on_plan_nav, pattern=r"^pd:"))
-    app.add_handler(CallbackQueryHandler(on_clockin_slot, pattern=r"^ci:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_clockin_slot, pattern=r"^ci:[0-9a-f]{8}:\d+$"))
     app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^(ap|dn|ao):\d+$"))
     app.add_handler(CallbackQueryHandler(on_channel_pick, pattern=r"^tc:\d+:"))
     app.add_handler(CommandHandler("channels", cmd_channels))
@@ -706,8 +428,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_country_pick, pattern=r"^vz:cy:\d+:[A-Z]{2}$"))
     app.add_handler(CommandHandler("store", cmd_store))
     app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^vz:(fc|fs):\d+:\w+$"))
-    app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_take_button, pattern=r"^vz:tk:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_reschedule_answer, pattern=r"^vz:r[ad]:[0-9a-f-]{36}$"))
+    app.add_handler(CallbackQueryHandler(on_take_button, pattern=r"^vz:tk:[0-9a-f-]{36}$"))
     app.add_handler(CommandHandler("visits", cmd_visits))
     app.add_handler(CommandHandler("visitchat", cmd_visitchat))
     # Ops special requests (sr: buttons)
@@ -733,13 +455,13 @@ def main() -> None:
             conversation_timeout=1800,
         )
     )
-    app.add_handler(CallbackQueryHandler(on_ops_button, pattern=r"^sr:(tk|ok|no|bk):\d+$|^sr:nr:\d+:[A-Z]+$"))
+    app.add_handler(CallbackQueryHandler(on_ops_button, pattern=r"^sr:(tk|ok|no|bk):[0-9a-f-]{36}$|^sr:nr:[0-9a-f-]{36}:[A-Z]+$"))
     app.add_handler(CommandHandler("opschat", cmd_opschat))
     app.add_handler(CommandHandler("opsrounds", cmd_opsrounds))
     app.add_handler(CommandHandler("requests", cmd_requests))
     app.add_handler(
         ConversationHandler(
-            entry_points=[CallbackQueryHandler(on_amount_start, pattern=r"^vz:am:\d+$")],
+            entry_points=[CallbackQueryHandler(on_amount_start, pattern=r"^vz:am:[0-9a-f-]{36}$")],
             states={VISIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_amount_text)]},
             fallbacks=[CommandHandler("cancel", cancel)],
             allow_reentry=True,
@@ -751,27 +473,27 @@ def main() -> None:
     # On-Site typed steps: a note on a visit that didn't finish (and later more).
     app.add_handler(
         ConversationHandler(
-            entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:\d+$"),
-                          CallbackQueryHandler(on_nf_time_start, pattern=r"^vn:x:\d+$"),
-                          CallbackQueryHandler(on_rq_reason_start, pattern=r"^oq:r:\d+$"),
-                          CallbackQueryHandler(on_rq_extra_start, pattern=r"^oq:[mc]:\d+$"),
-                          CallbackQueryHandler(on_cab_trip, pattern=r"^cb:p:\d+:[A-Z]+$")],
+            entry_points=[CallbackQueryHandler(on_nf_note_start, pattern=r"^vn:n:[0-9a-f-]{36}$"),
+                          CallbackQueryHandler(on_nf_time_start, pattern=r"^vn:x:[0-9a-f-]{36}$"),
+                          CallbackQueryHandler(on_rq_reason_start, pattern=r"^oq:r:[0-9a-f-]{36}$"),
+                          CallbackQueryHandler(on_rq_extra_start, pattern=r"^oq:[mc]:[0-9a-f-]{36}$"),
+                          CallbackQueryHandler(on_cab_trip, pattern=r"^cb:p:[0-9a-f-]{36}:[A-Z]+$")],
             states={ONS_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_ons_text)]},
             fallbacks=[CommandHandler("cancel", cancel)],
             allow_reentry=True,
             conversation_timeout=1800,
         )
     )
-    app.add_handler(CallbackQueryHandler(on_nf_button, pattern=r"^vn:[rudtlbk]:\d+(:\w+)?$"))
-    app.add_handler(CallbackQueryHandler(on_rq_form, pattern=r"^oq:[npsk]:\d+(:\w+)*$"))
-    app.add_handler(CallbackQueryHandler(on_rq_button, pattern=r"^oq:[td]:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_paynow_button, pattern=r"^vq:[pb]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_nf_button, pattern=r"^vn:[rudtlbk]:[0-9a-f-]{36}(:\w+)?$"))
+    app.add_handler(CallbackQueryHandler(on_rq_form, pattern=r"^oq:[npsk]:[0-9a-f-]{36}(:\w+)*$"))
+    app.add_handler(CallbackQueryHandler(on_rq_button, pattern=r"^oq:[td]:[0-9a-f-]{36}$"))
+    app.add_handler(CallbackQueryHandler(on_paynow_button, pattern=r"^vq:[pb]:[0-9a-f-]{36}$"))
     app.add_handler(CommandHandler("requestchat", cmd_requestchat))
     app.add_handler(CommandHandler("financechat", cmd_financechat))
     app.add_handler(CommandHandler("paynowqr", cmd_paynowqr))
-    app.add_handler(CallbackQueryHandler(on_finance_button, pattern=r"^fl:[td]:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_cab_form, pattern=r"^cb:n:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_cab_decision, pattern=r"^cb:[arbx]:\d+(:[A-Z]+)?$"))
+    app.add_handler(CallbackQueryHandler(on_finance_button, pattern=r"^fl:[td]:[0-9a-f-]{36}$"))
+    app.add_handler(CallbackQueryHandler(on_cab_form, pattern=r"^cb:n:[0-9a-f-]{36}$"))
+    app.add_handler(CallbackQueryHandler(on_cab_decision, pattern=r"^cb:[arbx]:[0-9a-f-]{36}(:[A-Z]+)?$"))
     app.add_handler(CallbackQueryHandler(on_viewas_pick, pattern=r"^va:"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))
@@ -810,22 +532,22 @@ def main() -> None:
     app.add_handler(CommandHandler(["onchat", "linkchat"], cmd_linkchat))
     app.add_handler(CommandHandler("bumpnow", cmd_bumpnow))
     app.add_handler(CommandHandler("postupdate", cmd_postupdate))   # /linkchat: the old name
-    app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_store_reopen, pattern=r"^sc:o:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^sc:[hn]:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:[0-9a-f-]{36}$"))
+    app.add_handler(CallbackQueryHandler(on_store_reopen, pattern=r"^sc:o:[0-9a-f-]{36}$"))
+    app.add_handler(CallbackQueryHandler(on_store_pick, pattern=r"^sc:[hn]:[0-9a-f-]{36}$"))
     app.add_handler(CommandHandler("cases", cmd_cases))
     app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(
         ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(on_case_note_start, pattern=r"^cs:[nh]:\d+$"),
-                CallbackQueryHandler(on_case_edit_start, pattern=r"^cs:ef:\d+:\w+$"),
+                CallbackQueryHandler(on_case_note_start, pattern=r"^cs:[nh]:[0-9a-f-]{36}$"),
+                CallbackQueryHandler(on_case_edit_start, pattern=r"^cs:ef:[0-9a-f-]{36}:\w+$"),
             ],
             states={
                 CASE_NOTE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text),
-                    CallbackQueryHandler(on_handback_choice, pattern=r"^cs:(hy|hw|v):\d+$"),
+                    CallbackQueryHandler(on_handback_choice, pattern=r"^cs:(hy|hw|v):[0-9a-f-]{36}$"),
                 ],
                 CASE_EDIT: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_edit_text)

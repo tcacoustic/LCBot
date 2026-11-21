@@ -31,15 +31,9 @@ async def on_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.answer()
         return
 
-    slot_id = int(raw)
+    slot_id = raw
     user = query.from_user
-    row = q1(
-        """SELECT s.id, s.label, d.id AS day_id, d.name AS day_name,
-                  w.id AS week_id, w.status
-           FROM slots s JOIN days d ON d.id = s.day_id
-           JOIN weeks w ON w.id = d.week_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    row = data.slot_info(slot_id)
     if not row or row["status"] != "open":
         await query.answer("This week is closed.", show_alert=True)
         return
@@ -52,9 +46,7 @@ async def on_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     async with write_lock:
         touch_agent(user, dm_ok=1)
-        mine = q1(
-            "SELECT 1 FROM signups WHERE slot_id=? AND user_id=?", (slot_id, user.id)
-        )
+        mine = holds(slot_id, user.id)
         if not mine:
             holder = slot_taken_by(slot_id, user.id)
             if holder:
@@ -64,14 +56,10 @@ async def on_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 return
         if mine:
-            run("DELETE FROM signups WHERE slot_id=? AND user_id=?", (slot_id, user.id))
+            take_slot(slot_id, user.id)
             note = f"Dropped {row['day_name']} {row['label']}"
         else:
-            run(
-                "INSERT INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                (slot_id, user.id, display_name_of(user.id, user.full_name),
-                 now().isoformat()),
-            )
+            give_slot(slot_id, user.id)
             note = f"✅ {row['day_name']} {row['label']}"
 
     await query.answer(note)
@@ -94,7 +82,7 @@ async def on_plan_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if raw == "list":
         text, kb = render_plan(user.id, w["id"])
     else:
-        text, kb = render_plan_day(user.id, int(raw))
+        text, kb = render_plan_day(user.id, raw)
     try:
         await query.edit_message_text(
             text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
@@ -127,26 +115,17 @@ async def on_plan_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         touch_agent(user, dm_ok=1)
 
         if action == "clear":
-            run(
-                """DELETE FROM signups WHERE user_id=? AND slot_id IN
-                   (SELECT s.id FROM slots s JOIN days d ON d.id=s.day_id WHERE d.week_id=?)""",
-                (user.id, week_id),
-            )
+            mine = [x["id"] for x in week_slots(week_id, held_by=user.id)]
+            if mine:
+                data.remove("signups", user_id=user.id, slot_id=mine)
             note = "Cleared your whole week."
 
         elif action == "last":
-            prev = q1(
-                "SELECT * FROM weeks WHERE id < ? ORDER BY id DESC LIMIT 1", (week_id,)
-            )
+            prev = data.row("weeks", start_date=("lt", w["start_date"]), order="-start_date")
             if not prev:
                 await query.answer("No previous week to copy from.", show_alert=True)
                 return
-            previous = q(
-                """SELECT d.name AS day_name, s.label FROM signups su
-                   JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
-                   WHERE d.week_id=? AND su.user_id=?""",
-                (prev["id"], user.id),
-            )
+            previous = week_slots(prev["id"], held_by=user.id)
             if not previous:
                 await query.answer(
                     "You had nothing booked last week — nothing to copy.", show_alert=True
@@ -154,23 +133,15 @@ async def on_plan_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 return
             copied, skipped, taken = 0, 0, 0
             for p in previous:
-                target = q1(
-                    """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
-                       WHERE d.week_id=? AND d.name=? AND s.label=?""",
-                    (week_id, p["day_name"], p["label"]),
-                )
+                target = next((x for x in week_slots(week_id)
+                               if x["day_name"] == p["day_name"] and x["label"] == p["label"]), None)
                 if not target:
                     skipped += 1
                     continue
                 if slot_taken_by(target["id"], user.id):
                     taken += 1
                     continue
-                cur = run(
-                    "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                    (target["id"], user.id,
-                     display_name_of(user.id, user.full_name), now().isoformat()),
-                )
-                copied += cur.rowcount
+                copied += give_slot(target["id"], user.id)
             note = f"Copied {copied} slot(s) from {prev['label']}."
             if skipped:
                 note += f" {skipped} not in this week's timings."
@@ -180,16 +151,10 @@ async def on_plan_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         elif action == "confirm":
             if is_locked(week_id, user.id):
-                run(
-                    "DELETE FROM confirmations WHERE week_id=? AND user_id=?",
-                    (week_id, user.id),
-                )
+                data.remove("confirmations", week_id=week_id, user_id=user.id)
                 note = "🔓 Unlocked. Change your slots, then confirm again."
             else:
-                run(
-                    "INSERT INTO confirmations (week_id, user_id, ts) VALUES (?,?,?)",
-                    (week_id, user.id, now().isoformat()),
-                )
+                data.add("confirmations", {"week_id": week_id, "user_id": user.id, "ts": now().isoformat()})
                 note = "✅ Confirmed and locked. Thanks!"
         else:
             await query.answer()
@@ -201,7 +166,7 @@ async def on_plan_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await refresh_board(context, week_id)
     else:
         if action in {"clear", "last"}:
-            for d in q("SELECT id FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
+            for d in data.board(week_id)["days"]:
                 await refresh_day(context, d["id"])
         await refresh_header(context, week_id)
 
@@ -221,14 +186,7 @@ async def cmd_dropshift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     today = now().date().isoformat()
-    mine = q(
-        """SELECT s.id, s.label, d.name AS day_name, d.the_date
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE d.week_id=? AND su.user_id=? AND d.the_date >= ?
-           ORDER BY d.idx, s.idx""",
-        (w["id"], user.id, today),
-    )
+    mine = week_slots(w["id"], since=today, held_by=user.id)
     if not mine:
         await update.message.reply_text(
             "You have no upcoming shifts this week."
@@ -236,10 +194,7 @@ async def cmd_dropshift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     pending = {
-        r["slot_id"] for r in q(
-            "SELECT slot_id FROM drop_requests WHERE agent_id=? AND status='pending'",
-            (user.id,),
-        )
+        r["slot_id"] for r in data.rows("drop_requests", agent_id=user.id, status="pending")
     }
     rows = []
     for m in mine:
@@ -274,11 +229,7 @@ async def on_drop_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.edit_message_text("No problem — nothing changed.")
         return ConversationHandler.END
 
-    slot = q1(
-        """SELECT s.id, s.label, d.name AS day_name FROM slots s
-           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (int(raw),),
-    )
+    slot = data.slot_info(raw)
     if not slot:
         await query.edit_message_text("That shift no longer exists.")
         return ConversationHandler.END
@@ -305,18 +256,10 @@ async def got_drop_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["drop_slot"] = slot_id
         return DROP_REASON
 
-    slot = q1(
-        """SELECT s.id, s.label, d.name AS day_name, d.the_date FROM slots s
-           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    slot = data.slot_info(slot_id)
     async with write_lock:
-        cur = run(
-            "INSERT INTO drop_requests (agent_id, slot_id, reason, requested_at) "
-            "VALUES (?,?,?,?)",
-            (user.id, slot_id, reason, now().isoformat()),
-        )
-        req_id = cur.lastrowid
+        req_id = data.add("drop_requests", {"agent_id": user.id, "slot_id": slot_id, "reason": reason,
+                                            "requested_at": now().isoformat()})["id"]
 
     nm = display_name_of(user.id, user.full_name)
     await update.message.reply_text(
@@ -338,8 +281,7 @@ async def got_drop_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
     ]])
     sent = await notify_admins(context.bot, text, kb)
-    run("UPDATE drop_requests SET notified=? WHERE id=?",
-        (json.dumps(sent), req_id))
+    data.change("drop_requests", {"notified": json.dumps(sent)}, id=req_id)
     return ConversationHandler.END
 
 
@@ -358,19 +300,9 @@ async def cmd_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     today = now().date().isoformat()
-    slots = q(
-        """SELECT s.id, s.label, s.capacity, d.name AS day_name
-           FROM slots s JOIN days d ON d.id = s.day_id
-           WHERE d.week_id=? AND d.the_date >= ?
-           ORDER BY d.idx, s.idx""",
-        (w["id"], today),
-    )
+    slots = week_slots(w["id"], since=today)
     pending = {
-        r["slot_id"] for r in q(
-            "SELECT slot_id FROM drop_requests "
-            "WHERE agent_id=? AND kind='pickup' AND status='pending'",
-            (user.id,),
-        )
+        r["slot_id"] for r in data.rows("drop_requests", agent_id=user.id, kind="pickup", status="pending")
     }
 
     rows = []
@@ -412,11 +344,7 @@ async def on_pickup_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("No problem — nothing changed.")
         return ConversationHandler.END
 
-    slot = q1(
-        """SELECT s.id, s.label, d.name AS day_name FROM slots s
-           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (int(raw),),
-    )
+    slot = data.slot_info(raw)
     if not slot:
         await query.edit_message_text("That shift no longer exists.")
         return ConversationHandler.END
@@ -442,18 +370,10 @@ async def got_pickup_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if note == "-":
         note = ""
 
-    slot = q1(
-        """SELECT s.id, s.label, d.name AS day_name FROM slots s
-           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    slot = data.slot_info(slot_id)
     async with write_lock:
-        cur = run(
-            "INSERT INTO drop_requests (kind, agent_id, slot_id, reason, requested_at) "
-            "VALUES ('pickup',?,?,?,?)",
-            (user.id, slot_id, note, now().isoformat()),
-        )
-        req_id = cur.lastrowid
+        req_id = data.add("drop_requests", {"kind": "pickup", "agent_id": user.id, "slot_id": slot_id,
+                                            "reason": note, "requested_at": now().isoformat()})["id"]
 
     nm = display_name_of(user.id, user.full_name)
     await update.message.reply_text(
@@ -475,8 +395,7 @@ async def got_pickup_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
     ]])
     sent = await notify_admins(context.bot, text, kb)
-    run("UPDATE drop_requests SET notified=? WHERE id=?",
-        (json.dumps(sent), req_id))
+    data.change("drop_requests", {"notified": json.dumps(sent)}, id=req_id)
     return ConversationHandler.END
 
 
@@ -495,23 +414,13 @@ async def cmd_swap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     today = now().date().isoformat()
-    mine = q(
-        """SELECT s.id, s.label, d.name AS day_name FROM signups su
-           JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE d.week_id=? AND su.user_id=? AND d.the_date >= ?
-           ORDER BY d.idx, s.idx""",
-        (w["id"], user.id, today),
-    )
+    mine = week_slots(w["id"], since=today, held_by=user.id)
     if not mine:
         await update.message.reply_text("You have no upcoming shifts this week.")
         return ConversationHandler.END
 
     pending = {
-        r["slot_id"] for r in q(
-            "SELECT slot_id FROM drop_requests WHERE agent_id=? AND status='pending'",
-            (user.id,),
-        )
+        r["slot_id"] for r in data.rows("drop_requests", agent_id=user.id, status="pending")
     }
     rows = [
         [InlineKeyboardButton(f"{m['day_name']} {m['label']}",
@@ -540,11 +449,7 @@ async def on_swap_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.edit_message_text("No problem — nothing changed.")
         return ConversationHandler.END
 
-    slot = q1(
-        """SELECT s.id, s.label, s.capacity, d.name AS day_name FROM slots s
-           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (int(raw),),
-    )
+    slot = data.slot_info(raw)
     if not slot:
         await query.edit_message_text("That shift no longer exists.")
         return ConversationHandler.END
@@ -552,7 +457,7 @@ async def on_swap_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["swap_slot"] = slot["id"]
     holders = {h["user_id"] for h in slot_holders(slot["id"])}
     others = [
-        a for a in q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name")
+        a for a in data.agents(status="active", team="LIVECHAT")
         if a["user_id"] != query.from_user.id and a["user_id"] not in holders
     ]
     if not others:
@@ -561,7 +466,7 @@ async def on_swap_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     rows, row = [], []
     for a in others:
-        nm = a["display_name"] or a["name"]
+        nm = a["name"]
         row.append(InlineKeyboardButton(nm[:20], callback_data=f"sq:{a['user_id']}"))
         if len(row) == 2:
             rows.append(row); row = []
@@ -586,7 +491,7 @@ async def on_swap_who(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await query.edit_message_text("No problem — nothing changed.")
         return ConversationHandler.END
 
-    context.user_data["swap_to"] = int(raw)
+    context.user_data["swap_to"] = int(raw)        # a Telegram id
     nm = display_name_of(int(raw), "them")
     await query.edit_message_text(
         f"Handing it to <b>{esc(nm)}</b>.\n\n"
@@ -611,18 +516,11 @@ async def got_swap_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["swap_to"] = to_id
         return SWAP_REASON
 
-    slot = q1(
-        """SELECT s.label, d.name AS day_name FROM slots s
-           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    slot = data.slot_info(slot_id)
     async with write_lock:
-        cur = run(
-            "INSERT INTO drop_requests (kind, agent_id, slot_id, target_id, reason,"
-            " requested_at) VALUES ('swap',?,?,?,?,?)",
-            (user.id, slot_id, to_id, reason, now().isoformat()),
-        )
-        req_id = cur.lastrowid
+        req_id = data.add("drop_requests", {"kind": "swap", "agent_id": user.id, "slot_id": slot_id,
+                                            "target_id": to_id, "reason": reason,
+                                            "requested_at": now().isoformat()})["id"]
 
     from_nm = display_name_of(user.id, user.full_name)
     to_nm = display_name_of(to_id, "them")
@@ -655,8 +553,7 @@ async def got_swap_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
     ]])
     sent = await notify_admins(context.bot, text, kb)
-    run("UPDATE drop_requests SET notified=? WHERE id=?",
-        (json.dumps(sent), req_id))
+    data.change("drop_requests", {"notified": json.dumps(sent)}, id=req_id)
     return ConversationHandler.END
 
 
@@ -667,7 +564,7 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Only admins can decide this.", show_alert=True)
         return
 
-    req = q1("SELECT * FROM drop_requests WHERE id=?", (int(raw),))
+    req = data.row("drop_requests", id=raw)
     if not req:
         await query.answer("That request has gone.", show_alert=True)
         return
@@ -678,11 +575,7 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await decide_exchange(query, context, req, action == "a")
         return
 
-    slot = q1(
-        """SELECT s.id, s.label, d.id AS day_id, d.name AS day_name, d.week_id
-           FROM slots s JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (req["slot_id"],),
-    )
+    slot = data.slot_info(req["slot_id"])
     nm = display_name_of(req["agent_id"], str(req["agent_id"]))
     approve = action == "a"
     is_pickup = req["kind"] == "pickup"
@@ -691,34 +584,18 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     where = f"{slot['day_name']} {slot['label']}" if slot else "that shift"
 
     async with write_lock:
-        run(
-            "UPDATE drop_requests SET status=?, decided_by=?, decided_at=? WHERE id=?",
-            ("approved" if approve else "declined",
-             query.from_user.id, now().isoformat(), req["id"]),
-        )
+        data.change("drop_requests", {"status": "approved" if approve else "declined",
+                                      "decided_by": query.from_user.id, "decided_at": now().isoformat()},
+                    id=req["id"])
         if approve and slot:
             if is_swap:
                 # One move, so the slot is never open for anyone else to take.
-                run(
-                    "DELETE FROM signups WHERE slot_id=? AND user_id=?",
-                    (slot["id"], req["agent_id"]),
-                )
-                run(
-                    "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) "
-                    "VALUES (?,?,?,?)",
-                    (slot["id"], req["target_id"], to_nm, now().isoformat()),
-                )
+                take_slot(slot["id"], req["agent_id"])
+                give_slot(slot["id"], req["target_id"])
             elif is_pickup:
-                run(
-                    "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) "
-                    "VALUES (?,?,?,?)",
-                    (slot["id"], req["agent_id"], nm, now().isoformat()),
-                )
+                give_slot(slot["id"], req["agent_id"])
             else:
-                run(
-                    "DELETE FROM signups WHERE slot_id=? AND user_id=?",
-                    (slot["id"], req["agent_id"]),
-                )
+                take_slot(slot["id"], req["agent_id"])
 
     verdict = "approved ✅" if approve else "declined 🚫"
     await query.answer(f"{nm} {verdict}")
@@ -799,19 +676,13 @@ async def cmd_dropreqs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Shift requests waiting on a decision — both drops and pickups."""
     if not is_admin(update.effective_user.id):
         return
-    rows = q(
-        "SELECT * FROM drop_requests WHERE status='pending' ORDER BY requested_at"
-    )
+    rows = data.rows("drop_requests", status="pending", order="requested_at")
     if not rows:
         await update.message.reply_text("No shift drop requests waiting.")
         return
     await update.message.reply_text(f"{len(rows)} waiting:")
     for r in rows:
-        slot = q1(
-            """SELECT s.label, d.name AS day_name FROM slots s
-               JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-            (r["slot_id"],),
-        )
+        slot = data.slot_info(r["slot_id"])
         where = f"{slot['day_name']} {slot['label']}" if slot else "unknown shift"
         nm = display_name_of(r["agent_id"], str(r["agent_id"]))
         kb = InlineKeyboardMarkup([[
@@ -844,12 +715,7 @@ async def cmd_myshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not w:
         await update.message.reply_text("No week has been posted yet.")
         return
-    rows = q(
-        """SELECT d.name, d.the_date, s.label FROM signups su
-           JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
-           WHERE d.week_id=? AND su.user_id=? ORDER BY d.idx, s.idx""",
-        (w["id"], update.effective_user.id),
-    )
+    rows = week_slots(w["id"], held_by=update.effective_user.id)
     hint = ""
     if nxt and here and nxt["id"] != here["id"]:
         hint = (
@@ -905,7 +771,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
     lines = [render_header(w["id"])[0], ""]
-    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (w["id"],)):
+    for d in data.board(w["id"])["days"]:
         day_text, _ = render_day(d["id"])
         lines.append(day_text)
         lines.append("")
@@ -943,23 +809,15 @@ async def cmd_dropslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     label = " ".join(context.args[2:]).strip()
 
-    slot = q1(
-        """SELECT s.id, s.label, d.id AS day_id FROM slots s
-           JOIN days d ON d.id = s.day_id
-           WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
-        (w["id"], day, label),
-    )
+    slot = find_slot(w["id"], day, label)
     if not slot:
         await update.message.reply_text(
             f"No {label!r} slot on {day} this week. Check the wording on the board."
         )
         return
 
-    nm = row["display_name"] or row["name"]
-    held = q1(
-        "SELECT 1 FROM signups WHERE slot_id=? AND user_id=?",
-        (slot["id"], row["user_id"]),
-    )
+    nm = row["name"]
+    held = holds(slot["id"], row["user_id"])
     if not held:
         holders = slot_holders(slot["id"])
         who = ", ".join(h["name"] for h in holders) if holders else "nobody"
@@ -971,16 +829,9 @@ async def cmd_dropslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     async with write_lock:
-        run(
-            "DELETE FROM signups WHERE slot_id=? AND user_id=?",
-            (slot["id"], row["user_id"]),
-        )
+        take_slot(slot["id"], row["user_id"])
 
-    left = q1(
-        """SELECT COUNT(*) c FROM signups su JOIN slots s ON s.id=su.slot_id
-           JOIN days d ON d.id=s.day_id WHERE d.week_id=? AND su.user_id=?""",
-        (w["id"], row["user_id"]),
-    )["c"]
+    left = len(week_slots(w["id"], held_by=row["user_id"]))
 
     await update.message.reply_text(
         f"Freed <b>{day} {esc(slot['label'])}</b> from <b>{esc(nm)}</b>.\n"
@@ -1018,11 +869,7 @@ async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
         return
     label = " ".join(context.args[1:]).strip()
-    slot = q1(
-        """SELECT s.id, s.label, s.capacity FROM slots s JOIN days d ON d.id = s.day_id
-           WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
-        (w["id"], day, label),
-    )
+    slot = find_slot(w["id"], day, label)
     if not slot:
         await update.message.reply_text(f"No {label!r} slot on {day}.")
         return
@@ -1036,9 +883,7 @@ async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     lines = [f"<b>{day} {esc(slot['label'])}</b> — {len(holders)}/{cap}", ""]
     for h in holders:
-        a = q1("SELECT username FROM agents WHERE user_id=?", (h["user_id"],))
-        handle = f" @{a['username']}" if a and a["username"] else ""
-        lines.append(f"{esc(h['name'])}{handle}")
+        lines.append(f"{esc(h['name'])} · <code>{h['user_id']}</code>")
     lines.append(
         f"\n<code>/dropslot @handle {day} {slot['label']}</code> to free one"
     )
@@ -1095,9 +940,7 @@ async def cmd_addslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     labels = [x.strip() for x in " ".join(context.args[1:]).split(",") if x.strip()]
 
-    d = q1(
-        "SELECT * FROM days WHERE week_id=? AND name=?", (w["id"], day)
-    )
+    d = next((x for x in data.board(w["id"])["days"] if x["name"] == day), None)
     if not d:
         await update.message.reply_text(
             f"{day} isn't part of {esc(w['label'])}.",
@@ -1113,23 +956,14 @@ async def cmd_addslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except ValueError:
                 skipped.append(f"{label} (not a time)")
                 continue
-            dupe = q1(
-                "SELECT 1 FROM slots WHERE day_id=? AND lower(label)=lower(?)",
-                (d["id"], label),
-            )
+            dupe = find_slot(w["id"], day, label)
             if dupe:
                 skipped.append(f"{label} (already there)")
                 continue
-            run(
-                "INSERT INTO slots (day_id, idx, label, start_min) VALUES (?,?,?,?)",
-                (d["id"], 999, label, start),
-            )
+            data.add("slots", {"day_id": d["id"], "idx": 999, "label": label, "start_min": start})
             added.append(label)
         # keep the day in time order
-        for i, row in enumerate(
-            q("SELECT id FROM slots WHERE day_id=? ORDER BY start_min, id", (d["id"],))
-        ):
-            run("UPDATE slots SET idx=? WHERE id=?", (i, row["id"]))
+        reorder_day(d["id"])
 
     msg = []
     if added:
@@ -1171,12 +1005,7 @@ async def cmd_delslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     label = " ".join(args[1:]).strip()
 
-    slot = q1(
-        """SELECT s.id, s.label, d.id AS day_id FROM slots s
-           JOIN days d ON d.id = s.day_id
-           WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
-        (w["id"], day, label),
-    )
+    slot = find_slot(w["id"], day, label)
     if not slot:
         await update.message.reply_text(
             f"No {label!r} slot on {day} this week. Check the board's wording."
@@ -1196,13 +1025,9 @@ async def cmd_delslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     async with write_lock:
-        run("DELETE FROM signups WHERE slot_id=?", (slot["id"],))
-        run("DELETE FROM slots WHERE id=?", (slot["id"],))
-        for i, row in enumerate(
-            q("SELECT id FROM slots WHERE day_id=? ORDER BY start_min, id",
-              (slot["day_id"],))
-        ):
-            run("UPDATE slots SET idx=? WHERE id=?", (i, row["id"]))
+        data.remove("signups", slot_id=slot["id"])
+        data.remove("slots", id=slot["id"])
+        reorder_day(slot["day_id"])
 
     note = f"🗑 Removed <b>{day} {esc(slot['label'])}</b>."
     if holders:
@@ -1231,14 +1056,8 @@ async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not context.args:
-        rows = q(
-            """SELECT d.name AS day, s.label, s.capacity,
-                      (SELECT COUNT(*) FROM signups WHERE slot_id=s.id) AS n
-               FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.week_id=? AND s.capacity IS NOT NULL AND s.capacity <> ?
-               ORDER BY d.idx, s.idx""",
-            (w["id"], SLOT_CAPACITY),
-        )
+        rows = [{**x, "day": x["day_name"]} for x in week_slots(w["id"])
+                if x["capacity"] is not None and x["capacity"] != SLOT_CAPACITY]
         lines = [f"<b>Slots taking more than {SLOT_CAPACITY} — {w['label']}</b>", ""]
         if not rows:
             lines.append(f"None. Every slot takes {SLOT_CAPACITY}.")
@@ -1272,17 +1091,9 @@ async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     label = " ".join(args).strip()
 
     if day:
-        target = q(
-            """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
-            (w["id"], day, label),
-        )
+        target = [x for x in week_slots(w["id"]) if x["day_name"] == day and x["label"].lower() == label.lower()]
     else:
-        target = q(
-            """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.week_id=? AND lower(s.label)=lower(?)""",
-            (w["id"], label),
-        )
+        target = [x for x in week_slots(w["id"]) if x["label"].lower() == label.lower()]
     if not target:
         await update.message.reply_text(
             f"No {label!r} slots{' on ' + day if day else ''} this week. "
@@ -1292,7 +1103,7 @@ async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     async with write_lock:
         for t in target:
-            run("UPDATE slots SET capacity=? WHERE id=?", (n, t["id"]))
+            data.change("slots", {"capacity": n}, id=t["id"])
 
     where = f"on {day}" if day else "every day that has it"
     await update.message.reply_text(
@@ -1312,19 +1123,14 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if not context.args:
-        rows = q(
-            """SELECT f.user_id, a.display_name, a.name, COUNT(*) AS n
-               FROM fixed_slots f JOIN agents a ON a.user_id = f.user_id
-               GROUP BY f.user_id ORDER BY a.name"""
-        )
+        fixed = data.all_rows("fixed_slots")
+        rows = sorted(({"user_id": u, "name": display_name_of(u, str(u))} for u in {f["user_id"] for f in fixed}),
+                      key=lambda r: r["name"].lower())
         lines = ["<b>Fixed weekly rosters</b>", ""]
         if not rows:
             lines.append("Nobody has one yet.")
         for r in rows:
-            slots = q(
-                "SELECT day_name, label FROM fixed_slots WHERE user_id=?",
-                (r["user_id"],),
-            )
+            slots = [f for f in fixed if f["user_id"] == r["user_id"]]
             by_day = {}
             for sl in slots:
                 by_day.setdefault(sl["day_name"], []).append(sl["label"])
@@ -1332,7 +1138,7 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"{d} {', '.join(sorted(by_day[d], key=slot_start_minutes))}"
                 for d in DAY_NAMES if d in by_day
             )
-            lines.append(f"<b>{esc(r['display_name'] or r['name'])}</b> — {detail}")
+            lines.append(f"<b>{esc(r['name'])}</b> — {detail}")
         lines += [
             "",
             "<code>/fixed @handle MON 10am-12pm</code> — add or remove a slot",
@@ -1349,12 +1155,10 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not row:
         await update.message.reply_text("No one matches that. Check /roster.")
         return
-    nm = row["display_name"] or row["name"]
+    nm = row["name"]
 
     if len(context.args) == 1:
-        slots = q(
-            "SELECT day_name, label FROM fixed_slots WHERE user_id=?", (row["user_id"],)
-        )
+        slots = data.rows("fixed_slots", user_id=row["user_id"])
         if not slots:
             await reply_long(update.message, 
                 f"<b>{esc(nm)}</b> has no fixed slots.\n\n"
@@ -1378,7 +1182,7 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if context.args[1].lower() == "clear":
         async with write_lock:
-            run("DELETE FROM fixed_slots WHERE user_id=?", (row["user_id"],))
+            data.remove("fixed_slots", user_id=row["user_id"])
         await reply_long(update.message, 
             f"Cleared the fixed roster for <b>{esc(nm)}</b>.",
             parse_mode=constants.ParseMode.HTML,
@@ -1404,26 +1208,17 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     async with write_lock:
-        existing = q1(
-            "SELECT 1 FROM fixed_slots WHERE user_id=? AND day_name=? AND lower(label)=lower(?)",
-            (row["user_id"], day, label),
-        )
+        existing = [f for f in data.rows("fixed_slots", user_id=row["user_id"], day_name=day)
+                    if f["label"].lower() == label.lower()]
         if existing:
-            run(
-                "DELETE FROM fixed_slots WHERE user_id=? AND day_name=? AND lower(label)=lower(?)",
-                (row["user_id"], day, label),
-            )
+            for f in existing:
+                data.remove("fixed_slots", user_id=row["user_id"], day_name=day, label=f["label"])
             verb = "Removed"
         else:
-            run(
-                "INSERT INTO fixed_slots (user_id, day_name, label) VALUES (?,?,?)",
-                (row["user_id"], day, label),
-            )
+            data.add("fixed_slots", {"user_id": row["user_id"], "day_name": day, "label": label})
             verb = "Added"
 
-    total = q1(
-        "SELECT COUNT(*) c FROM fixed_slots WHERE user_id=?", (row["user_id"],)
-    )["c"]
+    total = len(data.rows("fixed_slots", user_id=row["user_id"]))
     await reply_long(update.message, 
         f"{verb} <b>{day} {esc(label)}</b> for <b>{esc(nm)}</b>. "
         f"They now have {total} fixed slot(s).\n\n"
@@ -1444,8 +1239,7 @@ CG_PICK, CG_WHAT, CG_WHO, CG_THEIRS, CG_REASON = 290, 291, 292, 293, 294
 
 
 def shift_name(slot_id: int) -> str:
-    s = q1("""SELECT s.label, d.the_date FROM slots s JOIN days d ON d.id = s.day_id
-              WHERE s.id=?""", (slot_id,))
+    s = data.slot_info(slot_id)
     if not s:
         return "that shift"
     return f"{date.fromisoformat(s['the_date']):%a %-d %b} {s['label']}"
@@ -1457,13 +1251,8 @@ def upcoming_shifts(user_id: int) -> list:
     w = open_week() or latest_week()
     if not w:
         return []
-    busy = {r["slot_id"] for r in q(
-        "SELECT slot_id FROM drop_requests WHERE agent_id=? AND status IN ('pending','awaiting')",
-        (user_id,))}
-    rows = q("""SELECT s.id, s.label, s.start_min, d.id AS day_id, d.the_date FROM signups su
-                JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
-                WHERE d.week_id=? AND su.user_id=? AND d.the_date >= ?
-                ORDER BY d.idx, s.idx""", (w["id"], user_id, now().date().isoformat()))
+    busy = {r["slot_id"] for r in data.rows("drop_requests", agent_id=user_id, status=["pending", "awaiting"])}
+    rows = week_slots(w["id"], since=now().date().isoformat(), held_by=user_id)
     return [r for r in rows if r["id"] not in busy]
 
 
@@ -1482,8 +1271,7 @@ def clashes(slot, mine: list) -> bool:
 
 
 def slot_row(slot_id: int):
-    return q1("""SELECT s.id, s.label, s.start_min, d.id AS day_id FROM slots s
-                 JOIN days d ON d.id = s.day_id WHERE s.id=?""", (slot_id,))
+    return data.slot_info(slot_id)
 
 
 def exchange_options(me: int, my_slot: int, them: int) -> list:
@@ -1532,15 +1320,14 @@ async def cg_show(update: Update, context: ContextTypes.DEFAULT_TYPE, step: int)
             cg_back_row()])
     elif step == CG_WHO:
         holders = {h["user_id"] for h in slot_holders(d["slot"])}
-        people = [a for a in q("SELECT * FROM agents WHERE status='active' AND user_id IN "
-                               "(SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name")
+        people = [a for a in data.agents(status="active", team="LIVECHAT")
                   if a["user_id"] != uid and a["user_id"] not in holders]
         if d["mode"] == "ex":
             people = [a for a in people if exchange_options(uid, d["slot"], a["user_id"])]
         else:   # give: only people free at that time
             mine_slot = slot_row(d["slot"])
             people = [a for a in people if not clashes(mine_slot, upcoming_shifts(a["user_id"]))]
-        btns = [InlineKeyboardButton((a["display_name"] or a["name"])[:20], callback_data=f"cg:u:{a['user_id']}")
+        btns = [InlineKeyboardButton(a["name"][:20], callback_data=f"cg:u:{a['user_id']}")
                 for a in people]
         rows = [btns[i:i + 2] for i in range(0, len(btns), 2)] + [cg_back_row()]
         verb = "exchange with" if d["mode"] == "ex" else "give it to"
@@ -1606,7 +1393,7 @@ async def on_cg_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return await cg_show(update, context, back)
     kind, val = parts[1], parts[2]
     if kind == "p":
-        d["slot"] = int(val)
+        d["slot"] = val
         return await cg_show(update, context, CG_WHAT)
     if kind == "w":
         d["mode"] = val
@@ -1615,7 +1402,7 @@ async def on_cg_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         d["to"] = int(val)
         return await cg_show(update, context, CG_THEIRS if d["mode"] == "ex" else CG_REASON)
     if kind == "t":
-        d["theirs"] = int(val)
+        d["theirs"] = val
         return await cg_show(update, context, CG_REASON)
     return d.get("step", CG_PICK)
 
@@ -1635,11 +1422,9 @@ async def got_cg_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     mode = d["mode"]
     kind = {"drop": "drop", "give": "swap", "ex": "exchange"}[mode]
     async with write_lock:
-        req_id = run(
-            "INSERT INTO drop_requests (kind, agent_id, slot_id, target_id, reason, requested_at, status)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (kind, user.id, d["slot"], d.get("to"), reason, now().isoformat(),
-             "awaiting" if mode == "ex" else "pending")).lastrowid
+        req_id = data.add("drop_requests", {
+            "kind": kind, "agent_id": user.id, "slot_id": d["slot"], "target_id": d.get("to"), "reason": reason,
+            "requested_at": now().isoformat(), "status": "awaiting" if mode == "ex" else "pending"})["id"]
         if mode == "ex":
             set_setting(f"exchange_back:{req_id}", str(d["theirs"]))
     context.user_data.pop("cg", None)
@@ -1664,7 +1449,7 @@ async def got_cg_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         except Exception:
             await update.message.reply_text(
                 f"I couldn't message {to_nm}. Ask them to open the bot, then try again.")
-            run("UPDATE drop_requests SET status='declined' WHERE id=?", (req_id,))
+            data.change("drop_requests", {"status": "declined"}, id=req_id)
         return ConversationHandler.END
 
     if mode == "give":
@@ -1692,13 +1477,13 @@ async def send_for_approval(bot, req_id: int, text: str) -> None:
         InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{req_id}"),
         InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}")]])
     sent = await notify_admins(bot, text, kb)
-    run("UPDATE drop_requests SET notified=? WHERE id=?", (json.dumps(sent), req_id))
+    data.change("drop_requests", {"notified": json.dumps(sent)}, id=req_id)
 
 
 def exchange_text(req) -> str:
     a = display_name_of(req["agent_id"], "them")
     b = display_name_of(req["target_id"], "them")
-    back = int(setting(f"exchange_back:{req['id']}", "0") or 0)
+    back = setting(f"exchange_back:{req['id']}", "") or None
     return (f"🔁 <b>Shift exchange request</b>\n\n<b>{esc(a)}</b> ⇄ <b>{esc(b)}</b>\n"
             f"{esc(a)} gives <b>{esc(shift_name(req['slot_id']))}</b>\n"
             f"{esc(a)} takes <b>{esc(shift_name(back))}</b>\n"
@@ -1709,7 +1494,7 @@ async def on_exchange_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """xa:y|n:<id> — the other person agrees to (or turns down) an exchange."""
     query = update.callback_query
     _, ans, raw = query.data.split(":")
-    req = q1("SELECT * FROM drop_requests WHERE id=?", (int(raw),))
+    req = data.row("drop_requests", id=raw)
     if not req or req["target_id"] != query.from_user.id:
         await query.answer("This isn't yours to answer.", show_alert=True)
         return
@@ -1719,8 +1504,8 @@ async def on_exchange_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     who = display_name_of(query.from_user.id, "They")
     if ans == "n":
-        run("UPDATE drop_requests SET status='declined', decided_by=?, decided_at=? WHERE id=?",
-            (query.from_user.id, now().isoformat(), req["id"]))
+        data.change("drop_requests", {"status": "declined", "decided_by": query.from_user.id,
+                                      "decided_at": now().isoformat()}, id=req["id"])
         await query.edit_message_text(query.message.text_html + "\n\n❌ You said no.",
                                       parse_mode=constants.ParseMode.HTML)
         try:
@@ -1730,7 +1515,7 @@ async def on_exchange_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             pass
         return
-    run("UPDATE drop_requests SET status='pending' WHERE id=?", (req["id"],))
+    data.change("drop_requests", {"status": "pending"}, id=req["id"])
     await query.edit_message_text(query.message.text_html + "\n\n✅ You agreed. Waiting on a manager.",
                                   parse_mode=constants.ParseMode.HTML)
     try:
@@ -1742,28 +1527,27 @@ async def on_exchange_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def decide_exchange(query, context, req, approve: bool) -> None:
     """A manager's answer to an exchange: both shifts move together, or nothing does."""
-    back = int(setting(f"exchange_back:{req['id']}", "0") or 0)
+    back = setting(f"exchange_back:{req['id']}", "") or None
     a, b = req["agent_id"], req["target_id"]
     a_nm, b_nm = display_name_of(a, "them"), display_name_of(b, "them")
     give, take = shift_name(req["slot_id"]), shift_name(back)
     moved = False
     async with write_lock:
-        still = (q1("SELECT 1 FROM signups WHERE slot_id=? AND user_id=?", (req["slot_id"], a))
-                 and q1("SELECT 1 FROM signups WHERE slot_id=? AND user_id=?", (back, b)))
+        still = (holds(req["slot_id"], a)
+                 and holds(back, b))
         if approve and not still:
-            run("UPDATE drop_requests SET status='declined', decided_by=?, decided_at=? WHERE id=?",
-                (query.from_user.id, now().isoformat(), req["id"]))
+            data.change("drop_requests", {"status": "declined", "decided_by": query.from_user.id,
+                                          "decided_at": now().isoformat()}, id=req["id"])
         else:
-            run("UPDATE drop_requests SET status=?, decided_by=?, decided_at=? WHERE id=?",
-                ("approved" if approve else "declined", query.from_user.id, now().isoformat(), req["id"]))
+            data.change("drop_requests", {"status": "approved" if approve else "declined",
+                                          "decided_by": query.from_user.id, "decided_at": now().isoformat()},
+                        id=req["id"])
         if approve and still:
             ts = now().isoformat()
-            run("DELETE FROM signups WHERE slot_id=? AND user_id=?", (req["slot_id"], a))
-            run("DELETE FROM signups WHERE slot_id=? AND user_id=?", (back, b))
-            run("INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                (req["slot_id"], b, b_nm, ts))
-            run("INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                (back, a, a_nm, ts))
+            take_slot(req["slot_id"], a)
+            take_slot(back, b)
+            give_slot(req["slot_id"], b)
+            give_slot(back, a)
             moved = True
     if approve and not moved:
         await query.answer("One of those shifts has changed, so nothing moved.", show_alert=True)
@@ -1797,6 +1581,6 @@ async def decide_exchange(query, context, req, approve: bool) -> None:
         pass
     if moved:
         for sid in (req["slot_id"], back):
-            s = q1("SELECT d.id AS day_id, d.week_id FROM slots s JOIN days d ON d.id = s.day_id WHERE s.id=?", (sid,))
+            s = data.slot_info(sid)
             if s:
                 await refresh_group(context, s["week_id"], s["day_id"])
