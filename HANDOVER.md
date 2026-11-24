@@ -30,7 +30,7 @@ Each team gets its own Home screen in the App. Admins get an 🛡 Admin switch (
 | Live bot and test bot | @BotFather in Telegram | /mybots → bot → Bot Settings → **Transfer Ownership**, for **both** bots |
 | Bot owner inside the bot | Railway env var `ADMIN_IDS` (Telegram user IDs) | Add the new owner's ID. Remove the old owner's on their last day |
 | Hosting | Railway project "livechat-agent-bot": live service + **LCBot Test** service | Invite the new owner as admin; check billing |
-| Code | GitHub `tcacoustic/LCBot` | New owner needs admin access |
+| Code | GitHub [tcacoustic/LCBot](https://github.com/tcacoustic/LCBot) | New owner needs admin access |
 | Ops sheet link | Google Apps Script project "Special Req – bot link" (separate from the sheet's own script) + the "Special Req" tab of the 🇸🇬 SG B2C Order Entry Tracker | Share or transfer the script project so it keeps running after the old owner's account closes |
 | Data warehouse | `tcacoustic/tc-data-warehouse`, plan #378 (Wilson owns it) | Nothing to transfer. Schema changes go to Wilson as warehouse PRs |
 | Telegram chats the bot works in | The groups in section 4 | Make the new owner an admin of each group, so they can add or remove the bot |
@@ -122,7 +122,13 @@ Check that nobody's personal account is the only way into anything (Railway bill
 
 Most of this bot was built with Claude Code, working in this repo. The new owner can carry on the same way.
 
-**Set up:** install Claude Code (desktop app or terminal) with a TC account, clone `tcacoustic/LCBot`, and open the folder. Claude reads `CLAUDE.md` automatically. Ask it to read this file too, at the start of a session.
+**Set up:** install Claude Code (desktop app or terminal) with a TC account, clone the repo, and open the folder:
+
+```bash
+git clone https://github.com/tcacoustic/LCBot.git
+```
+
+Then open the `LCBot` folder in Claude Code. Claude reads `CLAUDE.md` automatically. Ask it to read this file too, at the start of a session.
 
 **How to ask:** describe the problem in team words, with a screenshot if you have one (blur customer details). For example:
 - "On-Site says the Leave button does nothing on Android. Find out why, fix it on a branch, and put it on the test bot."
@@ -146,7 +152,8 @@ Most of this bot was built with Claude Code, working in this repo. The new owner
 
 ## 9. Useful links
 
+- Bot code: https://github.com/tcacoustic/LCBot (open PRs: https://github.com/tcacoustic/LCBot/pulls)
+- Data warehouse: https://github.com/tcacoustic/tc-data-warehouse (move plan: https://github.com/tcacoustic/tc-data-warehouse/issues/378)
 - LCBot Test Run checklist, On-Site ideas and App vision page, tutorial videos, team guide: Claude artifacts (see section 2).
-- Warehouse move plan: `tcacoustic/tc-data-warehouse` issue #378.
 - Telegram bot docs: https://core.telegram.org/bots
 - Railway: the "livechat-agent-bot" project (Deployments → Logs for errors).
