@@ -114,7 +114,7 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 |---|---|
 | Before the last day | New owner added to `ADMIN_IDS` (live + test), Railway, GitHub (admin), each Telegram group (admin), the Apps Script project. Both bots transferred in @BotFather. Artifacts shared. New owner makes one small change test → ship with the old owner watching |
 | Last day | Old owner removed from `ADMIN_IDS`, Railway, GitHub admin, Telegram group admin, Apps Script. Old owner's local copies of any data deleted (`*.db`, `bot.env`, exports) |
-| Right after | New owner rotates `BOT_TOKEN` (both bots) and `REQUEST_SHEET_SECRET`, and confirms the bot still works. Tell Wilson so he can update the warehouse side if needed |
+| Right after | New owner rotates `BOT_TOKEN` (both bots) and `REQUEST_SHEET_SECRET`, and confirms the bot still works. Tell Wilson, who can update the warehouse side if needed |
 
 Check that nobody's personal account is the only way into anything (Railway billing, Google script, bots).
 
