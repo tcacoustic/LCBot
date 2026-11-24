@@ -13,7 +13,9 @@ both sides answer with their own code: access status, teams, admin, who holds ea
 confirmed each week, each person's timesheet per week and per month (minutes, pay, overtime,
 shifts, open), each overtime claim, the open cases and each appointment.
 
---expected lists the differences already agreed, one fnmatch pattern of question keys per line
+One difference is agreed in #378 and built in: a removed member the old bot shows as `declined` is
+`revoked` now (no access either way). It's counted as expected and listed in --details.
+--expected lists the other differences already agreed, one fnmatch pattern of question keys per line
 (`#` starts a comment). It names people by Telegram id, so keep it outside git, next to the
 snapshot. Any other difference fails the run. The output is counts and PASS or FAIL only;
 --details writes each difference (with ids) to a local file for you to read.
@@ -89,9 +91,12 @@ def answers(core, onsite, rows, ref, legacy, s: dict) -> dict:
     confirmations = rows("confirmations")
     for w in s["weeks"]:
         wid = ref("weeks", w["id"])
-        out[f"week:{w['id']}:confirmed"] = sorted(r["user_id"] for r in confirmations if r["week_id"] == wid)
+        out[f"week:{w['id']}:confirmed"] = sorted(r["user_id"] for r in confirmations if r["week_id"] == wid) \
+            if wid else "(not loaded)"
         for sl in s["slots"][str(w["id"])]:
-            out[f"slot:{sl}:holders"] = sorted(r["user_id"] for r in core.slot_holders(ref("slots", sl)))
+            sid = ref("slots", sl)
+            out[f"slot:{sl}:holders"] = sorted(r["user_id"] for r in core.slot_holders(sid)) if sid else "(not loaded)"
+            out[f"slot:{sl}:capacity"] = core.slot_capacity(sid) if sid else "(not loaded)"
     periods = [(f"week {w['id']}", dt.date.fromisoformat(w["start_date"][:10]), dt.date.fromisoformat(w["end_date"][:10]))
                for w in s["weeks"]]
     for m in s["months"]:
@@ -159,9 +164,10 @@ def new_side(schema: str, s: dict) -> dict:
         return cache[t]
 
     def ref(t, i):
-        return next((r["id"] for r in rows(t) if r.get("legacy_id") == i), f"missing-{t}-{i}")
+        return next((r["id"] for r in rows(t) if r.get("legacy_id") == i), None)
 
-    return answers(core, onsite, rows, ref, lambda r: r.get("legacy_id"), s)
+    # a row made since the move has no old id: it can only ever be a difference
+    return answers(core, onsite, rows, ref, lambda r: r.get("legacy_id") or f"new {r['id']}", s)
 
 
 # ---------------------------------------------------------------------------- comparing
@@ -191,7 +197,8 @@ def compare(old: dict, new: dict, expected: list[str]) -> tuple[Counter, list[st
         if a == b:
             continue
         if a == "declined" and b == "revoked" and key.endswith(":status"):
-            counts[(kind, "expected")] += 1      # a removed member who left: revoked on identity
+            counts[(kind, "expected")] += 1      # #378: a leaver is revoked on identity; no access either way
+            details.append(f"agreed     {key}: old {a!r} new {b!r} (#378: leavers are revoked)")
             continue
         if any(fnmatch.fnmatchcase(key, p) for p in expected):
             counts[(kind, "expected")] += 1

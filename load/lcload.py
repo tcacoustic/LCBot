@@ -79,6 +79,7 @@ class Report:
         self.tables: dict[str, Counter] = defaultdict(Counter)
         self.skips: dict[str, Counter] = defaultdict(Counter)
         self.people = Counter()
+        self.agents = Counter()   # old agents rows: each becomes a member, a request, or a skip
         self.notes = Counter()
 
     def skip(self, table, reason):
@@ -86,6 +87,10 @@ class Report:
 
     def lines(self) -> list[str]:
         out = ["People: " + ", ".join(f"{k} {v}" for k, v in sorted(self.people.items()))]
+        out.append(f"Bot users (agents rows): exported {self.agents['exported']} = placed {self.agents['placed']} "
+                   f"+ skipped {sum(self.skips['agents'].values())}")
+        for reason, n in sorted(self.skips["agents"].items()):
+            out.append(f"    skipped {n}: {reason}")
         out.append(f"{'table':<20}{'exported':>9}{'new':>6}{'changed':>8}{'same':>6}{'skipped':>8}")
         for t, c in self.tables.items():
             skipped = sum(self.skips[t].values())
@@ -97,15 +102,26 @@ class Report:
         return out
 
     def balanced(self) -> bool:
-        return all(c["exported"] == c["new"] + c["changed"] + c["same"] + sum(self.skips[t].values())
-                   for t, c in self.tables.items())
+        return self.agents["exported"] == self.agents["placed"] + sum(self.skips["agents"].values()) and \
+            all(c["exported"] == c["new"] + c["changed"] + c["same"] + sum(self.skips[t].values())
+                for t, c in self.tables.items())
 
     def changes(self) -> int:
         return sum(c["new"] + c["changed"] for c in self.tables.values()) + self.people["created"] \
-            + self.people["nicknames set"]
+            + self.people["nicknames set"] + self.notes["appointments follow-up links set"]
 
 
 # ---------------------------------------------------------------------------- values
+def telegram(v) -> int | None:
+    """A Telegram id from a person column; 0 or empty is nobody (the old bot wrote 0 for "no one")."""
+    if v in (None, "", 0, "0"):
+        return None
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        raise Skip("a person column that isn't a Telegram id")
+
+
 def moment(v, tz=SG):
     if v in (None, ""):
         return None
@@ -179,9 +195,6 @@ class Loader:
                 sql.SQL(", ").join(sql.SQL("{0} = excluded.{0}").format(sql.Identifier(x)) for x in rest),
                 sql.SQL(", ").join(sql.SQL("{}.{}").format(sql.Identifier(new), sql.Identifier(x)) for x in rest),
                 sql.SQL(", ").join(sql.SQL("excluded.{}").format(sql.Identifier(x)) for x in rest))
-            if len(rest) == 1:   # a one-column row comparison needs the row() spelling
-                on_conflict = sql.SQL("do update set {0} = excluded.{0} where {1}.{0} is distinct from excluded.{0}") \
-                    .format(sql.Identifier(rest[0]), sql.Identifier(new))
         else:
             on_conflict = sql.SQL("do nothing")
         stmt = sql.SQL("insert into {} as {} ({}) values ({}) on conflict ({}) {} returning (xmax = 0)").format(
@@ -203,17 +216,23 @@ class Loader:
     def old_rows(self, table: str) -> list[dict]:
         try:
             return [dict(r) for r in self.old.execute(f'select * from "{table}" order by rowid')]
-        except sqlite3.OperationalError:
-            return []
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return []
+            raise
 
     def history_ids(self) -> set[int]:
-        """Telegram ids in any person column of any table: everyone with history."""
+        """Telegram ids in any person column of any table: everyone with history. A team membership
+        alone isn't history: the old bot kept a removed person's teams."""
         seen = set()
         for old, (_, _, people) in self.data.TABLES.items():
             for r in self.old_rows(old):
-                seen |= {int(r[c]) for c in people if r.get(c) not in (None, "")}
-        seen |= {int(r["user_id"]) for r in self.old_rows("memberships")}
-        return seen
+                for c in people:
+                    try:
+                        seen.add(telegram(r.get(c)))
+                    except Skip:
+                        pass   # reported when the row is loaded
+        return seen - {None}
 
     # ------------------------------------------------------------------ people
     def people(self) -> None:
@@ -254,13 +273,14 @@ class Loader:
         conv = self.cols["members"]
         members, requests = [], []
         for tg, a in agents.items():
-            self.r.tables["agents"]["exported"] += 1
+            self.r.agents["exported"] += 1
             member = tg in self.pid and (a["status"] == "active" or (a["status"] == "declined" and tg in history))
             req = {"legacy_id": tg, "telegram_id": tg, "given_name": a["display_name"] or a["name"],
                    "telegram_name": a["name"], "telegram_username": a["username"],
-                   "requested_at": moment(a["requested_at"]),
+                   # the old bot added requested_at late, so older rows may only have decided_at
+                   "requested_at": moment(a["requested_at"]) or moment(a["decided_at"]),
                    "request_message_ids": convert(a["req_msgs"], "jsonb"),
-                   "decided_by_person_id": self.pid.get(int(a["decided_by"])) if a["decided_by"] else None,
+                   "decided_by_person_id": self.pid.get(telegram(a["decided_by"])),
                    "decided_at": moment(a["decided_at"]), "status": None, "person_id": None}
             if member:
                 row = {"person_id": self.pid[tg]}
@@ -269,28 +289,24 @@ class Loader:
                 row.update({k: req[k] for k in ("requested_at", "decided_at", "decided_by_person_id",
                                                  "request_message_ids")})
                 members.append(row)
-                if a["decided_at"]:
+                if req["decided_at"]:              # the approval, for /access's history
                     requests.append({**req, "status": "approved", "person_id": self.pid[tg]})
-            elif a["status"] == "pending":
+            elif a["status"] == "pending" and req["requested_at"]:
                 requests.append({**req, "status": "pending", "decided_at": None})
-            elif a["status"] == "declined" and (req["decided_at"] or req["requested_at"]):
+            elif a["status"] == "declined" and req["requested_at"]:
                 requests.append({**req, "status": "declined", "decided_at": req["decided_at"] or req["requested_at"]})
             else:
-                self.r.skip("agents", f"{a['status']} with no person and no date to record")
-        self.upsert("members", "members", members)
-        self.upsert("join_requests", "join_requests", requests)
-        # every agents row went to members, join_requests or a skip
-        c = self.r.tables.pop("agents")
-        self.r.notes["bot users read (agents rows)"] = c["exported"]
+                self.r.skip("agents", f"{a['status']}, not a member, and no date to record")
+                continue
+            self.r.agents["placed"] += 1
         self.r.tables["members"]["exported"] = len(members)
         self.r.tables["join_requests"]["exported"] = len(requests)
-        if self.r.skips.get("agents"):
-            self.r.tables["agents (not loaded)"]["exported"] = sum(self.r.skips["agents"].values())
-            self.r.skips["agents (not loaded)"] = self.r.skips.pop("agents")
+        self.upsert("members", "members", members)
+        self.upsert("join_requests", "join_requests", requests)
         teams = []
         for m in self.old_rows("memberships"):
             self.r.tables["team_members"]["exported"] += 1
-            tg = int(m["user_id"])
+            tg = telegram(m["user_id"])
             if not any(x["person_id"] == self.pid.get(tg) for x in members):
                 self.r.skip("team_members", "not a member")
                 continue
@@ -315,7 +331,7 @@ class Loader:
                 raise SystemExit(f"{old}.{c} has nowhere to go in {self.schema}.{new}: add it to DROPPED or map it")
             typ, nullable = cols[target]
             if c in people:
-                v = None if v in (None, "") else self.pid.get(int(v), False)
+                v = self.pid.get(telegram(v), False) if telegram(v) else None
                 if v is False:
                     if not nullable:
                         raise Skip(f"{c}: not on identity")
@@ -323,10 +339,13 @@ class Loader:
                     v = None
             elif c in FKS.get(old, {}):
                 ref = FKS[old][c]
-                v = None if v in (None, "") else self.legacy(ref).get(int(v), False)
+                try:
+                    v = None if v in (None, "") else self.legacy(ref).get(int(v), False)
+                except (ValueError, TypeError):
+                    raise Skip(f"{c}: not a row id")
                 if v is False:
-                    if old == "appointments":   # a follow-up of a later visit: set on the second pass
-                        v = None
+                    if old == "appointments" and int(r["followup_of"]) in self.loading:
+                        v = None                    # a follow-up of a later visit: set on the second pass
                     elif not nullable:
                         raise Skip(f"{c}: its {ref} row isn't loaded")
                     else:
@@ -346,6 +365,7 @@ class Loader:
 
     def table(self, old: str) -> None:
         new = self.data.TABLES[old][0]
+        self.loading = {r["id"] for r in self.old_rows(old)} if old == "appointments" else set()
         rows = []
         for r in self.old_rows(old):
             self.r.tables[new]["exported"] += 1
@@ -363,9 +383,10 @@ class Loader:
         target = sql.Identifier(self.schema, "appointments")
         for r in self.old_rows("appointments"):
             if r.get("followup_of") and int(r["followup_of"]) in ids and int(r["id"]) in ids:
-                self.conn.execute(sql.SQL("update {} set followup_of_id = %s where id = %s "
-                                          "and followup_of_id is distinct from %s").format(target),
-                                  (ids[int(r["followup_of"])], ids[int(r["id"])], ids[int(r["followup_of"])]))
+                cur = self.conn.execute(sql.SQL("update {} set followup_of_id = %s where id = %s "
+                                                "and followup_of_id is distinct from %s").format(target),
+                                        (ids[int(r["followup_of"])], ids[int(r["id"])], ids[int(r["followup_of"])]))
+                self.r.notes["appointments follow-up links set"] += cur.rowcount
 
     def settings(self) -> None:
         rows = []
@@ -422,6 +443,12 @@ def load(database_url: str, snapshot: str, schema: str, people: str | None, appl
             diag = e.diag
             raise SystemExit(f"Stopped, nothing written: {type(e).__name__} ({e.sqlstate}) on "
                              f"{diag.table_name or '?'} {diag.constraint_name or ''}".rstrip())
+        except (ValueError, TypeError, KeyError) as e:   # its message can hold a value too
+            conn.rollback()
+            if os.environ.get("LOAD_DEBUG"):
+                raise
+            raise SystemExit(f"Stopped, nothing written: {type(e).__name__} in the snapshot's data. "
+                             "Rerun with LOAD_DEBUG=1 to see it (it may show personal data).") from None
         if apply:
             conn.commit()
         else:

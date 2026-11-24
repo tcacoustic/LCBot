@@ -17,6 +17,7 @@ run-test.sh
 test-data/
 
 # the data load: snapshots, merge lists and parity notes stay outside git
-*.csv
-expected*.txt
-details*.txt
+/*.csv
+/load/*.csv
+/load/expected*.txt
+/load/details*.txt

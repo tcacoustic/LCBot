@@ -20,7 +20,8 @@ try:
 except ImportError:
     lcload = None
 
-STAFF, NEWBIE, LEAVER, DECLINED, PENDING, ADMIN = 990000001, 990000002, 990000003, 990000004, 990000005, 990000099
+STAFF, NEWBIE, LEAVER, DECLINED, PENDING, TEAMONLY, ADMIN = (990000001, 990000002, 990000003, 990000004, 990000005,
+                                                             990000006, 990000099)
 T = "2026-11-02T10:00:00+08:00"
 
 
@@ -31,13 +32,14 @@ def snapshot(path: str) -> None:
     agents = [
         (STAFF, "Ann Tan", "ann", 1, 1, "admin", "active", "Ann", T, ADMIN, T, "[11, 12]", None, 1, 1, 0, "[\"SHOPEE_SG\"]", "SG", None),
         (NEWBIE, "Ben Lim", None, 1, 1, "agent", "active", "Benny", T, ADMIN, T, None, None, 1, 0, 1, None, "MY", None),
-        (LEAVER, "Cal Ng", None, 0, 0, "agent", "declined", None, T, ADMIN, T, None, None, 1, 1, 0, None, "SG", None),
+        (LEAVER, "Cal Ng", None, 0, 0, "agent", "declined", None, None, ADMIN, T, None, None, 1, 1, 0, None, "SG", None),
         (DECLINED, "Dee Ong", "dee", 1, 0, "agent", "declined", "Dee", T, ADMIN, "2026-11-03 09:00:00", None, None, 1, 1, 0, None, None, None),
+        (TEAMONLY, "Fay Ho", None, 0, 0, "agent", "declined", None, T, ADMIN, T, None, None, 1, 1, 0, None, "SG", None),
         (PENDING, "Eve Koh", "eve", 1, 1, "agent", "pending", "Eve", T, None, None, "[5]", None, 1, 1, 0, None, None, None),
     ]
     db.executemany("insert into agents values (" + ",".join("?" * 19) + ")", agents)
     db.executemany("insert into memberships values (?,?,?)",
-                   [(STAFF, "LIVECHAT", T), (STAFF, "ON", T), (LEAVER, "LIVECHAT", T)])
+                   [(STAFF, "LIVECHAT", T), (STAFF, "ON", T), (LEAVER, "LIVECHAT", T), (TEAMONLY, "SH", T)])   # removed, teams kept
     db.execute("insert into weeks values (7, 'Wk 45', '2026-11-02', '2026-11-08', null, '2026-10-31 18:00:00', 'open', 501)")
     db.execute("insert into days values (70, 7, 0, 'MON', '2026-11-02', 601)")
     db.executemany("insert into slots values (?,?,?,?,?,?)", [(700, 70, 0, "10am-12pm", 600, 2), (701, 70, 1, "12pm-2pm", 720, 2)])
@@ -63,6 +65,9 @@ def snapshot(path: str) -> None:
     db.executemany("insert into settings values (?,?)", [
         ("pm_alerts", "on"), ("case_pick:90", f"help:{STAFF}"), ("visit_pin:30", "x"), ("memberships_moved", "1"),
         ("payphoto_wait:-55", "30"), ("case_pick:999", "gone")])
+    db.execute("insert into special_requests (id, order_no, category, details, delivery_date, timeframe, created_by, "
+               "created_at, handled_by) values (95, 'SO-1', 'redeliver', 'x', '2026-11-03', 'am', ?, ?, 0)",
+               (STAFF, T))   # the old bot's 0 for "no one"
     db.commit()
     db.close()
 
@@ -103,7 +108,9 @@ class LoadTest(SnapshotCase):
         self.assertEqual(r.people["created active"], 1)
         self.assertEqual(r.people["created revoked"], 1)
         self.assertEqual(r.people["skipped: no name in the bot or the merge list"], 1)
+        self.assertEqual(r.people["declined or pending, no history: not created"], 3)
         self.assertEqual(r.skips["time_entries"], {"agent_id: not on identity": 1})
+        self.assertEqual(r.notes["appointments follow-up links set"], 1)
 
     def test_a_second_run_changes_nothing(self):
         self.load()
@@ -124,7 +131,7 @@ class LoadTest(SnapshotCase):
         self.assertEqual(self.one(f"select full_name || '|' || nickname from identity.people where telegram_id = {STAFF}"),
                          "Ann Tan Hui|Annie")   # matched: keeps their name, takes the approved nickname
         self.assertEqual(self.one(f"select status from identity.people where telegram_id = {LEAVER}"), "revoked")
-        self.assertEqual(self.one(f"select count(*) from identity.people where telegram_id in ({DECLINED}, {PENDING})"), "0")
+        self.assertEqual(self.one(f"select count(*) from identity.people where telegram_id in ({DECLINED}, {PENDING}, {TEAMONLY})"), "0")
 
     def test_members_teams_and_requests(self):
         self.load()
@@ -138,7 +145,10 @@ class LoadTest(SnapshotCase):
         self.assertEqual(self.one("select string_agg(team, ',' order by team) from lc_bot_dev.team_members"), "LIVECHAT,LIVECHAT,ON")
         self.assertEqual(self.one("select string_agg(telegram_id || ':' || status, ',' order by telegram_id) "
                                   "from lc_bot_dev.join_requests"),
-                         f"{STAFF}:approved,{NEWBIE}:approved,{LEAVER}:approved,{DECLINED}:declined,{PENDING}:pending")
+                         f"{STAFF}:approved,{NEWBIE}:approved,{LEAVER}:approved,{DECLINED}:declined,{PENDING}:pending,"
+                         f"{TEAMONLY}:declined")
+        self.assertEqual(self.one(f"select requested_at = decided_at from lc_bot_dev.join_requests where telegram_id = {LEAVER}"),
+                         "t")   # from before the old bot kept requested_at
 
     def test_times_links_and_settings(self):
         self.load()
@@ -177,12 +187,13 @@ class ParityTest(SnapshotCase):
     def test_old_and_new_answer_the_same_once_the_known_gaps_are_listed(self):
         self.load()
         self.assertEqual(self.parity(), 1)     # the unknown person's shift isn't loaded
-        self.assertEqual(self.parity(["sheet:123456789:*"]), 0)
+        # a declined person's old teams aren't carried over (they never come back as a member)
+        self.assertEqual(self.parity(["sheet:123456789:*", f"person:{TEAMONLY}:teams"]), 0)
 
     def test_a_wrong_row_fails_the_check(self):
         self.load()
         sql("delete from lc_bot_dev.signups where slot_id = (select id from lc_bot_dev.slots where legacy_id = 700)")
-        self.assertEqual(self.parity(["sheet:123456789:*"]), 1)
+        self.assertEqual(self.parity(["sheet:123456789:*", f"person:{TEAMONLY}:teams"]), 1)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,9 @@ Wilson's Mac, outside this repo: it is public.
   skipped. It never prints a name or an id.
 - `parity.py` asks the old bot (on a copy of the snapshot) and the new bot (through the Data API,
   as the schema's own role) the same questions for every person, week, slot, month, overtime
-  claim, open case and appointment, and fails on any difference not on the expected list.
+  claim, open case and appointment, and fails on any difference not on the expected list. One
+  difference is built in, because #378 decided it: a removed member shown as `declined` by the old
+  bot is `revoked` now (no access either way).
 
 ## Files kept outside git
 
