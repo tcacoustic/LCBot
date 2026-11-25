@@ -506,11 +506,12 @@ def slot_minutes(label: str) -> int:
     return b - a
 
 
-def slot_run_from(slot_id: int):
+def slot_run_from(slot_id: int, agent: int | None = None):
     """A slot plus any back-to-back slots the same agent holds after it.
 
     Someone rostered 10-12 and 12-2 clocks in once, so the entry has to cover
-    both blocks rather than stopping at the end of the first.
+    both blocks rather than stopping at the end of the first. `agent` is whose
+    run it is; on a slot two people hold, without it the run is the first holder's.
     """
     first = data.slot_info(slot_id)
     if not first:
@@ -519,7 +520,7 @@ def slot_run_from(slot_id: int):
     holders = b["signups"][slot_id]
     if not holders:
         return [first]
-    holder = holders[0]["user_id"]
+    holder = agent if any(h["user_id"] == agent for h in holders) else holders[0]["user_id"]
     same_day = sorted((s for s in b["slots"][first["day_id"]]
                        if any(h["user_id"] == holder for h in b["signups"][s["id"]])),
                       key=lambda s: s["start_min"])
@@ -551,7 +552,7 @@ def entry_split(row) -> tuple:
     midnight = datetime.combine(day, time(0, 0), TZ)
 
     base, last_end = 0, None
-    for sl in slot_run_from(row["slot_id"]):
+    for sl in slot_run_from(row["slot_id"], row["agent_id"]):
         end_min = sl["start_min"] + slot_minutes(sl["label"])
         slot_end = midnight + timedelta(minutes=end_min)
         if out >= slot_end - timedelta(minutes=SLOT_GRACE_MIN):

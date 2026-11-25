@@ -15,3 +15,9 @@ bot 2.py
 test.env
 run-test.sh
 test-data/
+
+# the data load: snapshots, merge lists and parity notes stay outside git
+/*.csv
+/load/*.csv
+/load/expected*.txt
+/load/details*.txt
