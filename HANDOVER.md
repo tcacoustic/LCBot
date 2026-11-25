@@ -35,7 +35,7 @@ Each team gets its own Home screen in the App. Admins get an 🛡 Admin switch (
 | Data warehouse | `tcacoustic/tc-data-warehouse`, plan #378 (Wilson owns it) | Nothing to transfer. Schema changes go to Wilson as warehouse PRs |
 | Telegram chats the bot works in | The groups in section 4 | Make the new owner an admin of each group, so they can add or remove the bot |
 | Claude artifacts (ideas page, App vision, tutorial videos, team guide, test checklist) | The previous owner's Claude account | Share each with the new owner before the last day. They stop working when the account closes, so ask IT whether to copy them |
-| Claude's notes about this project | Saved only on the previous owner's Mac | The rules that matter are copied into section 8 of this file |
+| Claude's notes about this project | Saved only on the previous owner's Mac | The rules that matter are copied into section 9 of this file |
 
 **After the previous owner leaves:** rotate the bot token (BotFather → API Token → Revoke, then update `BOT_TOKEN` in Railway) and `REQUEST_SHEET_SECRET` (Railway + the Apps Script's Script Properties). Rotating is normal practice when someone who knew a secret leaves.
 
@@ -94,7 +94,7 @@ With the On-Site App (PR #81), optional: `PAYNOW_UEN` / `PAYNOW_NAME` (only for 
 
 The full list with defaults is in the Config section at the top of `core.py`. The test bot has its own values (its own token, test sheet copy).
 
-## 6. Open work (as of Tue 24 Nov 2026)
+## 6. Open work (as of Wed 25 Nov 2026)
 
 | What | State | Next step |
 |---|---|---|
@@ -106,6 +106,7 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 | MY / HK / TH sheets for Ops requests | Parked | SG sheet only today |
 | RMA app (Service Concierge replacement) | AppSheet trial planned | Waiting on IT |
 | Standalone phone app (outside Telegram) | Idea | Installable web app with "Log in with Telegram" first; needs IT / AI lead sign-off |
+| App error box says "send it to @caydenseee" (`core.py` `MINIAPP_HTML`, on `main`, `staging`, `onsite-app`) | Points at the previous owner | Change to the new owner's handle, or "use the Feedback button". Branch from `staging`, tell Wilson, or do it after #84 |
 | `/stats` (owner-only counts) | Idea | Build if wanted |
 
 ## 7. Handover checklist
@@ -118,7 +119,27 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 
 Check that nobody's personal account is the only way into anything (Railway billing, Google script, bots).
 
-## 8. Improving the bot with Claude
+## 8. Troubleshooting
+
+The new owner isn't technical. When they bring a problem, Claude should do the investigating, explain in plain words, and give click-by-click steps for anything they must do in Railway, BotFather or Google. First question: does it affect **one person** (access, teams, their phone) or **everyone** (the bot, Railway, Telegram)?
+
+| Symptom | Check first | Fix | Then |
+|---|---|---|---|
+| Bot doesn't reply to anyone | status.railway.com, Telegram status; Railway → live service → Deployments: is the newest deploy Active? | Outage: wait. Crashed: Redeploy the last good deploy | Read Railway → Logs (owner pastes them with names removed) |
+| Broke right after a ship | The newest deploy is that change | Redeploy the previous deploy, then revert the PR on GitHub | Fix on a branch, test, ship again |
+| Logs: `Conflict: terminated by other getUpdates request` | Someone else is polling with the live token | Revoke in @BotFather, new `BOT_TOKEN` in Railway. Bot is offline until the new deploy is Active, so check the deploy queue is moving first | Tell IT and Wilson the same day |
+| App error box / App won't load, for everyone | Is the bot replying? `401` = `BOT_TOKEN` changed or `initData` check failing; blank = `PUBLIC_URL` | Close and reopen the App (cache); `BUILD_STAMP` changes each boot | Logs: `... view failed` lines in `webapp.py` name the screen |
+| One person: no access / App won't open | `/pending`, App → Admin → People | Approve, tick teams, reopen Telegram | `/access @handle` shows who approved them and when |
+| Wrong screens or buttons | Their teams (memberships) | Fix teams in App → Admin → People; menu refreshes (`refresh_menu_for`) | `/viewas` to see what they see |
+| Board / shift call / reminders didn't post | `/newweek` done? Bot still in the group? Jobs live in memory and are re-armed in `post_init` on restart | Re-add the bot; restart (redeploy) re-arms jobs | Group upgraded to supergroup = new chat ID: `/chatid` in the group (owner only), update `GROUP_CHAT_ID` |
+| Store or Ops chat stopped getting posts | Bot removed from the chat, or chat moved | Re-add, then `/onchat <store>` or `/opschat` (add MY, HK or TH) in that chat | |
+| Ops request in Telegram but not in the sheet | Apps Script "Special Req – bot link" → run `checkBotLink` then `checkSetup` | `REQUEST_SHEET_SECRET` must match in Railway and Script Properties; `REQUEST_SHEET_URL` must be the current web app URL | After editing the script: Deploy → **New deployment** (or Edit → New version), else the old code keeps running |
+| Hours or pay look wrong | `/timesheet`, `/audit`, App Hours tab | `/clockoutfor @handle 18:00`, `/addtime @handle YYYY-MM-DD HH:MM HH:MM`, `/fixtime <id> HH:MM HH:MM` | Explain the calculation (`PAY_MODE`, `rate_for`, `OT_*`) |
+| Data missing or wrong (after the warehouse switch) | Everyone, since a time? | Don't hand-edit data | Wilson owns the data |
+
+Golden rules: undo first (Redeploy the last good deploy), investigate after. Never ask for or accept tokens or passwords in chat. Logs and screenshots may contain staff or customer names; ask the owner to remove them first.
+
+## 9. Improving the bot with Claude
 
 Most of this bot was built with Claude Code, working in this repo. The new owner can carry on the same way.
 
@@ -148,12 +169,17 @@ Then open the `LCBot` folder in Claude Code. Claude reads `CLAUDE.md` automatica
 - Look and feel: dates as "Fri 16 Oct" (no Today/Tomorrow), a Back button on every step, country flags and platform logos on every screen, App first (the `/` menu shows only chat commands).
 - Build what the team asked for, launch it small (SG first), and improve from their feedback.
 
+**Working with a non-technical owner:** explain in plain words, no jargon. Give click-by-click steps for Railway, BotFather, GitHub and Google. Do the git and GitHub work yourself, and say what each step does before it changes anything live.
+
+**Finding new needs:** once a month, the owner can paste in staff Feedback messages (names removed) and ask Claude to group them into themes and quick wins. They can also ask each team lead "what do you still do outside the bot?" and ask which of those could move into the bot. Suggest small steps: one team or SG first, then improve from feedback. Don't add extras nobody asked for.
+
 **What to check yourself:** read the PR description, try it on the test bot, and ask Claude "what could this break?" before shipping. Claude can be confidently wrong; the test bot is where you find out.
 
-## 9. Useful links
+## 10. Useful links
 
 - Bot code: https://github.com/tcacoustic/LCBot (open PRs: https://github.com/tcacoustic/LCBot/pulls)
 - Data warehouse: https://github.com/tcacoustic/tc-data-warehouse (move plan: https://github.com/tcacoustic/tc-data-warehouse/issues/378)
 - LCBot Test Run checklist, On-Site ideas and App vision page, tutorial videos, team guide: Claude artifacts (see section 2).
 - Telegram bot docs: https://core.telegram.org/bots
+- Plain-language guide for the owner (transfers, everyday jobs, troubleshooting, using Claude): Claude Doc "SH Bot: guide for the new owner" (shared with the owner; ask IT to keep a copy).
 - Railway: the "livechat-agent-bot" project (Deployments → Logs for errors).
