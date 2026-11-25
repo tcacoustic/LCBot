@@ -58,6 +58,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         from ops import start_cant_reason
         return await start_cant_reason(update, context, context.args[0][4:])
 
+    # From 📝 Note to the specialist under an On-Site request.
+    if context.args and context.args[0].startswith("oqn_"):
+        from onsite import start_rq_note
+        return await start_rq_note(update, context, context.args[0][4:])
+
     # From 📋 Open all in SH Bot under the 10am bump: the case list.
     if context.args and context.args[0] == "cases" and (status == "active" or is_owner(user.id)):
         from handover import cases_list
@@ -69,10 +74,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if context.args and context.args[0].startswith("note_") and (
             status == "active" or is_owner(user.id)):
         raw = context.args[0][5:]
-        r = q1("SELECT username, closed FROM ho_cases WHERE id=?",
-               (int(raw),)) if raw.isdigit() else None
+        r = data.row("ho_cases", id=raw) if re.fullmatch(r"[0-9a-f-]{36}", raw) else None
         if r and not r["closed"]:
-            context.user_data["case_note"] = ("n", int(raw))
+            context.user_data["case_note"] = ("n", raw)
             await update.message.reply_text(
                 f"📝 <b>Note on {esc(r['username'])}</b>\n\nWhat's the latest? "
                 "(e.g. refund done, waiting on courier)\n\n<i>/cancel to stop</i>",
@@ -132,13 +136,8 @@ async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ASK_NAME
 
     async with write_lock:
-        run(
-            "INSERT OR REPLACE INTO agents "
-            "(user_id, name, username, dm_ok, active, role, status, "
-            " display_name, requested_at) "
-            "VALUES (?,?,?,1,1,'agent','pending',?,?)",
-            (user.id, user.full_name, user.username, given, now().isoformat()),
-        )
+        data.request_access(user.id, given, telegram_name=user.full_name,
+                            telegram_username=user.username)
 
     await update.message.reply_text(
         f"Thanks {esc(given)}! I've sent your request to the team admins.\n\n"
@@ -166,49 +165,38 @@ async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ]
     )
     sent = await notify_admins(context.bot, text, kb)
-    run("UPDATE agents SET req_msgs=? WHERE user_id=?",
-        (json.dumps(sent), user.id))
+    data.set_request_messages(user.id, sent)
     if not sent:
         log.warning("Access request from %s but no admin could be reached.", user.id)
     return ConversationHandler.END
 
 
 async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Set the name that appears on the schedule."""
+    """Fix the name on a waiting access request. A member's name is their people record's
+    (nickname, else full name), which the bot reads and doesn't change."""
     if not is_admin(update.effective_user.id):
         return
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /rename @handle Jia En\n"
-            "or:    /rename 123456789 Jia En"
-        )
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /rename 123456789 Jia En")
         return
 
-    target, new_name = context.args[0], " ".join(context.args[1:]).strip()
-    row = None
-    if target.startswith("@"):
-        row = q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
-    elif target.isdigit():
-        row = q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
+    target, new_name = int(context.args[0]), " ".join(context.args[1:]).strip()
+    row = data.agent(target)
     if not row:
         await update.message.reply_text("No one matches that. Check /roster.")
         return
+    if row["status"] != "pending":
+        await update.message.reply_text(
+            "Names on the schedule come from the company's people record (nickname, else full "
+            "name). Ask the warehouse owner to change it there.")
+        return
 
     async with write_lock:
-        run(
-            "UPDATE agents SET display_name=? WHERE user_id=?",
-            (new_name, row["user_id"]),
-        )
-        # keep the schedule in step with the new name
-        run("UPDATE signups SET name=? WHERE user_id=?", (new_name, row["user_id"]))
-
+        data.rename_request(target, new_name)
     await update.message.reply_text(
-        f"Renamed to <b>{esc(new_name)}</b> on the schedule.",
+        f"Request renamed to <b>{esc(new_name)}</b>. That's the name they'll join under.",
         parse_mode=constants.ParseMode.HTML,
     )
-    w = open_week() or latest_week()
-    if w:
-        await refresh_group(context, w["id"])
 
 
 async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -221,37 +209,29 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Only admins can approve access.", show_alert=True)
         return
 
-    row = q1("SELECT * FROM agents WHERE user_id=?", (target_id,))
-    if not row:
-        await query.answer("That request no longer exists.", show_alert=True)
-        return
-    if row["status"] != "pending":
-        await query.answer(
-            f"Already handled — {esc(row['name'])} is {row['status']}.", show_alert=True
-        )
-        return
-
     approve = kind in ("ap", "ao")
-    new_status = "active" if approve else "declined"
     async with write_lock:
-        run(
-            "UPDATE agents SET status=?, decided_by=?, decided_at=? WHERE user_id=?",
-            (new_status, decider.id, now().isoformat(), target_id),
-        )
-        if kind == "ao":                # an older request's "Approve as Online"
+        row = data.decide(target_id, approve=approve, by=decider.id)
+        if row and kind == "ao":        # an older request's "Approve as Online"
             set_depts(target_id, ["ON"])
+    if not row:
+        now_row = data.agent(target_id)
+        if not now_row:
+            await query.answer("That request no longer exists.", show_alert=True)
+        else:
+            await query.answer(
+                f"Already handled — {esc(now_row['name'])} is {now_row['status']}.", show_alert=True
+            )
+        return
 
-    shown = row["display_name"] or row["name"]
+    shown = row["name"]
     verdict = "approved ✅" if approve else "declined 🚫"
     await query.answer(f"{shown} {verdict}")
     settled = (
         f"🔔 <b>Access request</b>\n\n<b>{esc(shown)}</b>\n\n"
         f"{verdict} by {esc(decider.full_name)}"
     )
-    try:
-        sent = json.loads(row["req_msgs"] or "[]")
-    except (json.JSONDecodeError, TypeError):
-        sent = []
+    sent = row["req_msgs"] or []
     if sent:
         await settle_admin_messages(context.bot, sent, settled)
     else:
@@ -295,7 +275,7 @@ def dept_question(shown: str) -> str:
 
 
 def dept_picker(user_id: int) -> InlineKeyboardMarkup:
-    have = {r["dept"] for r in q("SELECT dept FROM memberships WHERE user_id=?", (user_id,))}
+    have = data.teams(user_id)
     rows = [[InlineKeyboardButton(f"{'✅' if key in have else '⬜️'} {name}",
                                   callback_data=f"dp:{user_id}:{key}")]
             for key, name in DEPARTMENTS]
@@ -333,12 +313,12 @@ async def on_dept_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     _, raw, choice = query.data.split(":", 2)
     uid = int(raw)
-    row = q1("SELECT * FROM agents WHERE user_id=?", (uid,))
+    row = data.agent(uid)
     if not row:
         await query.answer("That person isn't on the list any more.", show_alert=True)
         return
-    shown = row["display_name"] or row["name"]
-    have = [r["dept"] for r in q("SELECT dept FROM memberships WHERE user_id=?", (uid,))]
+    shown = row["name"]
+    have = sorted(data.teams(uid))
 
     if choice == "done":
         if not have:
@@ -363,7 +343,7 @@ async def on_dept_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await ask_store(context.bot, uid, uid)
             await context.bot.send_message(
                 query.from_user.id, f"I've asked {shown} to pick their store. "
-                "To set it for them: /specialists @username")
+                "To set it for them: /specialists Name")
         return
 
     if choice not in DEPT_NAMES:
@@ -373,7 +353,7 @@ async def on_dept_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     async with write_lock:
         set_depts(uid, want)
         if "LIVECHAT" in want and "LIVECHAT" not in have:
-            run("UPDATE agents SET on_avails=1, tag_calls=1 WHERE user_id=?", (uid,))
+            data.set_agent(uid, on_avails=True, tag_calls=True)
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=dept_picker(uid))
@@ -392,19 +372,18 @@ async def cmd_departments(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not target:
         lines = ["<b>Teams</b>", ""]
         for key, name in DEPARTMENTS:
-            n = q1("SELECT COUNT(*) c FROM memberships m JOIN agents a ON a.user_id=m.user_id "
-                   "WHERE m.dept=? AND a.status='active'", (key,))["c"]
+            n = len(data.agents(status="active", team=key))
             lines.append(f"• {esc(name)}: {n}")
-        lines += ["", "Change someone's team: <code>/departments @username</code>",
+        lines += ["", "Change someone's team: <code>/departments Name</code>",
                   "Everyone, by team: /roster"]
         await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
         return
     row = find_agent(target)
     if not row:
-        await update.message.reply_text("I can't find that person. Try their @username.")
+        await update.message.reply_text("I can't find that person. Try their name or Telegram id.")
         return
     await update.message.reply_text(
-        dept_question(row["display_name"] or row["name"]),
+        dept_question(row["name"]),
         parse_mode=constants.ParseMode.HTML, reply_markup=dept_picker(row["user_id"]))
 
 
@@ -488,17 +467,16 @@ async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     _, raw, choice = query.data.split(":", 2)
     uid = int(raw)
-    row = q1("SELECT * FROM agents WHERE user_id=?", (uid,))
+    row = data.agent(uid)
     if not row:
         await query.answer("That person isn't on the list any more.", show_alert=True)
         return
-    shown = row["display_name"] or row["name"]
+    shown = row["name"]
 
     if choice == "make":
         async with write_lock:
-            run("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
-                "VALUES (?, 'ON', ?)", (uid, now().isoformat()))
-            run("UPDATE agents SET channels=COALESCE(channels, '[]') WHERE user_id=?", (uid,))
+            data.set_teams(uid, data.teams(uid) | {"ON"})
+            data.set_agent(uid, channels=online_channels(uid))
         await welcome_to_team(context.bot, uid)
         await query.answer(f"{shown} is now in the Online team")
         await query.edit_message_text(
@@ -508,8 +486,8 @@ async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if choice == "remove":
         async with write_lock:
-            run("DELETE FROM memberships WHERE user_id=? AND dept='ON'", (uid,))
-            run("UPDATE agents SET channels=NULL WHERE user_id=?", (uid,))
+            data.set_teams(uid, data.teams(uid) - {"ON"})
+            data.set_agent(uid, channels=None)
         await welcome_to_team(context.bot, uid)
         await query.answer()
         await query.edit_message_text(
@@ -532,7 +510,7 @@ async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     have = online_channels(uid)
     have = [k for k in have if k != choice] if choice in have else have + [choice]
     async with write_lock:
-        run("UPDATE agents SET channels=? WHERE user_id=?", (json.dumps(have), uid))
+        data.set_agent(uid, channels=have)
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=channel_picker(uid))
@@ -549,13 +527,11 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     target = " ".join(context.args).strip()
     if not target:
-        team = q("SELECT * FROM agents WHERE status='active' AND user_id IN "
-                 "(SELECT user_id FROM memberships WHERE dept='ON') "
-                 "ORDER BY name")
+        team = data.agents(status="active", team="ON")
         lines = ["<b>Online team</b>", ""]
-        lines += [f"• {esc(r['display_name'] or r['name'])}: "
+        lines += [f"• {esc(r['name'])}: "
                   f"{esc(channels_text(r['user_id']))}" for r in team] or ["Nobody yet."]
-        lines += ["", "Change someone's channels: <code>/channels @username</code>",
+        lines += ["", "Change someone's channels: <code>/channels Name</code>",
                   "New people: tap <b>Approve</b>, then tick ON."]
         await update.message.reply_text(
             "\n".join(lines), parse_mode=constants.ParseMode.HTML)
@@ -563,9 +539,9 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     row = find_agent(target)
     if not row:
-        await update.message.reply_text("I can't find that person. Try their @username.")
+        await update.message.reply_text("I can't find that person. Try their name or Telegram id.")
         return
-    shown = row["display_name"] or row["name"]
+    shown = row["name"]
     if not is_online(row["user_id"]):
         await update.message.reply_text(
             f"{shown} isn't in the Online team. Move them over? They'll only "
@@ -592,7 +568,7 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not row:
             await update.message.reply_text("No one matches that. Check /roster.")
             return
-        nm = row["display_name"] or row["name"]
+        nm = row["name"]
         lines = [f"<b>{esc(nm)}</b>", ""]
         lines.append(f"Status: <b>{row['status']}</b>")
         if row["requested_at"]:
@@ -615,11 +591,8 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
 
-    rows = q(
-        """SELECT * FROM agents WHERE decided_at IS NOT NULL
-           ORDER BY decided_at DESC LIMIT 25"""
-    )
-    pending = q1("SELECT COUNT(*) c FROM agents WHERE status='pending'")["c"]
+    rows = data.decisions(25)
+    pending = len(data.agents(status="pending"))
     lines = ["<b>Access decisions</b>", ""]
     if not rows:
         lines.append("Nothing recorded yet.")
@@ -634,10 +607,10 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if r["decided_at"] else ""
         )
         lines.append(
-            f"{mark} {esc(r['display_name'] or r['name'])} — "
+            f"{mark} {esc(r['name'])} — "
             f"by {esc(who)}, {when}"
         )
-    declined = q("SELECT * FROM agents WHERE status='declined'")
+    declined = data.agents(status="declined")
     if declined:
         lines += [
             "",
@@ -646,7 +619,7 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ]
     if pending:
         lines += ["", f"⏳ {pending} waiting now — see /pending"]
-    lines.append("\n<code>/access @handle</code> for one person's history.")
+    lines.append("\n<code>/access Name</code> for one person's history.")
     await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
@@ -655,9 +628,7 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
-    rows = q(
-        "SELECT * FROM agents WHERE status='pending' ORDER BY requested_at"
-    )
+    rows = data.agents(status="pending")
     if not rows:
         await update.message.reply_text("No one is waiting for approval.")
         return
@@ -673,7 +644,7 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ]
         )
         await reply_long(update.message, 
-            f"<b>{esc(r['display_name'] or r['name'])}</b>\n"
+            f"<b>{esc(r['name'])}</b>\n"
             f"{handle} · <code>{r['user_id']}</code>",
             reply_markup=kb,
             parse_mode=constants.ParseMode.HTML,
@@ -685,8 +656,8 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not is_admin(update.effective_user.id):
         return
-    rows = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') ORDER BY name")
-    waiting = q1("SELECT COUNT(*) c FROM agents WHERE status='pending'")["c"]
+    rows = data.agents(status="active", team="LIVECHAT")
+    waiting = len(data.agents(status="pending"))
     if not rows:
         await reply_long(update.message, 
             "Roster is empty. Agents join it by tapping a slot, or by sending me /start."
@@ -696,9 +667,7 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         role = role_of(r["user_id"])
         badge = {"owner": "👑", "admin": "🛠"}.get(role, "")
         bits = f"{'🔔' if r['dm_ok'] else '🔕'}{badge} "
-        bits += esc(r["display_name"] or r["name"])
-        if r["username"]:
-            bits += f" @{r['username']}"
+        bits += esc(r["name"])
         if not r["on_avails"]:
             bits += " · not on avails"
         if r["salaried"]:
@@ -722,17 +691,15 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for key, name in DEPARTMENTS:
         if key == "LIVECHAT":
             continue
-        team = q("SELECT a.* FROM agents a JOIN memberships m ON m.user_id=a.user_id "
-                 "WHERE m.dept=? AND a.status='active' ORDER BY a.name", (key,))
+        team = data.agents(status="active", team=key)
         if not team:
             continue
         lines += ["", f"<b>{esc(name)} ({len(team)})</b>"] + [
-            f"{esc(r['display_name'] or r['name'])}"
-            + (f" @{r['username']}" if r["username"] else "")
+            f"{esc(r['name'])}"
             + (f" — {esc(channels_text(r['user_id']))}" if key == "ON" else "")
             for r in team
         ]
-    lines.append("<i>Change someone's team with /departments @handle.</i>")
+    lines.append("<i>Change someone's team with /departments Name.</i>")
 
     # Owners set in config may have never messaged the bot.
     missing = [
@@ -747,7 +714,7 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append("\n🔕 = hasn't sent me /start, so can't get shift reminders.")
     lines.append(
         "<code>/makeadmin @handle</code> · <code>/removeadmin @handle</code> "
-        "· <code>/removeagent @handle</code>"
+        "· <code>/removeagent Name</code>"
     )
     if waiting:
         lines.append(f"\n⏳ {waiting} waiting for approval — see /pending")
@@ -763,13 +730,7 @@ async def _set_role(update, context, new_role: str) -> None:
         await update.message.reply_text(f"Usage: /{verb} @handle")
         return
     target = " ".join(context.args).strip()
-    row = None
-    if target.startswith("@"):
-        row = q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
-    elif target.isdigit():
-        row = q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
-    if not row:
-        row = q1("SELECT * FROM agents WHERE lower(name)=lower(?)", (target,))
+    row = find_agent(target)
     if not row:
         await update.message.reply_text(
             "No one on the roster matches that. Check /roster."
@@ -781,7 +742,7 @@ async def _set_role(update, context, new_role: str) -> None:
         )
         return
 
-    run("UPDATE agents SET role=? WHERE user_id=?", (new_role, row["user_id"]))
+    data.set_agent(row["user_id"], role=new_role)
     await refresh_menu_for(context.bot, row["user_id"])
 
     if new_role == "admin":
@@ -813,12 +774,12 @@ async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        on = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND tag_calls=1 ORDER BY name")
-        off = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND tag_calls=0 ORDER BY name")
+        on = data.agents(status="active", team="LIVECHAT", tag_calls=True)
+        off = data.agents(status="active", team="LIVECHAT", tag_calls=False)
         lines = [f"<b>Tagged in the nightly post ({len(on)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in on] or ["  nobody"]
         lines += ["", f"<b>Not tagged ({len(off)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in off] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in off] or ["  nobody"]
         lines += [
             "",
             "<code>/tag off @handle</code> — stop pinging them",
@@ -845,8 +806,8 @@ async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     want = 1 if mode == "on" else 0
     async with write_lock:
-        run("UPDATE agents SET tag_calls=? WHERE user_id=?", (want, row["user_id"]))
-    nm = row["display_name"] or row["name"]
+        data.set_agent(row["user_id"], tag_calls=bool(want))
+    nm = row["name"]
     if want:
         msg = f"<b>{esc(nm)}</b> will be tagged in the nightly on-duty post again."
     else:
@@ -860,12 +821,12 @@ async def cmd_salaried(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        sal = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND salaried=1 ORDER BY name")
-        hourly = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND salaried=0 ORDER BY name")
+        sal = data.agents(status="active", team="LIVECHAT", salaried=True)
+        hourly = data.agents(status="active", team="LIVECHAT", salaried=False)
         lines = [f"<b>Salaried — no hourly pay ({len(sal)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in sal] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in sal] or ["  nobody"]
         lines += ["", f"<b>Paid hourly ({len(hourly)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in hourly] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in hourly] or ["  nobody"]
         lines += [
             "",
             "<code>/salaried on @handle</code> — stop hourly pay",
@@ -894,8 +855,8 @@ async def cmd_salaried(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     want = 1 if mode == "on" else 0
     async with write_lock:
-        run("UPDATE agents SET salaried=? WHERE user_id=?", (want, row["user_id"]))
-    nm = row["display_name"] or row["name"]
+        data.set_agent(row["user_id"], salaried=bool(want))
+    nm = row["name"]
     if want:
         msg = (f"<b>{esc(nm)}</b> is salaried — livechat hours won't be paid "
                "hourly.\nThey still show on the board and still clock in and out.")
@@ -914,12 +875,12 @@ async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        on = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND on_avails=1 ORDER BY name")
-        off = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND on_avails=0 ORDER BY name")
+        on = data.agents(status="active", team="LIVECHAT", on_avails=True)
+        off = data.agents(status="active", team="LIVECHAT", on_avails=False)
         lines = [f"<b>On the avails roster ({len(on)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in on] or ["  nobody"]
         lines += ["", f"<b>Not tagged or chased ({len(off)})</b>"]
-        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in off] or ["  nobody"]
+        lines += [f"  {esc(a["name"])}" for a in off] or ["  nobody"]
         lines += [
             "",
             "<code>/avails off @handle</code> — stop tagging them",
@@ -945,8 +906,8 @@ async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     want = 1 if mode == "on" else 0
     async with write_lock:
-        run("UPDATE agents SET on_avails=? WHERE user_id=?", (want, row["user_id"]))
-    nm = row["display_name"] or row["name"]
+        data.set_agent(row["user_id"], on_avails=bool(want))
+    nm = row["name"]
     if want:
         msg = (f"<b>{esc(nm)}</b> is back on the avails roster — "
                "they'll be tagged and chased again.")
@@ -967,21 +928,13 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if not context.args:
         await update.message.reply_text(
-            "Usage: <code>/removeagent @handle</code>, or their numeric ID from /roster.",
+            "Usage: <code>/removeagent Name</code>, or their numeric ID from /roster.",
             parse_mode=constants.ParseMode.HTML,
         )
         return
 
     target = " ".join(context.args).strip()
-    row = None
-    if target.startswith("@"):
-        row = q1(
-            "SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],)
-        )
-    elif target.isdigit():
-        row = q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
-    if not row:
-        row = q1("SELECT * FROM agents WHERE lower(name)=lower(?)", (target,))
+    row = find_agent(target)
     if not row:
         await update.message.reply_text(
             f"No one on the roster matches {target!r}. Check /roster for exact handles and IDs."
@@ -1006,18 +959,11 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def remove_from_roster(user_id: int) -> tuple:
     """Off the bot, with any slots they held this week freed. Past weeks keep
     their history. Returns (slots freed, the week's id or None)."""
-    run("UPDATE agents SET active=0, status='declined' WHERE user_id=?", (user_id,))
+    data.set_agent(user_id, active=False, status="declined")
     w = open_week() or latest_week()
     if not w:
         return 0, None
-    cur = run(
-        """DELETE FROM signups WHERE user_id=? AND slot_id IN
-           (SELECT s.id FROM slots s JOIN days d ON d.id=s.day_id
-            WHERE d.week_id=?)""",
-        (user_id, w["id"]),
-    )
-    run("DELETE FROM confirmations WHERE week_id=? AND user_id=?", (w["id"], user_id))
-    return cur.rowcount, w["id"]
+    return data.free_week(user_id, w["id"]), w["id"]
 
 
 # --------------------------------------------------------------------------
@@ -1029,11 +975,9 @@ FEEDBACK_KINDS = {"PROBLEM": "🐞 Problem", "IDEA": "💡 Idea", "QUESTION": "�
 
 
 def feedback_head(user_id: int, kind: str = "", where: str = "") -> str:
-    row = q1("SELECT username FROM agents WHERE user_id=?", (user_id,))
-    handle = f" @{row['username']}" if row and row["username"] else ""
     teams = [DEPT_NAMES[k] for k, _ in DEPARTMENTS if k in depts_of(user_id)]
     bits = [b for b in (FEEDBACK_KINDS.get(kind, ""), f"from the App: {where}" if where else "") if b]
-    return (f"💬 <b>Feedback from {esc(display_name_of(user_id, 'someone'))}</b>{esc(handle)}"
+    return (f"💬 <b>Feedback from {esc(display_name_of(user_id, 'someone'))}</b>"
             f"{' · ' + esc(' + '.join(teams)) if teams else ''}"
             + (f"\n{esc(' · '.join(bits))}" if bits else ""))
 

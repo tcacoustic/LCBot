@@ -23,8 +23,11 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import threading
+
+from data import Data
+from rest import RestClient
+from service_token import service_token_from_env
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 from dataclasses import dataclass
@@ -66,6 +69,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 
 
+
 DAY_ALIASES = {
     "THURS": "THU", "THURSDAY": "THU", "THUR": "THU",
     "MONDAY": "MON", "TUESDAY": "TUE", "TUES": "TUE", "WEDNESDAY": "WED",
@@ -102,7 +106,12 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "").strip() or "Asia/Singapore")
-DB_PATH = os.environ.get("DB_PATH", "").strip() or "avails.db"
+
+# The warehouse's Data API, as the bot's own role. DB_SCHEMA has no default on purpose:
+# LCBot Test sets lc_bot_dev and production sets lc_bot, so neither can reach the other's data.
+DB_SCHEMA = os.environ["DB_SCHEMA"].strip()
+data = Data(RestClient(os.environ["SUPABASE_URL"].strip(), os.environ["SUPABASE_PUBLISHABLE_KEY"].strip(),
+                       service_token_from_env(), schema=DB_SCHEMA, timezone=TZ.key))
 MIN_PER_SLOT = env_int("MIN_PER_SLOT", 1)
 # How many agents can hold the same slot. 1 = first come, first served.
 SLOT_CAPACITY = max(1, env_int("SLOT_CAPACITY", 1))
@@ -132,9 +141,6 @@ DEFAULT_RATE_CENTS = env_int("DEFAULT_RATE_CENTS", 0)
 REVIEW_RATE_CENTS = env_int("REVIEW_RATE_CENTS", 1000)
 # How long after a shift ends before an open clock-in is auto-closed.
 AUTO_CLOSE_GRACE_MIN = env_int("AUTO_CLOSE_GRACE_MIN", 120)
-# Automatic database backup, DM'd to owners. 0-6 = Mon-Sun.
-BACKUP_DAY = env_int("BACKUP_DAY", 0)
-BACKUP_TIME = os.environ.get("BACKUP_TIME", "").strip() or "09:00"
 # "slot"   = pay the full rostered block, however long they were actually on
 # "actual" = pay the exact clocked time
 PAY_MODE = (os.environ.get("PAY_MODE", "").strip().lower() or "slot")
@@ -239,425 +245,10 @@ write_lock = asyncio.Lock()
 # Database
 # --------------------------------------------------------------------------
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS weeks (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    label         TEXT NOT NULL,
-    start_date    TEXT NOT NULL,
-    end_date      TEXT NOT NULL,
-    key_events    TEXT,
-    deadline      TEXT NOT NULL,
-    status        TEXT NOT NULL DEFAULT 'open',
-    header_msg_id INTEGER
-);
-CREATE TABLE IF NOT EXISTS days (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    week_id   INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
-    idx       INTEGER NOT NULL,
-    name      TEXT NOT NULL,
-    the_date  TEXT NOT NULL,
-    msg_id    INTEGER
-);
-CREATE TABLE IF NOT EXISTS slots (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    day_id     INTEGER NOT NULL REFERENCES days(id) ON DELETE CASCADE,
-    idx        INTEGER NOT NULL,
-    label      TEXT NOT NULL,
-    start_min  INTEGER NOT NULL,
-    capacity   INTEGER
-);
-CREATE TABLE IF NOT EXISTS signups (
-    slot_id  INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
-    user_id  INTEGER NOT NULL,
-    name     TEXT NOT NULL,
-    ts       TEXT NOT NULL,
-    PRIMARY KEY (slot_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS agents (
-    user_id  INTEGER PRIMARY KEY,
-    name     TEXT NOT NULL,
-    username TEXT,
-    dm_ok    INTEGER NOT NULL DEFAULT 0,
-    active   INTEGER NOT NULL DEFAULT 1,
-    role     TEXT NOT NULL DEFAULT 'agent',
-    status   TEXT NOT NULL DEFAULT 'active',
-    display_name TEXT,
-    requested_at TEXT,
-    decided_by   INTEGER,
-    decided_at   TEXT
-);
-CREATE TABLE IF NOT EXISTS presets (
-    name   TEXT PRIMARY KEY,
-    config TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-CREATE TABLE IF NOT EXISTS fixed_slots (
-    user_id  INTEGER NOT NULL,
-    day_name TEXT NOT NULL,
-    label    TEXT NOT NULL,
-    PRIMARY KEY (user_id, day_name, label)
-);
-CREATE TABLE IF NOT EXISTS drop_requests (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind         TEXT NOT NULL DEFAULT 'drop',
-    agent_id     INTEGER NOT NULL,
-    slot_id      INTEGER NOT NULL,
-    reason       TEXT,
-    target_id    INTEGER,
-    requested_at TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',
-    decided_by   INTEGER,
-    decided_at   TEXT
-);
-CREATE TABLE IF NOT EXISTS ot_claims (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id    INTEGER NOT NULL,
-    agent_id    INTEGER NOT NULL,
-    claimed_out TEXT NOT NULL,
-    ot_minutes  INTEGER NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL DEFAULT 'pending',
-    asked_at    TEXT NOT NULL,
-    decided_by  INTEGER,
-    decided_at  TEXT,
-    notified    TEXT
-);
-CREATE TABLE IF NOT EXISTS reviews (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   INTEGER NOT NULL,
-    the_date   TEXT NOT NULL,
-    photo_id   TEXT,
-    note       TEXT,
-    added_by   INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS ho_cases (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   INTEGER NOT NULL,
-    the_date   TEXT NOT NULL,
-    section    TEXT NOT NULL DEFAULT 'open',
-    prio       TEXT,
-    platform   TEXT,
-    flag       TEXT,
-    store      TEXT,
-    username   TEXT,
-    body       TEXT,
-    closed     INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    closed_by  INTEGER,
-    closed_at  TEXT
-);
-CREATE TABLE IF NOT EXISTS handovers (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id  INTEGER NOT NULL,
-    the_date  TEXT NOT NULL,
-    body      TEXT,
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS pay_rates (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id       INTEGER,
-    cents          INTEGER NOT NULL,
-    effective_from TEXT NOT NULL,
-    created_by     INTEGER,
-    created_at     TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS time_entries (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id   INTEGER NOT NULL,
-    slot_id    INTEGER,
-    the_date   TEXT NOT NULL,
-    clock_in   TEXT NOT NULL,
-    clock_out  TEXT,
-    status     TEXT NOT NULL DEFAULT 'open',
-    source     TEXT NOT NULL DEFAULT 'agent',
-    note       TEXT,
-    shift_label TEXT,
-    opening_posted INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS time_edits (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id   INTEGER NOT NULL,
-    changed_by INTEGER NOT NULL,
-    before     TEXT,
-    after      TEXT,
-    reason     TEXT,
-    changed_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS confirmations (
-    week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL,
-    ts      TEXT NOT NULL,
-    PRIMARY KEY (week_id, user_id)
-);
-"""
-
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
-# The web server runs on its own thread and shares this connection. Without
-# these two settings a read from the web thread can sit waiting behind a write
-# on the bot's thread, which shows up as the Mini App spinning forever.
-try:
-    db.execute("PRAGMA journal_mode=WAL")      # readers don't block on writers
-    db.execute("PRAGMA busy_timeout=8000")     # wait 8s, then fail loudly
-    db.commit()
-except Exception as _e:                        # a volume that can't do WAL
-    log.warning("Couldn't set WAL mode: %s", _e)
-db.executescript(SCHEMA)
-# Days used to be stored as THURS. Bring old rows in line with the new THU.
-for _tbl, _col in (("days", "name"), ("fixed_slots", "day_name")):
-    try:
-        db.execute(f"UPDATE {_tbl} SET {_col}='THU' WHERE {_col}='THURS'")
-    except sqlite3.OperationalError:
-        pass
-try:
-    for _p in db.execute("SELECT name, config FROM presets").fetchall():
-        if "THURS" in _p[1]:
-            db.execute(
-                "UPDATE presets SET config=? WHERE name=?",
-                (_p[1].replace('"THURS"', '"THU"'), _p[0]),
-            )
-except sqlite3.OperationalError:
-    pass
-db.commit()
-
-_slot_cols = {r[1] for r in db.execute("PRAGMA table_info(slots)")}
-if "capacity" not in _slot_cols:
-    db.execute("ALTER TABLE slots ADD COLUMN capacity INTEGER")
-_dr_cols = {r[1] for r in db.execute("PRAGMA table_info(drop_requests)")}
-if "kind" not in _dr_cols:
-    db.execute("ALTER TABLE drop_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'drop'")
-if "notified" not in _dr_cols:
-    db.execute("ALTER TABLE drop_requests ADD COLUMN notified TEXT")
-if "target_id" not in _dr_cols:
-    db.execute("ALTER TABLE drop_requests ADD COLUMN target_id INTEGER")
-_te_cols = {r[1] for r in db.execute("PRAGMA table_info(time_entries)")}
-for _c, _d in (("shift_label", "TEXT"),
-               ("opening_posted", "INTEGER NOT NULL DEFAULT 0")):
-    if _c not in _te_cols:
-        db.execute(f"ALTER TABLE time_entries ADD COLUMN {_c} {_d}")
-_cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
-if "role" not in _cols:
-    db.execute(
-        "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'agent'"
-    )
-for _col, _ddl in [
-    ("status", "TEXT NOT NULL DEFAULT 'active'"),
-    ("display_name", "TEXT"),
-    ("req_msgs", "TEXT"),
-    ("support_name", "TEXT"),
-    ("on_avails", "INTEGER NOT NULL DEFAULT 1"),
-    ("tag_calls", "INTEGER NOT NULL DEFAULT 1"),
-    ("salaried", "INTEGER NOT NULL DEFAULT 0"),
-    ("requested_at", "TEXT"),
-    ("decided_by", "INTEGER"),
-    ("decided_at", "TEXT"),
-    ("channels", "TEXT"),            # Online team: JSON list of channel keys
-]:
-    if _col not in _cols:
-        db.execute(f"ALTER TABLE agents ADD COLUMN {_col} {_ddl}")
-# Handover cases: the Online channel, the case split into fields, and a
-# close tick for each side (SH and Online). `closed` stays as "fully closed".
-_hc_cols = {r[1] for r in db.execute("PRAGMA table_info(ho_cases)")}
-for _col, _ddl in [
-    ("channel", "TEXT"),
-    ("order_no", "TEXT"),
-    ("product", "TEXT"),
-    ("happened", "TEXT"),
-    ("done", "TEXT"),
-    ("need", "TEXT"),
-    ("sh_closed", "INTEGER NOT NULL DEFAULT 0"),
-    ("sh_closed_by", "INTEGER"),
-    ("sh_closed_at", "TEXT"),
-    ("on_closed", "INTEGER NOT NULL DEFAULT 0"),
-    ("on_closed_by", "INTEGER"),
-    ("on_closed_at", "TEXT"),
-]:
-    if _col not in _hc_cols:
-        db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
-for _col, _ddl in [
-    ("chat_posted", "INTEGER NOT NULL DEFAULT 0"),
-    ("post_id", "INTEGER"),
-    ("handed_back", "INTEGER NOT NULL DEFAULT 0"),
-    ("pm_notified", "INTEGER NOT NULL DEFAULT 0"),
-    ("origin", "TEXT NOT NULL DEFAULT 'sh'"),     # 'on' = an Online request
-]:
-    if _col not in _hc_cols:
-        db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
-if "pm_notified" not in _hc_cols:
-    # Platform managers only hear about cases added from now on.
-    db.execute("UPDATE ho_cases SET pm_notified=1")
-if "chat_posted" not in _hc_cols:
-    # Only cases added from now on go to the store chats.
-    db.execute("UPDATE ho_cases SET chat_posted=1")
-# Which department(s) each person works in. The source of truth for what
-# they see; agents.role now only says admin or not.
-db.execute("""CREATE TABLE IF NOT EXISTS memberships (
-    user_id    INTEGER NOT NULL,
-    dept       TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (user_id, dept)
-)""")
-if not db.execute("SELECT 1 FROM settings WHERE key='memberships_moved'").fetchone():
-    # First start with departments: agents and admins into Livechat, the
-    # Online team into ON. Pending and declined people get theirs on approval.
-    _ts = datetime.now().isoformat()
-    db.execute("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
-               "SELECT user_id, 'ON', ? FROM agents WHERE role='online'", (_ts,))
-    db.execute("INSERT OR IGNORE INTO memberships (user_id, dept, created_at) "
-               "SELECT user_id, 'LIVECHAT', ? FROM agents WHERE status='active' "
-               "AND role IN ('agent', 'admin')", (_ts,))
-    # agents.role 'online' is left as it is: the new code goes by memberships,
-    # and the previous version still reads it if we ever roll back.
-    db.execute("INSERT INTO settings (key, value) VALUES ('memberships_moved', ?)", (_ts,))
-# On-Site: home visits, their history, and times a specialist isn't free.
-# Times are ISO strings with the visit country's UTC offset.
-db.execute("""CREATE TABLE IF NOT EXISTS appointments (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    country            TEXT NOT NULL,
-    specialist_id      INTEGER,
-    visit_type         TEXT NOT NULL,
-    starts_at          TEXT NOT NULL,
-    duration_min       INTEGER NOT NULL DEFAULT 120,
-    customer_name      TEXT NOT NULL,
-    phone              TEXT,
-    email              TEXT,
-    address            TEXT NOT NULL,
-    postal             TEXT,
-    product            TEXT,
-    issue              TEXT,
-    order_no           TEXT,
-    status             TEXT NOT NULL DEFAULT 'SCHEDULED',
-    created_by         INTEGER,
-    created_at         TEXT NOT NULL,
-    proposed_starts_at TEXT,
-    proposed_by        INTEGER,
-    arrived_at         TEXT,
-    left_at            TEXT,
-    outcome            TEXT,
-    amount_cents       INTEGER,
-    currency           TEXT,
-    pay_method         TEXT,
-    followup_done      INTEGER NOT NULL DEFAULT 0
-)""")
-db.execute("""CREATE TABLE IF NOT EXISTS appointment_log (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    appt_id    INTEGER NOT NULL,
-    user_id    INTEGER,
-    action     TEXT NOT NULL,
-    note       TEXT,
-    created_at TEXT NOT NULL
-)""")
-db.execute("""CREATE TABLE IF NOT EXISTS specialist_blocks (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL,
-    starts_at  TEXT NOT NULL,
-    ends_at    TEXT NOT NULL,
-    note       TEXT,
-    part       TEXT,
-    created_at TEXT NOT NULL
-)""")
-if "part" not in {r[1] for r in db.execute("PRAGMA table_info(specialist_blocks)")}:
-    db.execute("ALTER TABLE specialist_blocks ADD COLUMN part TEXT")   # AM, PM or FD
-if "country" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
-    db.execute("ALTER TABLE agents ADD COLUMN country TEXT")   # On-Site: where they work
-if "store" not in {r[1] for r in db.execute("PRAGMA table_info(agents)")}:
-    db.execute("ALTER TABLE agents ADD COLUMN store TEXT")     # FS: which store they're at
-# Who did what to a case, and any note they left.
-# Special requests to Ops (ops.py): one row each, mirrored to the Ops sheet.
-db.execute("""CREATE TABLE IF NOT EXISTS special_requests (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_no        TEXT NOT NULL,
-    country         TEXT,
-    category        TEXT NOT NULL,
-    details         TEXT NOT NULL,
-    delivery_date   TEXT NOT NULL,
-    timeframe       TEXT NOT NULL,
-    timeframe_other TEXT,
-    created_by      INTEGER NOT NULL,
-    created_at      TEXT NOT NULL,
-    after_cutoff    INTEGER NOT NULL DEFAULT 0,   -- next working day's delivery, asked after 2pm
-    urgent          INTEGER NOT NULL DEFAULT 0,   -- same-day delivery
-    status          TEXT NOT NULL DEFAULT 'OPEN',
-    reason          TEXT,
-    taken_by        INTEGER,
-    taken_at        TEXT,
-    ops_note        TEXT,
-    handled_by      INTEGER,
-    handled_at      TEXT,
-    ops_chat_id     INTEGER,
-    ops_msg_id      INTEGER,
-    sheet_dirty     INTEGER NOT NULL DEFAULT 1,
-    sheet_row       INTEGER
-)""")
-_cols = {r[1] for r in db.execute("PRAGMA table_info(special_requests)")}
-for _col in ("country TEXT", "taken_by INTEGER", "taken_at TEXT", "ops_note TEXT", "sheet_row INTEGER",
-             "urgent INTEGER NOT NULL DEFAULT 0", "source TEXT NOT NULL DEFAULT 'bot'",
-             "submitted_name TEXT"):
-    if _col.split()[0] not in _cols:
-        db.execute(f"ALTER TABLE special_requests ADD COLUMN {_col}")
-db.execute("""CREATE TABLE IF NOT EXISTS case_log (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    case_id    INTEGER NOT NULL,
-    user_id    INTEGER,
-    side       TEXT,
-    action     TEXT NOT NULL,
-    note       TEXT,
-    created_at TEXT NOT NULL
-)""")
-# One message in a store's chat: new cases from one handover, or one
-# Online request.
-db.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel    TEXT NOT NULL,
-    chat_id    INTEGER NOT NULL,
-    thread_id  INTEGER,
-    message_id INTEGER,
-    agent_id   INTEGER,
-    the_date   TEXT NOT NULL,
-    created_at TEXT NOT NULL
-)""")
-if "kind" not in {r[1] for r in db.execute("PRAGMA table_info(channel_posts)")}:
-    db.execute("ALTER TABLE channel_posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'handover'")
-if "sh_closed" not in _hc_cols:
-    # Cases closed before the two ticks existed count as closed on both sides.
-    db.execute(
-        "UPDATE ho_cases SET sh_closed=1, sh_closed_by=closed_by, "
-        "sh_closed_at=closed_at, on_closed=1, on_closed_by=closed_by, "
-        "on_closed_at=closed_at WHERE closed=1"
-    )
-for _name, _cfg in SEED_PRESETS.items():
-    db.execute(
-        "INSERT OR IGNORE INTO presets (name, config) VALUES (?,?)",
-        (_name, json.dumps(_cfg)),
-    )
-db.commit()
-
-
-# The bot and the Mini App's request threads share this one connection, and
-# SQLite can't run two statements on it at once (that gave "bad parameter or
-# other API misuse" and half-read rows). So they take turns. Reentrant, so
-# code already holding it can still call these helpers.
-db_lock = threading.RLock()
-
-
-def q(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-    with db_lock:
-        return db.execute(sql, args).fetchall()
-
-
-def q1(sql: str, args: tuple = ()) -> sqlite3.Row | None:
-    with db_lock:
-        return db.execute(sql, args).fetchone()
-
-
-def run(sql: str, args: tuple = ()) -> sqlite3.Cursor:
-    with db_lock:
-        cur = db.execute(sql, args)
-        db.commit()
-        return cur
+def seed_presets() -> None:
+    """The built-in timing patterns, added once (never overwriting an edited one). Run at startup."""
+    data.add("presets", [{"name": n, "config": json.dumps(c)} for n, c in SEED_PRESETS.items()],
+             on_conflict="name", returning=False, ignore=True)
 
 
 # --------------------------------------------------------------------------
@@ -874,16 +465,14 @@ def is_admin(user_id: int) -> bool:
         return not viewing_as(user_id)     # admin powers pause while viewing as a team
     if not ADMIN_IDS:
         return True          # nothing configured yet — open until an owner is set
-    row = q1(
-        "SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,)
-    )
-    return bool(row and row["role"] == "admin")
+    row = data.agent(user_id)
+    return bool(row and row["active"] and row["role"] == "admin")
 
 
 def is_salaried(agent_id: int) -> bool:
     """Full-timers on a salary — rostered and clocked like anyone else, but
     their livechat hours don't accrue hourly pay."""
-    row = q1("SELECT salaried FROM agents WHERE user_id=?", (agent_id,))
+    row = data.agent(agent_id)
     return bool(row and row["salaried"])
 
 
@@ -891,19 +480,12 @@ def rate_for(agent_id: int, on: date) -> int:
     """Hourly rate in cents that applied on a given day."""
     if is_salaried(agent_id):
         return 0
-    row = q1(
-        "SELECT cents FROM pay_rates WHERE agent_id=? AND effective_from<=? "
-        "ORDER BY effective_from DESC, id DESC LIMIT 1",
-        (agent_id, on.isoformat()),
-    )
-    if row:
-        return row["cents"]
-    row = q1(
-        "SELECT cents FROM pay_rates WHERE agent_id IS NULL AND effective_from<=? "
-        "ORDER BY effective_from DESC, id DESC LIMIT 1",
-        (on.isoformat(),),
-    )
-    return row["cents"] if row else DEFAULT_RATE_CENTS
+    day = on.isoformat()
+    for who in (agent_id, None):      # their own rate, else the team's
+        rates = [r for r in data.all_rows("pay_rates") if r["agent_id"] == who and r["effective_from"] <= day]
+        if rates:
+            return max(rates, key=lambda r: (r["effective_from"], r["created_at"]))["cents"]
+    return DEFAULT_RATE_CENTS
 
 
 def money(cents: int) -> str:
@@ -924,28 +506,24 @@ def slot_minutes(label: str) -> int:
     return b - a
 
 
-def slot_run_from(slot_id: int):
+def slot_run_from(slot_id: int, agent: int | None = None):
     """A slot plus any back-to-back slots the same agent holds after it.
 
     Someone rostered 10-12 and 12-2 clocks in once, so the entry has to cover
-    both blocks rather than stopping at the end of the first.
+    both blocks rather than stopping at the end of the first. `agent` is whose
+    run it is; on a slot two people hold, without it the run is the first holder's.
     """
-    first = q1(
-        """SELECT s.id, s.label, s.start_min, s.day_id, d.the_date
-           FROM slots s JOIN days d ON d.id = s.day_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    first = data.slot_info(slot_id)
     if not first:
         return []
-    holder = q1("SELECT user_id FROM signups WHERE slot_id=?", (slot_id,))
-    if not holder:
+    b = data.board(first["week_id"])
+    holders = b["signups"][slot_id]
+    if not holders:
         return [first]
-    same_day = q(
-        """SELECT s.id, s.label, s.start_min FROM slots s
-           JOIN signups su ON su.slot_id = s.id
-           WHERE s.day_id=? AND su.user_id=? ORDER BY s.start_min""",
-        (first["day_id"], holder["user_id"]),
-    )
+    holder = agent if any(h["user_id"] == agent for h in holders) else holders[0]["user_id"]
+    same_day = sorted((s for s in b["slots"][first["day_id"]]
+                       if any(h["user_id"] == holder for h in b["signups"][s["id"]])),
+                      key=lambda s: s["start_min"])
     run_ = [first]
     cursor = first["start_min"] + slot_minutes(first["label"])
     for cand in same_day:
@@ -974,7 +552,7 @@ def entry_split(row) -> tuple:
     midnight = datetime.combine(day, time(0, 0), TZ)
 
     base, last_end = 0, None
-    for sl in slot_run_from(row["slot_id"]):
+    for sl in slot_run_from(row["slot_id"], row["agent_id"]):
         end_min = sl["start_min"] + slot_minutes(sl["label"])
         slot_end = midnight + timedelta(minutes=end_min)
         if out >= slot_end - timedelta(minutes=SLOT_GRACE_MIN):
@@ -1012,11 +590,8 @@ def month_bounds(d: date) -> tuple[date, date]:
 
 
 def timesheet(agent_id: int, first: date, last: date) -> dict:
-    rows = q(
-        "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
-        "ORDER BY the_date, clock_in",
-        (agent_id, first.isoformat(), last.isoformat()),
-    )
+    rows = data.rows("time_entries", agent_id=agent_id,
+                     the_date=(("gte", first.isoformat()), ("lte", last.isoformat())), order="the_date,clock_in")
     shifts, minutes, cents, open_count = [], 0, 0, 0
     # A rostered block is paid once, however many times someone clocked into it.
     credited: set = set()
@@ -1057,21 +632,16 @@ def hhmm(minutes: int) -> str:
 
 
 def setting(key: str, default: str = "") -> str:
-    row = q1("SELECT value FROM settings WHERE key=?", (key,))
-    return row["value"] if row and row["value"] else default
+    return data.setting(key, default)
 
 
 def set_setting(key: str, value: str) -> None:
-    run(
-        "INSERT INTO settings (key, value) VALUES (?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
+    data.set_setting(key, value)
 
 
 def support_for(user_id: int, fallback: str = "") -> str:
     """Who to list as Support: their own override, else the team default."""
-    row = q1("SELECT support_name FROM agents WHERE user_id=?", (user_id,))
+    row = data.agent(user_id)
     if row and row["support_name"]:
         return row["support_name"]
     return setting("support_name", "") or fallback
@@ -1088,10 +658,7 @@ def agent_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
     Shows Clock out while they're on shift, Clock in otherwise.
     """
-    on_shift = bool(q1(
-        "SELECT 1 FROM time_entries WHERE agent_id=? AND clock_out IS NULL",
-        (user_id,),
-    ))
+    on_shift = bool(data.row("time_entries", agent_id=user_id, clock_out=None))
     rows = [
         [KeyboardButton(BTN_OUT if on_shift else BTN_IN)],
         [KeyboardButton(BTN_HOURS), KeyboardButton(BTN_SHIFTS)],
@@ -1112,21 +679,15 @@ def opening_block(user_id: int, name: str, slot_label: str) -> str:
 
 def display_name_of(user_id: int, fallback: str = "") -> str:
     """The roster name if one is set, otherwise whatever Telegram says."""
-    row = q1(
-        "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
-    )
-    if row and row["display_name"]:
-        return row["display_name"]
-    if row and row["name"]:
-        return row["name"]
-    return fallback
+    row = data.agent(user_id)
+    return row["name"] if row and row["name"] else fallback
 
 
 def agent_status(user_id: int) -> str | None:
-    """'active', 'pending', 'declined', or None if never seen."""
+    """'active', 'pending', 'declined', 'revoked' (off the people record), or None if never seen."""
     if is_owner(user_id):
         return "active"
-    row = q1("SELECT status FROM agents WHERE user_id=?", (user_id,))
+    row = data.agent(user_id)
     return row["status"] if row else None
 
 
@@ -1137,12 +698,7 @@ def has_access(user_id: int) -> bool:
 def admin_ids() -> list:
     """Everyone who should see access requests."""
     ids = set(ADMIN_IDS)
-    ids |= {
-        r["user_id"]
-        for r in q(
-            "SELECT user_id FROM agents WHERE role='admin' AND status='active'"
-        )
-    }
+    ids |= {r["user_id"] for r in data.agents(status="active", role="admin")}
     return sorted(ids)
 
 
@@ -1155,8 +711,6 @@ DEPARTMENTS = [
     ("OPS", "Ops"),
 ]
 DEPT_NAMES = dict(DEPARTMENTS)
-# Livechat people, for the lists that are about shifts, avails and pay.
-IN_LIVECHAT = "user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT')"
 
 
 def viewing_as(user_id: int) -> str:
@@ -1168,22 +722,15 @@ def depts_of(user_id: int) -> set:
     view = viewing_as(user_id)
     if view:
         return {view}
-    return {r["dept"] for r in q("SELECT dept FROM memberships WHERE user_id=?",
-                                 (user_id,))}
+    return data.teams(user_id)
 
 
 def set_depts(user_id: int, depts) -> None:
     """Replace someone's departments. Off Livechat = off avails and shift calls."""
-    run("DELETE FROM memberships WHERE user_id=?", (user_id,))
-    for d in depts:
-        run("INSERT INTO memberships (user_id, dept, created_at) VALUES (?,?,?)",
-            (user_id, d, now().isoformat()))
+    depts = list(depts)
+    data.set_teams(user_id, depts)
     if "LIVECHAT" not in depts:
-        run("UPDATE agents SET on_avails=0, tag_calls=0 WHERE user_id=?", (user_id,))
-    # Keep the old role label in step, so the previous version still works
-    # if this one is ever rolled back. Admins keep 'admin'.
-    run("UPDATE agents SET role=? WHERE user_id=? AND role<>'admin'",
-        ("online" if set(depts) == {"ON"} else "agent", user_id))
+        data.set_agent(user_id, on_avails=False, tag_calls=False)
 
 
 def is_online(user_id: int) -> bool:
@@ -1233,31 +780,28 @@ def online_view(user_id: int) -> bool:
 
 
 def online_channels(user_id: int) -> list:
-    row = q1("SELECT channels FROM agents WHERE user_id=?", (user_id,))
-    return json.loads(row["channels"]) if row and row["channels"] else []
+    row = data.agent(user_id)
+    return list(row["channels"] or []) if row else []
 
 
 def role_of(user_id: int) -> str:
     if is_owner(user_id):
         return "owner"
-    row = q1("SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,))
-    return row["role"] if row else "agent"
+    row = data.agent(user_id)
+    return row["role"] if row and row["active"] else "agent"
 
 
-def open_week() -> sqlite3.Row | None:
-    return q1("SELECT * FROM weeks WHERE status='open' ORDER BY id DESC LIMIT 1")
+def open_week() -> dict | None:
+    return data.row("weeks", status="open", order="-start_date")
 
 
-def week_containing(d: date) -> sqlite3.Row | None:
+def week_containing(d: date) -> dict | None:
     """The week whose dates cover this day, whatever its status."""
-    return q1(
-        "SELECT * FROM weeks WHERE ? BETWEEN start_date AND end_date "
-        "ORDER BY id DESC LIMIT 1",
-        (d.isoformat(),),
-    )
+    return data.row("weeks", start_date=("lte", d.isoformat()), end_date=("gte", d.isoformat()),
+                    order="-start_date")
 
 
-def this_week() -> sqlite3.Row | None:
+def this_week() -> dict | None:
     """The week being worked right now.
 
     Different from latest_week(): once next week opens for avails, that one is
@@ -1266,7 +810,7 @@ def this_week() -> sqlite3.Row | None:
     return week_containing(now().date()) or latest_week()
 
 
-def latest_week() -> sqlite3.Row | None:
+def latest_week() -> dict | None:
     """The week we're actually in.
 
     Prefer the open one, then whichever covers today, then the one starting
@@ -1274,38 +818,22 @@ def latest_week() -> sqlite3.Row | None:
     stray test week posted later hides the week everyone is working.
     """
     today = now().date().isoformat()
-    row = q1("SELECT * FROM weeks WHERE status='open' ORDER BY id DESC LIMIT 1")
+    row = open_week() or week_containing(now().date())
     if row:
         return row
-    row = q1(
-        "SELECT * FROM weeks WHERE ? BETWEEN start_date AND end_date "
-        "ORDER BY id DESC LIMIT 1",
-        (today,),
-    )
+    row = data.row("weeks", start_date=("gte", today), order="start_date")
     if row:
         return row
-    row = q1(
-        "SELECT * FROM weeks WHERE start_date >= ? ORDER BY start_date LIMIT 1",
-        (today,),
-    )
-    if row:
-        return row
-    return q1("SELECT * FROM weeks ORDER BY end_date DESC, id DESC LIMIT 1")
+    return data.row("weeks", order="-end_date,-start_date")
 
 
 def touch_agent(user, dm_ok: int | None = None) -> None:
-    existing = q1("SELECT * FROM agents WHERE user_id=?", (user.id,))
-    if existing:
-        run(
-            "UPDATE agents SET name=?, username=?, dm_ok=COALESCE(?, dm_ok) "
-            "WHERE user_id=?",
-            (user.full_name, user.username, dm_ok, user.id),
-        )
-    else:
-        run(
-            "INSERT INTO agents (user_id, name, username, dm_ok) VALUES (?,?,?,?)",
-            (user.id, user.full_name, user.username, dm_ok or 0),
-        )
+    """Note that a member has opened a DM with the bot. Names come from the people record now,
+    so nothing else is kept, and nobody becomes a member by talking to the bot."""
+    if dm_ok:
+        row = data.agent(user.id)
+        if row and "teams" in row and not row["dm_ok"]:
+            data.set_agent(user.id, dm_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -1314,9 +842,9 @@ def touch_agent(user, dm_ok: int | None = None) -> None:
 
 
 def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    day = q1("SELECT * FROM days WHERE id=?", (day_id,))
-    week = q1("SELECT * FROM weeks WHERE id=?", (day["week_id"],))
-    slots = q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (day_id,))
+    day = data.row("days", id=day_id)
+    b = data.board(day["week_id"])
+    week, slots = b["week"], b["slots"][day_id]
     closed = week["status"] != "open"
 
     d = date.fromisoformat(day["the_date"])
@@ -1324,12 +852,7 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
     buttons = []
 
     for s in slots:
-        names = [
-            r["name"]
-            for r in q(
-                "SELECT name FROM signups WHERE slot_id=? ORDER BY ts", (s["id"],)
-            )
-        ]
+        names = [r["name"] for r in b["signups"][s["id"]]]
         cap = s["capacity"] or SLOT_CAPACITY
         filled = ", ".join(names)
         if cap > 1 and names:
@@ -1359,44 +882,28 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
 def apply_fixed_slots(week_id: int) -> int:
     """Put people with a fixed weekly pattern straight onto the new board."""
     filled = 0
-    rows = q(
-        """SELECT f.user_id, f.day_name, f.label, a.display_name, a.name
-           FROM fixed_slots f JOIN agents a ON a.user_id = f.user_id
-           WHERE a.status='active'"""
-    )
-    for r in rows:
-        slot = q1(
-            """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
-            (week_id, r["day_name"], r["label"]),
-        )
-        if not slot:
+    active = {a["user_id"] for a in data.agents(status="active")}
+    b = data.board(week_id)
+    for r in data.all_rows("fixed_slots"):
+        if r["user_id"] not in active:
             continue
-        taken = q1("SELECT 1 FROM signups WHERE slot_id=?", (slot["id"],))
-        if taken:
+        slot = next((s for s in b["slot"].values()
+                     if s["day_name"] == r["day_name"] and s["label"].lower() == r["label"].lower()), None)
+        if not slot or b["signups"][slot["id"]]:
             continue
-        cur = run(
-            "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-            (slot["id"], r["user_id"],
-             r["display_name"] or r["name"], now().isoformat()),
-        )
-        filled += cur.rowcount
+        if data.add("signups", {"slot_id": slot["id"], "user_id": r["user_id"], "ts": now().isoformat()},
+                    on_conflict="slot_id,user_id", ignore=True):
+            filled += 1
     return filled
 
 
 def week_stats(week_id: int) -> dict:
-    roster = q("SELECT * FROM agents WHERE status='active' AND user_id IN (SELECT user_id FROM memberships WHERE dept='LIVECHAT') AND on_avails=1")
-    confirmed = {
-        r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
-    }
-    gaps = q(
-        """SELECT d.name, d.the_date, s.label, s.capacity,
-                  (SELECT COUNT(*) FROM signups WHERE slot_id = s.id) AS n
-           FROM slots s JOIN days d ON d.id = s.day_id
-           WHERE d.week_id = ?
-           ORDER BY d.idx, s.idx""",
-        (week_id,),
-    )
+    roster = data.agents(status="active", team="LIVECHAT", on_avails=True)
+    b = data.board(week_id)
+    confirmed = set(b["confirmed"])
+    gaps = [{"name": d["name"], "the_date": d["the_date"], "label": s["label"], "capacity": s["capacity"],
+             "n": len(b["signups"][s["id"]])}
+            for d in b["days"] for s in b["slots"][d["id"]]]
     return {
         "roster": roster,
         "confirmed": confirmed,
@@ -1409,15 +916,82 @@ def week_stats(week_id: int) -> dict:
     }
 
 
-def slot_holders(slot_id: int) -> list[sqlite3.Row]:
-    return q(
-        "SELECT user_id, name FROM signups WHERE slot_id=? ORDER BY ts", (slot_id,)
-    )
+def ref(row_id) -> str:
+    """The short reference shown for a row (#1a2b3c4d), which data.by_ref finds again."""
+    return str(row_id)[:8]
 
 
-def slot_capacity(slot_id: int) -> int:
+def named(rows, key: str = "agent_id") -> list[dict]:
+    """Rows with "name" (the person's shown name) added from a person column, as the old joins did."""
+    return [{**r, "name": display_name_of(r[key], str(r[key]))} for r in rows]
+
+
+def signups_between(first: str, last: str) -> list[dict]:
+    """Every signup on the days from first to last, across weeks, with slot and day, by date then start."""
+    out = []
+    for d in data.rows("days", the_date=(("gte", first), ("lte", last))):
+        b = data.board(d["week_id"])
+        for s in b["slots"][d["id"]]:
+            for h in b["signups"][s["id"]]:
+                out.append({**h, "id": s["id"], "label": s["label"], "start_min": s["start_min"],
+                            "day_name": d["name"], "the_date": d["the_date"], "slot_id": s["id"]})
+    return sorted(out, key=lambda r: (r["the_date"], r["start_min"]))
+
+
+def week_slots(week_id, since: str | None = None, held_by: int | None = None) -> list[dict]:
+    """A week's slots in board order (day, then slot), each with its day's the_date, day_name and
+    week_id (and "name" = the day name, as the old joins selected it). Optionally only from a date
+    on, or only the ones someone holds."""
+    b = data.board(week_id)
+    if not b:
+        return []
+    out = []
+    for d in b["days"]:
+        if since and d["the_date"] < since:
+            continue
+        for s in b["slots"][d["id"]]:
+            if held_by is not None and not any(h["user_id"] == held_by for h in b["signups"][s["id"]]):
+                continue
+            out.append({**b["slot"][s["id"]], "name": d["name"], "n": len(b["signups"][s["id"]])})
+    return out
+
+
+def find_slot(week_id, day: str | None, label: str) -> dict | None:
+    """A slot by day name and label (label case-blind). Day None: the first with that label."""
+    return next((s for s in week_slots(week_id)
+                 if (day is None or s["day_name"] == day) and s["label"].lower() == label.lower()), None)
+
+
+def give_slot(slot_id, user_id: int) -> bool:
+    """Put someone on a slot unless they're already on it. True if they weren't."""
+    return bool(data.add("signups", {"slot_id": slot_id, "user_id": user_id, "ts": now().isoformat()},
+                         on_conflict="slot_id,user_id", ignore=True))
+
+
+def take_slot(slot_id, user_id: int) -> bool:
+    """Take someone off a slot. True if they were on it."""
+    return bool(data.remove("signups", slot_id=slot_id, user_id=user_id))
+
+
+def reorder_day(day_id) -> None:
+    """Number a day's slots in time order again, after one is added or removed."""
+    for i, s in enumerate(sorted(data.rows("slots", day_id=day_id), key=lambda s: (s["start_min"], s["idx"]))):
+        if s["idx"] != i:
+            data.change("slots", {"idx": i}, id=s["id"])
+
+
+def holds(slot_id, user_id: int) -> bool:
+    return any(h["user_id"] == user_id for h in slot_holders(slot_id))
+
+
+def slot_holders(slot_id) -> list[dict]:
+    info = data.slot_info(slot_id)
+    return list(data.board(info["week_id"])["signups"][slot_id]) if info else []
+
+
+def slot_capacity(slot_id) -> int:
     """How many agents this particular slot takes."""
-    row = q1("SELECT capacity FROM slots WHERE id=?", (slot_id,))
+    row = data.slot_info(slot_id)
     if row and row["capacity"]:
         return row["capacity"]
     return SLOT_CAPACITY
@@ -1435,17 +1009,15 @@ def slot_taken_by(slot_id: int, user_id: int) -> str | None:
 
 def is_locked(week_id: int, user_id: int) -> bool:
     """A confirmed week is locked until the agent unlocks it."""
-    return bool(
-        q1("SELECT 1 FROM confirmations WHERE week_id=? AND user_id=?", (week_id, user_id))
-    )
+    b = data.board(week_id)
+    return bool(b and user_id in b["confirmed"])
 
 
 def tag_list(people, room: int = TG_LIMIT, ping: bool = True) -> str:
     """Everyone's @handle, or just their names when ping is off so a repost
     doesn't notify them again. Only cut short with +N if the message would
     otherwise go over Telegram's length limit."""
-    tags = [f"@{p['username']}" if ping and p["username"]
-            else esc(p["display_name"] or p["name"]) for p in people]
+    tags = [mention(p["user_id"], p["name"]) if ping else esc(p["name"]) for p in people]
     shown = []
     for i, tag in enumerate(tags):
         left = len(tags) - i - 1
@@ -1458,7 +1030,7 @@ def tag_list(people, room: int = TG_LIMIT, ping: bool = True) -> str:
 def render_board(week_id: int, compact: bool = False,
                  ping: bool = True) -> tuple[str, InlineKeyboardMarkup]:
     """The whole week in one message."""
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     st = week_stats(week_id)
     a, b = date.fromisoformat(w["start_date"]), date.fromisoformat(w["end_date"])
     deadline = datetime.fromisoformat(w["deadline"])
@@ -1480,17 +1052,13 @@ def render_board(week_id: int, compact: bool = False,
 
     rows: list[list[InlineKeyboardButton]] = []
 
-    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
+    bd = data.board(week_id)
+    for d in bd["days"]:
         the_date = date.fromisoformat(d["the_date"])
         lines += ["", f"<b>{d['name']} — {fmt_day(the_date)}</b>"]
         slot_buttons = []
-        for s in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (d["id"],)):
-            names = [
-                r["name"]
-                for r in q(
-                    "SELECT name FROM signups WHERE slot_id=? ORDER BY ts", (s["id"],)
-                )
-            ]
+        for s in bd["slots"][d["id"]]:
+            names = [r["name"] for r in bd["signups"][s["id"]]]
             cap = s["capacity"] or SLOT_CAPACITY
             if not names:
                 shown = "" if cap == 1 else f"(0/{cap})"
@@ -1540,7 +1108,7 @@ def render_board(week_id: int, compact: bool = False,
 
 
 async def refresh_board(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or not w["header_msg_id"]:
         return
     text, kb = render_board(week_id)
@@ -1569,7 +1137,7 @@ async def refresh_group(context: ContextTypes.DEFAULT_TYPE, week_id: int,
 
 
 def render_header(week_id: int, ping: bool = True) -> tuple[str, InlineKeyboardMarkup]:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     st = week_stats(week_id)
     a, b = date.fromisoformat(w["start_date"]), date.fromisoformat(w["end_date"])
     deadline = datetime.fromisoformat(w["deadline"])
@@ -1605,7 +1173,7 @@ def render_header(week_id: int, ping: bool = True) -> tuple[str, InlineKeyboardM
 
 
 async def refresh_day(context: ContextTypes.DEFAULT_TYPE, day_id: int) -> None:
-    day = q1("SELECT * FROM days WHERE id=?", (day_id,))
+    day = data.row("days", id=day_id)
     if not day or not day["msg_id"]:
         return
     text, kb = render_day(day_id)
@@ -1623,7 +1191,7 @@ async def refresh_day(context: ContextTypes.DEFAULT_TYPE, day_id: int) -> None:
 
 
 async def refresh_header(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or not w["header_msg_id"]:
         return
     text, kb = render_header(week_id)
@@ -1662,16 +1230,10 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer()
         return
 
-    slot_id = int(raw)
+    slot_id = raw
     user = query.from_user
 
-    row = q1(
-        """SELECT s.id, s.label, d.id AS day_id, d.name AS day_name,
-                  w.id AS week_id, w.status
-           FROM slots s JOIN days d ON d.id = s.day_id
-           JOIN weeks w ON w.id = d.week_id WHERE s.id=?""",
-        (slot_id,),
-    )
+    row = data.slot_info(slot_id)
     if not row:
         await query.answer("That slot no longer exists.", show_alert=True)
         return
@@ -1688,9 +1250,7 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     async with write_lock:
         touch_agent(user)
-        existing = q1(
-            "SELECT 1 FROM signups WHERE slot_id=? AND user_id=?", (slot_id, user.id)
-        )
+        existing = any(h["user_id"] == user.id for h in slot_holders(slot_id))
         if not existing:
             holder = slot_taken_by(slot_id, user.id)
             if holder:
@@ -1700,14 +1260,10 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
         if existing:
-            run("DELETE FROM signups WHERE slot_id=? AND user_id=?", (slot_id, user.id))
+            data.remove("signups", slot_id=slot_id, user_id=user.id)
             note = f"Dropped {row['day_name']} {row['label']}"
         else:
-            run(
-                "INSERT INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                (slot_id, user.id, display_name_of(user.id, user.full_name),
-                 now().isoformat()),
-            )
+            data.add("signups", {"slot_id": slot_id, "user_id": user.id, "ts": now().isoformat()})
             note = f"✅ {row['day_name']} {row['label']}"
 
     await query.answer(note)
@@ -1719,9 +1275,9 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not await gate_cb(query):
         return
     kind, raw = query.data.split(":", 1)
-    week_id = int(raw)
+    week_id = raw
     user = query.from_user
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
         await query.answer("This week is already closed.", show_alert=True)
         return
@@ -1737,10 +1293,7 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     show_alert=True,
                 )
                 return
-            run(
-                "DELETE FROM confirmations WHERE week_id=? AND user_id=?",
-                (week_id, user.id),
-            )
+            data.remove("confirmations", week_id=week_id, user_id=user.id)
             note = "🔓 Unlocked. Change your slots, then confirm again."
         else:
             if already:
@@ -1749,16 +1302,8 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     show_alert=True,
                 )
                 return
-            n = q1(
-                """SELECT COUNT(*) AS n FROM signups su
-                   JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
-                   WHERE d.week_id=? AND su.user_id=?""",
-                (week_id, user.id),
-            )["n"]
-            run(
-                "INSERT INTO confirmations (week_id, user_id, ts) VALUES (?,?,?)",
-                (week_id, user.id, now().isoformat()),
-            )
+            n = len(_my_slots(user.id, week_id))
+            data.add("confirmations", {"week_id": week_id, "user_id": user.id, "ts": now().isoformat()})
             note = (
                 f"✅ Confirmed — {n} slot(s), now locked."
                 if n
@@ -1770,15 +1315,8 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def _my_slots(user_id: int, week_id: int) -> set:
-    return {
-        r["slot_id"]
-        for r in q(
-            """SELECT su.slot_id FROM signups su
-               JOIN slots s ON s.id = su.slot_id JOIN days d ON d.id = s.day_id
-               WHERE d.week_id=? AND su.user_id=?""",
-            (week_id, user_id),
-        )
-    }
+    b = data.board(week_id)
+    return {sid for sid, hs in b["signups"].items() if any(h["user_id"] == user_id for h in hs)} if b else set()
 
 
 def _plan_footer(user_id: int, week_id: int, total: int) -> list:
@@ -1803,14 +1341,14 @@ def _plan_footer(user_id: int, week_id: int, total: int) -> list:
 
 def render_plan(user_id: int, week_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """Overview: one button per day, showing how many slots you hold."""
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     mine = _my_slots(user_id, week_id)
     confirmed = is_locked(week_id, user_id)
 
     lines = [f"🗓 <b>Your week — {w['label']}</b>", ""]
     rows = []
-    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
-        slots = q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (d["id"],))
+    for d in data.board(week_id)["days"]:
+        slots = data.board(week_id)["slots"][d["id"]]
         picked = [s["label"] for s in slots if s["id"] in mine]
         free = sum(
             1 for s in slots
@@ -1845,7 +1383,7 @@ def render_plan(user_id: int, week_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
 def render_plan_day(user_id: int, day_id: int) -> tuple[str, InlineKeyboardMarkup]:
     """One day at a time — far less to read than the whole week."""
-    d = q1("SELECT * FROM days WHERE id=?", (day_id,))
+    d = data.row("days", id=day_id)
     week_id = d["week_id"]
     mine = _my_slots(user_id, week_id)
     confirmed = is_locked(week_id, user_id)
@@ -1853,7 +1391,7 @@ def render_plan_day(user_id: int, day_id: int) -> tuple[str, InlineKeyboardMarku
 
     lines = [f"🗓 <b>{d['name']} — {fmt_day(the_date)}</b>", ""]
     rows = []
-    for s in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (day_id,)):
+    for s in data.board(week_id)["slots"][day_id]:
         holders = slot_holders(s["id"])
         cap = s["capacity"] or SLOT_CAPACITY
         if s["id"] in mine:
@@ -1907,7 +1445,6 @@ PICKUP_PICK, PICKUP_REASON = 210, 211
 HANDOVER_TEXT = 220
 HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
 REVIEW_PHOTO = 230
-RESTORE_FILE, RESTORE_OK = 250, 251
 HO_PICK = 231
 CASE_NOTE, CASE_EDIT = 270, 271
 OT_WHEN = 260
@@ -1958,13 +1495,25 @@ def day_row_for(the_date: str):
     Old closed weeks can cover the same dates, so always prefer the newest —
     otherwise the rota is read out of a week nobody is working any more.
     """
-    return q1(
-        """SELECT d.* FROM days d JOIN weeks w ON w.id = d.week_id
-           WHERE d.the_date=?
-           ORDER BY CASE w.status WHEN 'open' THEN 0 ELSE 1 END, w.id DESC
-           LIMIT 1""",
-        (the_date,),
-    )
+    days = data.rows("days", the_date=the_date)
+    if not days:
+        return None
+    weeks = {w["id"]: w for w in data.rows("weeks", id=[d["week_id"] for d in days])}
+    days.sort(key=lambda d: weeks[d["week_id"]]["start_date"], reverse=True)   # newest week first
+    days.sort(key=lambda d: weeks[d["week_id"]]["status"] != "open")             # the open one before all
+    return days[0]
+
+
+def signups_on(the_date: str) -> list[dict]:
+    """Every signup on a date, across weeks, with the slot's label, start and day name, by start time."""
+    out = []
+    for d in data.rows("days", the_date=the_date):
+        b = data.board(d["week_id"])
+        for s in b["slots"][d["id"]]:
+            for h in b["signups"][s["id"]]:
+                out.append({**h, "label": s["label"], "start_min": s["start_min"], "day_name": d["name"],
+                            "the_date": the_date, "slot_id": s["id"]})
+    return sorted(out, key=lambda r: r["start_min"])
 
 
 def current_slot_for(agent_id: int, when: datetime):
@@ -1973,13 +1522,10 @@ def current_slot_for(agent_id: int, when: datetime):
     day = day_row_for(when.date().isoformat())
     if not day:
         return None
-    rows = q(
-        """SELECT s.id, s.label, s.start_min, d.name AS day_name, d.the_date
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE su.user_id=? AND d.id=? ORDER BY s.start_min""",
-        (agent_id, day["id"]),
-    )
+    b = data.board(day["week_id"])
+    rows = sorted((b["slot"][s["id"]] for s in b["slots"][day["id"]]
+                   if any(h["user_id"] == agent_id for h in b["signups"][s["id"]])),
+                  key=lambda s: s["start_min"])
     if not rows:
         return None
     # closest slot start within a couple of hours either side
@@ -2174,16 +1720,13 @@ def search_cases(text: str, limit: int = 20) -> list:
         return []
     day = read_day(text)
     if day:
-        return q("SELECT * FROM ho_cases WHERE the_date=? OR substr(created_at, 1, 10)=?"
-                 " ORDER BY id DESC LIMIT ?", (day.isoformat(), day.isoformat(), limit))
-    words = text.split()[:5]
-    clause = "(" + " OR ".join(f"COALESCE({f}, '') LIKE ? ESCAPE '\\'" for f in SEARCH_FIELDS) + ")"
-    params = []
-    for w in words:
-        w = w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params += [f"%{w}%"] * len(SEARCH_FIELDS)
-    return q(f"SELECT * FROM ho_cases WHERE {' AND '.join([clause] * len(words))}"
-             " ORDER BY id DESC LIMIT ?", (*params, limit))
+        start = datetime.combine(day, time(0, 0), TZ)
+        return data.rows("ho_cases", either=[
+            {"the_date": day.isoformat()},
+            {"created_at": (("gte", f'"{start.isoformat()}"'),
+                            ("lt", f'"{(start + timedelta(days=1)).isoformat()}"'))},
+        ], order="-created_at", limit=limit)
+    return data.search("ho_cases", text.split()[:5], SEARCH_FIELDS, order="-created_at", limit=limit)
 
 
 def compose_body(d: dict, origin: str = "sh") -> str:
@@ -2230,13 +1773,11 @@ def online_team() -> list:
     """Everyone in the Online team. On the test bot (TEST_MODE) the owner
     counts too once they've picked channels, even while back on the SH side,
     so one person can test both sides."""
-    rows = q("SELECT * FROM agents WHERE status='active' AND user_id IN "
-             "(SELECT user_id FROM memberships WHERE dept='ON')")
+    rows = data.agents(status="active", team="ON")
     if TEST_MODE:
         seen = {r["user_id"] for r in rows}
-        rows += [r for r in q("SELECT * FROM agents WHERE channels IS NOT NULL "
-                              "AND channels <> '[]'")
-                 if is_owner(r["user_id"]) and r["user_id"] not in seen]
+        rows += [r for r in data.agents() if r["channels"]
+                 and is_owner(r["user_id"]) and r["user_id"] not in seen]
     return rows
 
 
@@ -2245,10 +1786,10 @@ def online_covers(channel: str | None) -> bool:
     true once someone in the Online role looks after that channel."""
     if not channel:
         return False
-    return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
+    return any(channel in (r["channels"] or []) for r in online_team())
 
 
-def pm_pick(case_id: int) -> tuple[str, int] | None:
+def pm_pick(case_id: str) -> tuple[str, int] | None:
     """A PM's answer to a new SH case: ('help', who) or ('skip', who).
     Kept in settings, not a new column."""
     v = setting(f"case_pick:{case_id}")
@@ -2258,15 +1799,14 @@ def pm_pick(case_id: int) -> tuple[str, int] | None:
     return kind, int(who)
 
 
-def helper_of(case_id: int) -> int | None:
+def helper_of(case_id: str) -> int | None:
     p = pm_pick(case_id)
     return p[1] if p and p[0] == "help" else None
 
 
 def skipped_ids() -> set:
     """Cases a PM said Not needed: off the Online team's lists."""
-    return {int(r["key"].split(":")[1])
-            for r in q("SELECT key FROM settings WHERE key LIKE 'case_pick:%' AND value LIKE 'skip:%'")}
+    return {k.split(":", 1)[1] for k, v in data.settings_like("case_pick:").items() if v.startswith("skip:")}
 
 
 def awaiting_pm(r) -> bool:
@@ -2276,154 +1816,135 @@ def awaiting_pm(r) -> bool:
             and pm_pick(r["id"]) is None)
 
 
-def pm_will_help(case_id: int, user_id: int) -> None:
+def pm_will_help(case_id: str, user_id: int) -> None:
     set_setting(f"case_pick:{case_id}", f"help:{user_id}")
     log_case(case_id, user_id, "on", "will help")
 
 
-def pm_not_needed(case_id: int, user_id: int) -> None:
+def pm_not_needed(case_id: str, user_id: int) -> None:
     """Counts as Online's close. SH isn't told; SH's close finishes it. The
     caller moves it out of the store chat (move_to_tc_online)."""
     set_setting(f"case_pick:{case_id}", f"skip:{user_id}")
     close_case(case_id, user_id, "on", action="not needed")
 
 
-def clear_pick(case_id: int) -> None:
-    run("DELETE FROM settings WHERE key=?", (f"case_pick:{case_id}",))
+def clear_pick(case_id: str) -> None:
+    data.del_setting(f"case_pick:{case_id}")
 
 
-def log_case(case_id: int, user_id: int | None, side: str, action: str,
+def log_case(case_id: str, user_id: int | None, side: str, action: str,
              note: str = "") -> None:
-    run("INSERT INTO case_log (case_id, user_id, side, action, note, created_at)"
-        " VALUES (?,?,?,?,?,?)",
-        (case_id, user_id, side, action, note or None, now().isoformat()))
+    data.add("case_log", {"case_id": case_id, "user_id": user_id, "side": side, "action": action,
+                          "note": note or None, "created_at": now().isoformat()}, returning=False)
 
 
-def latest_note(case_id: int, actions=("note", "handed back"), side: str | None = None):
+def latest_note(case_id: str, actions=("note", "handed back"), side: str | None = None):
     """The newest note someone wrote on a case (not edit records), or None."""
-    marks = ",".join("?" * len(actions))
-    extra, args = ("AND side=? ", (side,)) if side else ("", ())
-    return q1(f"SELECT * FROM case_log WHERE case_id=? AND note IS NOT NULL "
-              f"AND action IN ({marks}) {extra}ORDER BY id DESC LIMIT 1",
-              (case_id, *actions, *args))
+    extra = {"side": side} if side else {}
+    return data.row("case_log", case_id=case_id, note=("not.is", None), action=list(actions),
+                    order="-created_at", **extra)
 
 
-def reusable_note(case_id: int, user_id: int):
+def reusable_note(case_id: str, user_id: int):
     """The note this person just left, if it's still the latest word on the
     case — so handing back doesn't make them type it twice."""
     n = latest_note(case_id)
     return n if n and n["user_id"] == user_id and n["action"] == "note" else None
 
 
-def case_history(case_id: int) -> list:
-    return q("SELECT * FROM case_log WHERE case_id=? ORDER BY id", (case_id,))
+def case_history(case_id: str) -> list:
+    return data.rows("case_log", case_id=case_id, order="created_at")
 
 
-def insert_case(agent_id: int, d: dict, the_date: date, origin: str = "sh") -> int:
+def insert_case(agent_id: int, d: dict, the_date: date, origin: str = "sh") -> str:
     """Save a new case. Fills in its channel and the written-out body.
     origin 'on' is an Online request: posted to its store chat straight away,
     so it's marked as already posted and the PM isn't told about their own."""
     d["channel"] = channel_for(d["platform"], d.get("store"))
     d["body"] = compose_body(d, origin)
-    done_already = 1 if origin == "on" else 0
-    cur = run(
-        "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform, flag,"
-        " store, username, body, channel, order_no, product, happened, done,"
-        " need, created_at, origin, pm_notified, chat_posted)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (agent_id, the_date.isoformat(), d["section"], d["prio"], d["platform"],
-         d.get("flag", ""), d.get("store", ""), d["username"], d["body"],
-         d["channel"], d["order_no"], d["product"], d["happened"],
-         d.get("done") or None, d["need"], now().isoformat(),
-         origin, done_already, done_already),
-    )
-    return cur.lastrowid
+    done_already = origin == "on"
+    return data.add("ho_cases", {
+        "agent_id": agent_id, "the_date": the_date.isoformat(), "section": d["section"], "prio": d["prio"],
+        "platform": d["platform"], "flag": d.get("flag", ""), "store": d.get("store", ""),
+        "username": d["username"], "body": d["body"], "channel": d["channel"], "order_no": d["order_no"],
+        "product": d["product"], "happened": d["happened"], "done": d.get("done") or None, "need": d["need"],
+        "created_at": now().isoformat(), "origin": origin, "pm_notified": done_already,
+        "chat_posted": done_already,
+    })["id"]
 
 
-def close_case(case_id: int, user_id: int, side: str = "sh", action: str = "closed") -> None:
+def close_case(case_id: str, user_id: int, side: str = "sh", action: str = "closed") -> None:
     """Tick one side closed. Fully closed once both sides are, or once SH is
     if the Online team doesn't cover that channel."""
     if side not in ("sh", "on"):
         raise ValueError(side)
     ts = now().isoformat()
-    run(
-        f"UPDATE ho_cases SET {side}_closed=1, {side}_closed_by=?, "
-        f"{side}_closed_at=?, handed_back=0 WHERE id=?",
-        (user_id, ts, case_id),
-    )
+    rows = data.change("ho_cases", {f"{side}_closed": True, f"{side}_closed_by": user_id,
+                                    f"{side}_closed_at": ts, "handed_back": False}, id=case_id)
     log_case(case_id, user_id, side, action)
-    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    row = rows[0] if rows else None
     if row and row["sh_closed"] and (
         row["on_closed"] or not online_covers(row["channel"])
     ):
-        run(
-            "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
-            (user_id, ts, case_id),
-        )
+        data.change("ho_cases", {"closed": True, "closed_by": user_id, "closed_at": ts}, id=case_id)
 
 
 EDIT_LABELS = {"prio": "Urgency", **{k: label for k, label, _ in CASE_FIELDS}}
 
 
-def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
+def save_case_edit(case_id: str, user_id: int, key: str, value: str) -> None:
     """Change one part of a case, rebuild its written-out body, and log it."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     old = r[key] or ""
     if old == value:
         return
-    run(f"UPDATE ho_cases SET {key}=? WHERE id=?", (value or None, case_id))
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.change("ho_cases", {key: value or None}, id=case_id)[0]
     if r["order_no"] is not None:
         d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
-        run("UPDATE ho_cases SET body=? WHERE id=?",
-            (compose_body(d, r["origin"]), case_id))
+        data.change("ho_cases", {"body": compose_body(d, r["origin"])}, id=case_id)
     side = "on" if online_view(user_id) else "sh"
     log_case(case_id, user_id, side, "edited",
              f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
 
 
-def reopen_case(case_id: int, user_id: int | None = None) -> None:
+def reopen_case(case_id: str, user_id: int | None = None) -> None:
     """Back to open on both sides."""
     clear_pick(case_id)
-    run(
-        "UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL, "
-        "sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL, "
-        "on_closed=0, on_closed_by=NULL, on_closed_at=NULL WHERE id=?",
-        (case_id,),
-    )
+    data.change("ho_cases", {f"{s}{c}": v for s in ("", "sh_", "on_")
+                             for c, v in (("closed", False), ("closed_by", None), ("closed_at", None))},
+                id=case_id)
     log_case(case_id, user_id, "on" if user_id and online_view(user_id)
              else "sh", "reopened")
 
 
-def reopen_side(case_id: int, user_id: int, side: str) -> None:
+def reopen_side(case_id: str, user_id: int, side: str) -> None:
     """Undo one side's close (a misclick in a store chat): that side is open
     again, and so is the case. The other side's close stays."""
     if side not in ("sh", "on"):
         raise ValueError(side)
-    run(f"UPDATE ho_cases SET {side}_closed=0, {side}_closed_by=NULL, {side}_closed_at=NULL, "
-        "closed=0, closed_by=NULL, closed_at=NULL WHERE id=?", (case_id,))
+    data.change("ho_cases", {f"{side}_closed": False, f"{side}_closed_by": None, f"{side}_closed_at": None,
+                             "closed": False, "closed_by": None, "closed_at": None}, id=case_id)
     if side == "on":
         clear_pick(case_id)
     log_case(case_id, user_id, side, "reopened")
 
 
-def force_close_case(case_id: int, admin_id: int) -> None:
+def force_close_case(case_id: str, admin_id: int) -> None:
     """Admins: close both sides when one side never will."""
     ts = now().isoformat()
-    run(
-        "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=?, handed_back=0, "
-        "sh_closed=1, sh_closed_by=COALESCE(sh_closed_by, ?), "
-        "sh_closed_at=COALESCE(sh_closed_at, ?), "
-        "on_closed=1, on_closed_by=COALESCE(on_closed_by, ?), "
-        "on_closed_at=COALESCE(on_closed_at, ?) WHERE id=?",
-        (admin_id, ts, admin_id, ts, admin_id, ts, case_id),
-    )
+    r = data.row("ho_cases", id=case_id) or {}
+    values = {"closed": True, "closed_by": admin_id, "closed_at": ts, "handed_back": False}
+    for s in ("sh", "on"):                 # a side already closed keeps who closed it, and when
+        values[f"{s}_closed"] = True
+        values[f"{s}_closed_by"] = r.get(f"{s}_closed_by") or admin_id
+        values[f"{s}_closed_at"] = r.get(f"{s}_closed_at") or ts
+    data.change("ho_cases", values, id=case_id)
     log_case(case_id, admin_id, "admin", "force closed")
 
 
-async def announce_handback(bot, case_id: int, user_id: int, note: str) -> None:
+async def announce_handback(bot, case_id: str, user_id: int, note: str) -> None:
     """Tell TC Online straight away that Online needs something from SH."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if r:
         await post_ops(
             bot,
@@ -2433,14 +1954,11 @@ async def announce_handback(bot, case_id: int, user_id: int, note: str) -> None:
         )
 
 
-def hand_back_case(case_id: int, user_id: int, note: str | None) -> None:
+def hand_back_case(case_id: str, user_id: int, note: str | None) -> None:
     """Online needs something from SH: open it again on SH's side, flagged.
     note=None when it reuses the note they just left (already in the log)."""
-    run(
-        "UPDATE ho_cases SET handed_back=1, closed=0, closed_by=NULL, "
-        "closed_at=NULL, sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL "
-        "WHERE id=?", (case_id,),
-    )
+    data.change("ho_cases", {"handed_back": True, "closed": False, "closed_by": None, "closed_at": None,
+                             "sh_closed": False, "sh_closed_by": None, "sh_closed_at": None}, id=case_id)
     log_case(case_id, user_id, "on", "handed back", note)
 
 
@@ -2491,7 +2009,7 @@ def case_status_line(r) -> str:
     return f"🔸 Open · due {due.strftime('%a %-d %b')}"
 
 
-def note_line(case_id: int) -> str:
+def note_line(case_id: str) -> str:
     n = latest_note(case_id)
     if not n:
         return ""
@@ -2499,9 +2017,9 @@ def note_line(case_id: int) -> str:
     return f"📝 {when} · {display_name_of(n['user_id'], '')}: {n['note']}"
 
 
-def render_channel_post(post_id: int) -> str:
-    p = q1("SELECT * FROM channel_posts WHERE id=?", (post_id,))
-    cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))
+def render_channel_post(post_id: str) -> str:
+    p = data.row("channel_posts", id=post_id)
+    cases = data.rows("ho_cases", post_id=post_id, order="created_at")
     who = display_name_of(p["agent_id"], "") if p["agent_id"] else ""
     day = date.fromisoformat(p["the_date"]).strftime("%-d %b %Y")
     heading = {"request": "📣 Online request", "case": "🆕 New case"}.get(p["kind"], "📋 Handover")
@@ -2519,14 +2037,14 @@ def render_channel_post(post_id: int) -> str:
     return "\n".join(out)
 
 
-def channel_post_keyboard(post_id: int, bot_username: str | None):
+def channel_post_keyboard(post_id: str, bot_username: str | None):
     """Two buttons per case. A new case waits on its PM: 🙋 I'll help /
     Not needed. Then ✅ Close while nobody has closed it, ↩️ Reopen once
     someone has (to undo a misclick), plus 📝 Note while it's not fully
     closed. Note opens a private chat with the bot, so nothing is typed in the
     group. The name only goes on the buttons when a message has several cases."""
     rows = []
-    cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))[:45]
+    cases = data.rows("ho_cases", post_id=post_id, order="created_at")[:45]
     for r in cases:
         who = "" if len(cases) == 1 else f" · {(r['username'] or 'case')[:20]}"
         if awaiting_pm(r):
@@ -2548,9 +2066,9 @@ async def post_new_cases_to_chats(bot, agent_id: int) -> int:
     """Send each store's chat the new cases from this handover, one message
     per chat. Returns how many messages went out."""
     by_channel: dict = {}
-    for r in q("SELECT * FROM ho_cases WHERE chat_posted=0 ORDER BY id"):
+    for r in data.rows("ho_cases", chat_posted=False, order="created_at"):
         if r["closed"] or r["sh_closed"] or not channel_chat(r["channel"]):
-            run("UPDATE ho_cases SET chat_posted=1 WHERE id=?", (r["id"],))
+            data.change("ho_cases", {"chat_posted": True}, id=r["id"])
             continue
         by_channel.setdefault(r["channel"], []).append(r)
 
@@ -2578,38 +2096,32 @@ async def send_channel_post(bot, channel: str, cases: list, agent_id: int,
         chunks[-1].append(r)
         size += n
     for chunk in chunks:
-        pid = run(
-            "INSERT INTO channel_posts (channel, chat_id, thread_id, agent_id,"
-            " the_date, created_at, kind) VALUES (?,?,?,?,?,?,?)",
-            (channel, where["chat"], where.get("thread"), agent_id,
-             now().date().isoformat(), now().isoformat(), kind),
-        ).lastrowid
+        pid = data.add("channel_posts", {
+            "channel": channel, "chat_id": where["chat"], "thread_id": where.get("thread"),
+            "agent_id": agent_id, "the_date": now().date().isoformat(), "created_at": now().isoformat(),
+            "kind": kind})["id"]
         ids = [r["id"] for r in chunk]
-        marks = ",".join("?" * len(ids))
-        run(f"UPDATE ho_cases SET post_id=?, chat_posted=1 WHERE id IN ({marks})",
-            (pid, *ids))
+        data.change("ho_cases", {"post_id": pid, "chat_posted": True}, id=ids)
         kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
         try:
             msg = await bot.send_message(
                 where["chat"], render_channel_post(pid),
                 reply_markup=channel_post_keyboard(pid, bot.username), **kw)
-            run("UPDATE channel_posts SET message_id=? WHERE id=?",
-                (msg.message_id, pid))
+            data.change("channel_posts", {"message_id": msg.message_id}, id=pid)
             sent += 1
         except Exception as e:
             # Try again with the next handover.
             log.warning("Couldn't post to the %s chat: %s", channel, e)
-            run(f"UPDATE ho_cases SET post_id=NULL, chat_posted=0 "
-                f"WHERE id IN ({marks})", tuple(ids))
-            run("DELETE FROM channel_posts WHERE id=?", (pid,))
+            data.change("ho_cases", {"post_id": None, "chat_posted": False}, id=ids)
+            data.remove("channel_posts", id=pid)
     return sent
 
 
-async def post_case_now(bot, case_id: int, agent_id: int) -> bool:
+async def post_case_now(bot, case_id: str, agent_id: int) -> bool:
     """A case just added by SH or Livechat goes to its store's chat straight
     away, so the PM sees it without waiting for the end-of-shift handover.
     No linked chat: it waits for the handover summary in TC Online."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r or not channel_chat(r["channel"]):
         return False
     sent = bool(await send_channel_post(bot, r["channel"], [r], agent_id, kind="case"))
@@ -2617,24 +2129,24 @@ async def post_case_now(bot, case_id: int, agent_id: int) -> bool:
     return sent
 
 
-async def post_request(bot, case_id: int, pm_id: int) -> bool:
+async def post_request(bot, case_id: str, pm_id: int) -> bool:
     """A new Online request goes straight to its store's chat, where SH sees
     it. No linked chat: TC Online instead, so SH always hears about it."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return False
     if channel_chat(r["channel"]):
-        run("UPDATE ho_cases SET chat_posted=0 WHERE id=?", (case_id,))
+        data.change("ho_cases", {"chat_posted": False}, id=case_id)
         if await send_channel_post(bot, r["channel"], [r], pm_id, kind="request"):
             return True
-        run("UPDATE ho_cases SET chat_posted=1 WHERE id=?", (case_id,))
+        data.change("ho_cases", {"chat_posted": True}, id=case_id)
     c = case_row_to_dict(r)
     return await post_ops(
         bot, f"📣 Online request · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n\n"
              + render_case(c) + "\n\nIt's at the top of /handover.")
 
 
-async def notify_reply(bot, case_id: int, author_id: int, note: str | None = None,
+async def notify_reply(bot, case_id: str, author_id: int, note: str | None = None,
                        closed: bool = False) -> None:
     """Livechat or SH did something on a case: tell the Online side privately.
     A note goes to every PM who looks after that channel, and to the PM waiting
@@ -2642,14 +2154,13 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
     to the waiting PM. Online's own notes and closes don't ping anyone."""
     if online_view(author_id):
         return
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return
     if r["origin"] == "on":
         waiting = r["agent_id"]
     else:
-        back = q1("SELECT user_id FROM case_log WHERE case_id=? AND action='handed back' "
-                  "ORDER BY id DESC LIMIT 1", (case_id,))
+        back = data.row("case_log", case_id=case_id, action="handed back", order="-created_at")
         waiting = back["user_id"] if back else None
     who = display_name_of(author_id, "SH")
     # Who the case is, then what was said: customer · platform · order.
@@ -2665,7 +2176,7 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
     else:
         if setting("pm_alerts", "on") != "off":
             for pm in online_team():
-                if r["channel"] in json.loads(pm["channels"] or "[]"):
+                if r["channel"] in (pm["channels"] or []):
                     sends[pm["user_id"]] = (f"💬 <b>{esc(who)} added a note</b>\n{about}\n\n"
                                             f"{esc(note)}\n\nOpen the App to see the case.")
         if waiting:
@@ -2683,17 +2194,17 @@ async def notify_reply(bot, case_id: int, author_id: int, note: str | None = Non
 async def notify_pms(bot, agent_id: int) -> None:
     """A DM to each platform manager whose channels have new cases: what each
     case is and what help it needs. One message per person, not per case."""
-    rows = q("SELECT * FROM ho_cases WHERE pm_notified=0 ORDER BY id")
+    rows = data.rows("ho_cases", pm_notified=False, order="created_at")
     if not rows:
         return
-    run("UPDATE ho_cases SET pm_notified=1 WHERE pm_notified=0")
+    data.change("ho_cases", {"pm_notified": True}, id=[r["id"] for r in rows])
     if setting("pm_alerts", "on") == "off":
         return
     rows = [r for r in rows if not r["closed"]]
     who = display_name_of(agent_id, "SH")
     names = {key: name for key, _, name in CHANNELS}
     for pm in online_team():
-        mine = set(json.loads(pm["channels"] or "[]"))
+        mine = set((pm["channels"] or []))
         blocks = []
         for r in (r for r in rows if r["channel"] in mine):
             lines = [f"🆕 New case from {who} · {CHANNEL_NAMES.get(r['channel'], r['channel'])}",
@@ -2714,11 +2225,10 @@ async def notify_pms(bot, agent_id: int) -> None:
             log.info("Couldn't message %s about new cases: %s", pm["user_id"], e)
 
 
-async def refresh_case_post(bot, case_id: int) -> None:
+async def refresh_case_post(bot, case_id: str) -> None:
     """Edit the store chat's message so a case's line shows how it stands now."""
-    r = q1("SELECT post_id FROM ho_cases WHERE id=?", (case_id,))
-    p = q1("SELECT * FROM channel_posts WHERE id=?",
-           (r["post_id"],)) if r and r["post_id"] else None
+    r = data.row("ho_cases", id=case_id)
+    p = data.row("channel_posts", id=r["post_id"]) if r and r["post_id"] else None
     if not p or not p["message_id"]:
         return
     try:
@@ -2734,16 +2244,16 @@ async def refresh_case_post(bot, case_id: int) -> None:
         log.warning("Couldn't update the %s chat: %s", p["channel"], e)
 
 
-async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
+async def move_to_tc_online(bot, case_id: str, pm_id: int) -> None:
     """A PM said Not needed: take the case out of its store chat (delete the
     message, or just its part of a shared one). Quietly: no post to TC Online."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    r = data.row("ho_cases", id=case_id)
     if not r:
         return
-    p = q1("SELECT * FROM channel_posts WHERE id=?", (r["post_id"],)) if r["post_id"] else None
-    run("UPDATE ho_cases SET post_id=NULL WHERE id=?", (case_id,))
+    p = data.row("channel_posts", id=r["post_id"]) if r["post_id"] else None
+    data.change("ho_cases", {"post_id": None}, id=case_id)
     if p and p["message_id"]:
-        rest = q1("SELECT COUNT(*) AS n FROM ho_cases WHERE post_id=?", (p["id"],))["n"]
+        rest = data.count("ho_cases", post_id=p["id"])
         try:
             if rest:
                 await bot.edit_message_text(
@@ -2763,17 +2273,6 @@ async def move_to_tc_online(bot, case_id: int, pm_id: int) -> None:
     # Nothing is posted anywhere: SH see Online's tick on the case and close it.
 
 
-# Sort cases from before channels existed into one, by their store.
-for _r in db.execute(
-    "SELECT id, platform, store FROM ho_cases WHERE channel IS NULL"
-).fetchall():
-    db.execute(
-        "UPDATE ho_cases SET channel=? WHERE id=?",
-        (channel_for(_r[1], _r[2]), _r[0]),
-    )
-db.commit()
-
-
 def render_case(c: dict) -> str:
     lines = [f"▫️{c['platform']}", f"{c['prio']} {c['username']}"]
     if c.get("request"):
@@ -2789,8 +2288,7 @@ def render_case(c: dict) -> str:
 def shift_start(user_id: int) -> datetime:
     """When this person's shift began: their latest clock-in if it was within
     the last 16 hours, else the start of today."""
-    row = q1("SELECT clock_in FROM time_entries WHERE agent_id=? ORDER BY id DESC LIMIT 1",
-             (user_id,))
+    row = data.row("time_entries", agent_id=user_id, order="-clock_in")
     if row:
         started = datetime.fromisoformat(row["clock_in"])
         if started > now() - timedelta(hours=16):
@@ -2804,11 +2302,11 @@ def render_shift_summary(user_id: int, who: str) -> tuple:
     what's still open from before. Returns (text, closed count); the text is
     empty when they raised and closed nothing, so nothing is posted."""
     since = shift_start(user_id).isoformat()
-    raised = q("SELECT * FROM ho_cases WHERE agent_id=? AND origin='sh' AND created_at >= ?"
-               " ORDER BY id", (user_id, since))
+    raised = data.rows("ho_cases", agent_id=user_id, origin="sh", created_at=("gte", since),
+                       order="created_at")
     ids = {r["id"] for r in raised}
-    closed = [r for r in q("SELECT * FROM ho_cases WHERE sh_closed=1 AND sh_closed_by=?"
-                           " AND sh_closed_at >= ? ORDER BY sh_closed_at", (user_id, since))
+    closed = [r for r in data.rows("ho_cases", sh_closed=True, sh_closed_by=user_id,
+                                   sh_closed_at=("gte", since), order="sh_closed_at")
               if r["id"] not in ids]
     earlier = [r for r in open_cases() if r["id"] not in ids]
     if not raised and not closed:
@@ -2845,13 +2343,14 @@ Product name
 ‼️Need Help: what the next agent should pick up"""
 
 
+def add_handover(agent_id: int, the_date: date, body: str) -> None:
+    data.add("handovers", {"agent_id": agent_id, "the_date": the_date.isoformat(), "body": body,
+                           "created_at": now().isoformat()}, returning=False)
+
+
 def last_open_handover(exclude_agent: int | None = None):
     """The most recent handover that left something open."""
-    row = q1(
-        "SELECT * FROM handovers WHERE body IS NOT NULL AND body <> '' "
-        "ORDER BY created_at DESC LIMIT 1"
-    )
-    return row
+    return data.row("handovers", body=(("not.is", None), ("neq", "")), order="-created_at")
 
 
 def handover_keyboard(running=None) -> InlineKeyboardMarkup:
@@ -2884,7 +2383,7 @@ def handover_question() -> tuple:
 
 def open_cases() -> list:
     """Cases still live on SH's side, oldest first."""
-    return q("SELECT * FROM ho_cases WHERE closed=0 AND sh_closed=0 ORDER BY id")
+    return data.rows("ho_cases", closed=False, sh_closed=False, order="created_at")
 
 
 def case_row_to_dict(r) -> dict:
@@ -2912,11 +2411,8 @@ PICKER_HELP = (
 
 
 def reviews_for(agent_id: int, first: date, last: date) -> list:
-    return q(
-        "SELECT * FROM reviews WHERE agent_id=? AND the_date BETWEEN ? AND ? "
-        "ORDER BY the_date",
-        (agent_id, first.isoformat(), last.isoformat()),
-    )
+    return data.rows("reviews", agent_id=agent_id,
+                     the_date=(("gte", first.isoformat()), ("lte", last.isoformat())), order="the_date")
 
 
 async def flag_to_admins(bot, text: str) -> None:
@@ -2943,12 +2439,8 @@ def week_bounds(d: date) -> tuple:
 
 
 def find_agent(target: str):
-    if target.startswith("@"):
-        return q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
-    if target.isdigit():
-        return q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
-    return q1("SELECT * FROM agents WHERE lower(display_name)=lower(?) "
-              "OR lower(name)=lower(?)", (target, target))
+    """Someone by Telegram id or name. @usernames aren't kept any more, so '@jia' looks for the name 'jia'."""
+    return data.find(target.lstrip("@"))
 
 
 def at_time_on(the_date: str, hhmm_text: str) -> datetime | None:
@@ -2960,56 +2452,8 @@ def at_time_on(the_date: str, hhmm_text: str) -> datetime | None:
     return datetime.combine(d, time(mins // 60, mins % 60), TZ)
 
 
-EXPECTED_TABLES = {
-    "agents", "weeks", "days", "slots", "signups", "time_entries",
-    "pay_rates", "handovers", "ho_cases", "reviews", "drop_requests",
-}
-
-
-def inspect_db(path: str) -> dict:
-    """Read a database file without touching the live one."""
-    out = {"ok": False, "tables": set(), "counts": {}, "newest": None}
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
-        con.row_factory = sqlite3.Row
-    except Exception as e:
-        out["error"] = f"Can't open it: {e}"
-        return out
-    try:
-        names = {
-            r["name"] for r in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        out["tables"] = names
-        missing = EXPECTED_TABLES - names
-        if missing:
-            out["error"] = "Not an avails database — missing " + ", ".join(
-                sorted(missing)[:4]
-            )
-            return out
-        for t in ("agents", "weeks", "time_entries", "signups", "handovers",
-                  "reviews"):
-            out["counts"][t] = con.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-        r = con.execute(
-            "SELECT MAX(the_date) d FROM time_entries"
-        ).fetchone()
-        out["newest"] = r["d"] if r else None
-        out["ok"] = True
-    except Exception as e:
-        out["error"] = f"Couldn't read it: {e}"
-    finally:
-        con.close()
-    return out
-
-
-# --------------------------------------------------------------------------
-# Scheduled jobs
-# --------------------------------------------------------------------------
-
-
 async def nudge(context: ContextTypes.DEFAULT_TYPE, week_id: int, prefix: str) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
         return
     st = week_stats(week_id)
@@ -3043,14 +2487,14 @@ async def job_nudge(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def close_week(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
         return
-    run("UPDATE weeks SET status='closed' WHERE id=?", (week_id,))
+    data.change("weeks", {"status": "closed"}, id=week_id)
     if BOARD_MODE == "single":
         await refresh_board(context, week_id)
     else:
-        for d in q("SELECT id FROM days WHERE week_id=?", (week_id,)):
+        for d in data.board(week_id)["days"]:
             await refresh_day(context, d["id"])
         await refresh_header(context, week_id)
 
@@ -3080,31 +2524,22 @@ async def job_close(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def mention(user_id: int, name: str) -> str:
-    """@handle if they have one, otherwise a clickable name that still pings."""
-    a = q1("SELECT username FROM agents WHERE user_id=?", (user_id,))
-    if a and a["username"]:
-        return f"@{a['username']}"
-    return f'<a href="tg://user?id={user_id}">{esc(name)}</a>'
+    """A clickable name that pings its person, by Telegram id: no @username needed."""
+    return f'<a href="tg://user?id={int(user_id)}">{esc(name)}</a>'
 
 
 async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Every evening, DM everyone working tomorrow."""
     tomorrow = (now() + timedelta(days=1)).date()
-    rows = q(
-        """SELECT su.user_id, su.name, s.label, s.start_min, d.name AS day_name
-           FROM signups su JOIN slots s ON s.id = su.slot_id
-           JOIN days d ON d.id = s.day_id
-           WHERE d.the_date = ? ORDER BY s.start_min""",
-        (tomorrow.isoformat(),),
-    )
+    rows = signups_on(tomorrow.isoformat())
     if not rows:
         return
-    by_user: dict[int, list[sqlite3.Row]] = {}
+    by_user: dict[int, list[dict]] = {}
     for r in rows:
         by_user.setdefault(r["user_id"], []).append(r)
 
     for user_id, shifts in by_user.items():
-        agent = q1("SELECT * FROM agents WHERE user_id=?", (user_id,))
+        agent = data.agent(user_id)
         if agent and not agent["dm_ok"]:
             continue
         slots = "\n".join(f"  • {s['label']}" for s in shifts)
@@ -3116,7 +2551,7 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await context.bot.send_message(user_id, text)
         except Forbidden:
-            run("UPDATE agents SET dm_ok=0 WHERE user_id=?", (user_id,))
+            data.set_agent(user_id, dm_ok=False)
         except Exception as e:
             log.warning("Reminder to %s failed: %s", user_id, e)
         await asyncio.sleep(0.05)
@@ -3168,6 +2603,7 @@ ADMIN_GROUPS = [
         ("specialists", "On-Site Specialists by country"),
         ("visits", "On-Site visits and follow-ups"),
         ("visitchat", "Post On-Site visit reports in this group"),
+        ("requestchat", "Post On-Site replacement / payment requests in this group"),
         ("request", "Send a special request to Ops"),
         ("requests", "Special requests still open"),
         ("opschat", "Post special requests in this group (Ops)"),
@@ -3199,8 +2635,6 @@ OWNER_EXTRA = [
     ("setrate", "Set the hourly rate"),
     ("payroll", "Export shifts as CSV"),
     ("export", "This week's board as CSV"),
-    ("backup", "Download a copy of the data"),
-    ("restore", "Put a backup back"),
     ("chatid", "Show this chat's ID"),
 ]
 ADMIN_COMMANDS = AGENT_COMMANDS + [
@@ -3257,7 +2691,7 @@ ONLINE_COMMANDS = [
 # not listed is a Livechat tool (the week, slots, hours and pay).
 ADMIN_TEAMS = {
     "onchat": ("ON",), "linkchat": ("ON",), "pmalerts": ("ON",), "report": ("ON",), "channels": ("ON",),
-    "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",),
+    "specialists": ("ONSITE",), "visits": ("SH", "FS", "ONSITE"), "visitchat": ("SH",), "requestchat": ("ONSITE", "SH"),
     "departments": (), "access": (), "roster": (), "pending": (),
     "request": ("SH", "LIVECHAT", "ON", "FS"), "requests": ("OPS",), "opschat": ("OPS",), "opsrounds": ("OPS",),
 }
@@ -3389,10 +2823,10 @@ async def publish_command_menus(app: Application) -> None:
             )
             elevated = set(ADMIN_IDS) | {
                 r["user_id"]
-                for r in q("SELECT user_id FROM agents WHERE role='admin' AND active=1")
+                for r in data.agents(role="admin", active=True)
             } | {
                 r["user_id"]            # anyone in a team other than Livechat
-                for r in q("SELECT user_id FROM memberships WHERE dept<>'LIVECHAT'")
+                for r in data.agents() if r["teams"] - {"LIVECHAT"}
             }
             for uid in elevated:
                 await refresh_menu_for(bot, uid)
@@ -3647,6 +3081,8 @@ MINIAPP_HTML = """<!DOCTYPE html>
     font-size:15px; font-weight:800; cursor:pointer; }
   .case .tick.on { background:var(--ink); border-color:var(--ink); color:#fff; }
   .case .nm { font-weight:800; font-size:16px; }
+  .btnlink { display:inline-block; padding:10px 14px; border:2px solid var(--ink); border-radius:8px; font-weight:700; color:var(--ink); text-decoration:none; background:var(--card); }
+  .case.fu { border-color:var(--red); box-shadow:inset 6px 0 0 var(--red); padding-left:18px; }
   .case .meta { font-size:12px; color:var(--muted); margin-top:2px; }
   .case .body { font-size:14px; white-space:pre-wrap; margin-top:10px; padding-top:10px;
     border-top:1px solid #E2E0DA; color:var(--ink); }
@@ -3676,6 +3112,24 @@ MINIAPP_HTML = """<!DOCTYPE html>
     border-radius:6px; padding:10px 12px; font-size:16px; background:var(--card); color:var(--ink); }
   .fld textarea { min-height:110px; resize:vertical; }
   .fld .note { margin-top:4px; }
+  .mestats { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:8px; }
+  .mest { background:var(--card); border:2px solid var(--ink); border-radius:8px; padding:10px 12px; }
+  .mest .n { font-size:26px; font-weight:800; } .mest .l { font-size:12px; font-weight:800; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); }
+  .mest:first-child { grid-column:1 / -1; }
+  .lab-m { font-size:12px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin:14px 0 6px; }
+  .pd { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  .pd:last-child { border-bottom:0; } .pd span { color:var(--muted); } .pd b { text-align:right; }
+  .phn { user-select:all; -webkit-user-select:all; font-weight:700; }
+  /* Dates and times are typed straight through (see typedDates) */
+  .tdt-row { display:flex; gap:6px; align-items:stretch; }
+  .tdt { flex:1; width:100%; min-height:48px; border:2px solid #8A9099; border-radius:6px; padding:10px 12px;
+    font-size:16px; background:var(--card); color:var(--ink); font-variant-numeric:tabular-nums; letter-spacing:.04em; }
+  .tdt-ap { display:flex; gap:4px; }
+  .tdt-ap button { min-width:52px; min-height:48px; border:2px solid #8A9099; background:var(--card); color:var(--ink);
+    border-radius:6px; font-size:14px; font-weight:800; cursor:pointer; }
+  .tdt-ap button.on { background:var(--ink); border-color:var(--ink); color:#fff; }
+  .tdt-hint { font-size:13px; color:#5A6068; margin-top:4px; }
+  .tdt-hint.bad { color:#B42318; font-weight:700; }
   .pick { display:flex; gap:6px; flex-wrap:wrap; }
   .pick button { flex:1 1 auto; min-height:48px; border:2px solid var(--line); background:var(--card);
     border-radius:6px; padding:8px 12px; font-size:14px; font-weight:800; cursor:pointer; color:var(--ink); }
@@ -3719,6 +3173,11 @@ MINIAPP_HTML = """<!DOCTYPE html>
   body.admin-mode #app > :first-child { border-top:6px solid var(--accent); }
   #app > .back + .eyebrow { padding-top:4px; }
   .p.wait { border-color:var(--accent); }
+  .paycard { background:var(--ink); border-color:var(--ink); color:#fff; margin-top:12px; }
+  .paycard .k { font-size:12px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--headmuted); }
+  .paycard .v { font-size:26px; font-weight:800; margin-top:2px; }
+  .paycard .t { color:var(--headmuted); }
+  #teamKind { margin-bottom:8px; }
   .duo { display:flex; gap:8px; margin-top:10px; }
   .duo button { flex:1; min-height:44px; border-radius:6px; font-size:14px; font-weight:800; cursor:pointer; }
   .duo .ok { background:var(--green); color:#fff; border:2px solid var(--green); }
@@ -3766,6 +3225,125 @@ let TABS = null;
 let CS_Q = '';   // what the case search box holds; '' = the normal lists
 let VISITS_ONLY = false, VS = { week: '', country: '', spec: '', form: null, open: {}, move: {}, cancel: {}, block: null, avail: '', day: '', mode: 'sched', tw: '', tc: '', ts: '', tv: null };
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// A photo picked in the App, made smaller (longest side 1600px, JPEG) before it's sent.
+function shrinkPhoto(file) {
+  return new Promise(res => {
+    if (!file) return res(null);
+    const rd = new FileReader();
+    rd.onerror = () => res(null);
+    rd.onload = () => { const im = new Image(); im.onerror = () => res(null); im.onload = () => {
+      const k = Math.min(1, 1600 / Math.max(im.width, im.height)), cv = document.createElement('canvas');
+      cv.width = Math.round(im.width * k); cv.height = Math.round(im.height * k);
+      cv.getContext('2d').drawImage(im, 0, 0, cv.width, cv.height);
+      res(cv.toDataURL('image/jpeg', 0.82)); }; im.src = rd.result; };
+    rd.readAsDataURL(file);
+  });
+}
+
+// Dates and times are typed straight through instead of the phone's segment pickers:
+// 23112026 -> 23/11/2026, 230 + PM -> 2:30 PM. The original date/time input stays
+// (hidden) under the same id with an ISO value, so the code that reads it is unchanged.
+const TD_DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const TD_MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function tdDigits(raw) {
+  const segs = raw.replace(/[^\d/:]/g, '').split(/[\/:]/);
+  return segs.map((p, i) => (i < segs.length - 1 && p.length === 1 ? '0' + p : p)).join('');
+}
+function tdMaskDate(raw, del) {
+  let d = tdDigits(raw);
+  if (d.length >= 1 && +d[0] > 3) d = '0' + d;                          // day 4-9
+  if (d.length >= 3 && +d[2] > 1) d = d.slice(0, 2) + '0' + d.slice(2);  // month 2-9
+  d = d.slice(0, 8);
+  let out = d.slice(0, 2);
+  if (d.length > 2 || (d.length === 2 && !del)) out += '/';
+  out += d.slice(2, 4);
+  if (d.length > 4 || (d.length === 4 && !del)) out += '/';
+  return out + d.slice(4, 8);
+}
+function tdMaskTime(raw, del) {
+  let d = tdDigits(raw);
+  if (d.length >= 1 && +d[0] > 1) d = '0' + d;                          // hour 2-9
+  d = d.slice(0, 4);
+  let out = d.slice(0, 2);
+  if (d.length > 2 || (d.length === 2 && !del)) out += ':';
+  return out + d.slice(2, 4);
+}
+function typedDates(root) {
+  root.querySelectorAll('input[type=date]:not([data-typed]), input[type=time]:not([data-typed])').forEach(inp => {
+    inp.dataset.typed = '1';
+    const isDate = inp.type === 'date';
+    const wrap = document.createElement('div');
+    wrap.className = 'tdt-row';
+    wrap.style.cssText = inp.style.cssText;
+    const box = document.createElement('input');
+    box.type = 'text'; box.className = 'tdt'; box.inputMode = 'numeric'; box.autocomplete = 'off';
+    box.placeholder = isDate ? 'DD/MM/YYYY' : 'HH:MM';
+    box.setAttribute('aria-label', isDate ? 'Date, day then month then year' : 'Time');
+    wrap.appendChild(box);
+    const hint = document.createElement('div');
+    hint.className = 'tdt-hint';
+    let ap = '', apPicked = false, apBox = null;
+    const showAp = () => apBox && apBox.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.ap === ap));
+    if (!isDate) {
+      apBox = document.createElement('div');
+      apBox.className = 'tdt-ap';
+      apBox.innerHTML = '<button type="button" data-ap="AM">AM</button><button type="button" data-ap="PM">PM</button>';
+      apBox.querySelectorAll('button').forEach(b => b.onclick = () => { ap = b.dataset.ap; apPicked = true; showAp(); update(false); });
+      wrap.appendChild(apBox);
+    }
+    inp.style.display = 'none';
+    inp.parentNode.insertBefore(wrap, inp);
+    inp.parentNode.insertBefore(hint, inp);
+    const set = v => {
+      if (inp.value === v) return;
+      inp.value = v;
+      inp.dispatchEvent(new Event('input', { bubbles: true }));
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const say = (t, bad) => { hint.textContent = t || ''; hint.classList.toggle('bad', !!bad); };
+    function update(typing) {
+      const v = box.value;
+      if (isDate) {
+        const m = v.match(/^(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/);
+        if (!m || (m[3].length === 2 && typing)) { set(''); say(''); return; }
+        const y = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+        const dt = new Date(y, +m[2] - 1, +m[1]);
+        if (dt.getMonth() !== +m[2] - 1 || dt.getDate() !== +m[1]) { set(''); say('That date doesn’t exist', true); return; }
+        const iso = y + '-' + m[2] + '-' + m[1];
+        if (inp.min && iso < inp.min) { set(''); say('Pick a date from today on', true); return; }
+        if (m[3].length === 2) box.value = m[1] + '/' + m[2] + '/' + y;
+        say(TD_DOW[dt.getDay()] + ' ' + dt.getDate() + ' ' + TD_MON[dt.getMonth()] + ' ' + y);
+        set(iso);
+        if (typing) { const all = [...document.querySelectorAll('.tdt')], nx = all[all.indexOf(box) + 1]; if (nx && !nx.value) nx.focus(); }
+      } else {
+        const m = v.match(/^(\d{2}):(\d{2})$/);
+        let h = m ? +m[1] : (v.length >= 2 ? +v.slice(0, 2) : NaN);
+        if (h > 12 && h < 24) { box.value = String(h - 12).padStart(2, '0') + v.slice(2); h -= 12; ap = 'PM'; apPicked = true; }
+        if (!apPicked && h >= 1 && h <= 12) ap = (h === 10 || h === 11) ? 'AM' : 'PM';   // visits run ~10am-6pm; tap to change
+        showAp();
+        if (!m) { set(''); say(''); return; }
+        const mm = +m[2];
+        if (h < 1 || h > 12 || mm > 59) { set(''); say('That time doesn’t exist', true); return; }
+        const h24 = (h % 12) + (ap === 'PM' ? 12 : 0);
+        say('');
+        set(String(h24).padStart(2, '0') + ':' + m[2]);
+      }
+    }
+    if (inp.value) {                                   // show a value that's already there
+      if (isDate) { const p = inp.value.split('-'); box.value = p[2] + '/' + p[1] + '/' + p[0]; }
+      else { const [H, M] = inp.value.split(':'); const h = +H; ap = h >= 12 ? 'PM' : 'AM'; apPicked = true;
+             box.value = String(h % 12 || 12).padStart(2, '0') + ':' + M; showAp(); }
+      update(false);
+    }
+    box.addEventListener('input', e => {
+      const del = (e.inputType || '').startsWith('delete');
+      box.value = isDate ? tdMaskDate(box.value, del) : tdMaskTime(box.value, del);
+      update(true);
+    });
+    box.addEventListener('blur', () => update(false));
+  });
+}
+new MutationObserver(() => typedDates(document)).observe(document.documentElement, { childList: true, subtree: true });
 
 const ICONS = {
   home: 'M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z',
@@ -3775,7 +3353,10 @@ const ICONS = {
   visits: 'M12 21s-7-6.2-7-11a7 7 0 0 1 14 0c0 4.8-7 11-7 11zM12 8a2 2 0 1 0 0 4a2 2 0 1 0 0-4',
   team: 'M9 11a3.5 3.5 0 1 0 0-7a3.5 3.5 0 1 0 0 7zM3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.5 3.5 0 0 1 0 6.5M18 14c2 .7 3 2.8 3 6',
   shield: 'M12 3l7 3v5c0 4.5-3 8.3-7 10c-4-1.7-7-5.5-7-10V6zM9 12l2 2 4-4',
-  news: 'M3 10v4h3l6 4V6L6 10zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12'
+  news: 'M3 10v4h3l6 4V6L6 10zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12',
+  inbox: 'M4 13l3-8h10l3 8v6H4zM4 13h5l1 3h4l1-3h5',
+  list: 'M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01',
+  user: 'M12 12a4 4 0 1 0 0-8a4 4 0 1 0 0 8zM4 21c0-4 3.6-7 8-7s8 3 8 7'
 };
 function icon(path) {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
@@ -3797,7 +3378,12 @@ function caseTags(c, extra) {
 // Tabs come from the server: every team someone is in brings its own.
 const NAV = { home: [ICONS.home, 'Home'], week: [ICONS.week, 'Week'], me: [ICONS.hours, 'Hours'],
               ho: [ICONS.cases, 'Handover'], vis: [ICONS.visits, 'Visits'], team: [ICONS.team, 'Team'],
-              people: [ICONS.shield, 'People'], updates: [ICONS.news, 'Updates'] };
+              people: [ICONS.shield, 'People'], pay: [ICONS.hours, 'Pay'], updates: [ICONS.news, 'Updates'],
+              today: [ICONS.week, 'Today'], hov: [ICONS.inbox, 'Handovers'], oreq: [ICONS.list, 'Requests'],
+              prof: [ICONS.user, 'Me'] };
+// On-Site Specialists get five tabs of their own: Today, Visits, Handovers, Requests, Me.
+const SPEC_VIEWS = ['today', 'hov', 'oreq', 'prof'];
+const isSpecTabs = () => !!(TABS && TABS[0] === 'today');
 let TAB_NAMES = {};
 function navBar() {
   const tabs = ADMIN_MODE ? ADMIN_TABS
@@ -3938,6 +3524,7 @@ async function loadHome() {
 function renderTeamHome(d) {
   const app = document.getElementById('app');
   TABS = d.tabs || null; TAB_NAMES = d.tabNames || {}; CAN_REQUEST = !!d.canRequest;
+  if (isSpecTabs()) { VIEW = 'today'; return loadVisits(); }
   if (d.teamHome === 'ON') ONLINE = true;
   const card = (n, l, wide) => `<div class="card${wide ? ' wide' : ''}"><div class="n">${esc(String(n))}</div><div class="l">${esc(l)}</div></div>`;
   const cards = list => '<div class="cards" style="margin-top:20px">'
@@ -3978,12 +3565,16 @@ function renderTeamHome(d) {
     h += d.next ? hero('Next visit · ' + d.next.day + ' ' + d.next.start, d.next.customer,
                        [d.next.type, d.next.address].filter(Boolean).join(' · '), true)
                 : hero('Next visit', 'Nothing booked', '');
+    if (d.pay) h += '<div class="p tappable paycard" data-gopay="1"><div class="ptop"><div>'
+       + `<div class="k">${esc(d.pay.label)}</div><div class="v">${esc(d.pay.total || plural(d.pay.count, 'visit'))}</div></div>`
+       + '<div class="t">›</div></div>'
+       + `<div class="t">${esc(plural(d.pay.count, 'visit'))} · see Pay</div></div>`;
     h += cards([[d.todayVisits.length, 'Visits today'], [d.weekVisits, 'This week']]);
     if (d.todayVisits.length) h += '<h2>Today</h2>' + d.todayVisits.map(v => visitRow({ ...v, specialist: '' })).join('');
     h += '<div class="p tappable" data-gotovis="1" style="margin-top:14px"><div class="pn">'
        + plural(d.waiting, 'handover') + ' waiting' + (d.arranging ? ' · ' + d.arranging + ' you’re arranging' : '')
        + '</div><div class="t">Take one in My visits</div></div>';
-    h += '<div class="note">At the visit, send /visits to the bot to tap 🚗 Arrived and 🏁 Leave.</div>';
+    h += '<div class="note">At the visit, open it in My visits to tap 🚗 Arrived and 🏁 Leave (or send /visits).</div>';
   } else if (d.teamHome === 'ON') {
     h += hero('Open on your channels', plural(d.open, 'case'),
               d.channels.length ? (d.waiting ? d.waiting + ' waiting 3+ days ⏳' : 'None waiting 3+ days')
@@ -4019,6 +3610,7 @@ function renderTeamHome(d) {
   wire();
   wireRequestButton();
   document.querySelectorAll('[data-gotovis]').forEach(el => { el.onclick = () => { VIEW = 'vis'; render(); }; });
+  document.querySelectorAll('[data-gopay]').forEach(el => { el.onclick = () => { VIEW = 'pay'; PAY_MONTH = ''; render(); }; });
   document.querySelectorAll('[data-hcase]').forEach(el => {
     el.onclick = () => {
       if (d.teamHome === 'ON') { ON_GROUP = CH_GROUP[el.dataset.hch] || ON_GROUP; ON_REGION = ''; }
@@ -4100,7 +3692,11 @@ function wire() {
     el.onclick = () => { AGENT = Number(el.dataset.agent); START = ''; render(); };
   });
   document.querySelectorAll('.nav-bar div').forEach(el => {
-    el.onclick = () => { VIEW = el.dataset.v; START = ''; AGENT = PERSON = APPROVE = null; render(); };
+    el.onclick = () => {
+      VIEW = el.dataset.v; START = ''; AGENT = PERSON = APPROVE = null;
+      if (isSpecTabs()) { VS.vv = VS.lv = VS.rq = VS.cab = VS.form = null; VS.tv = null; window.scrollTo(0, 0); }
+      render();
+    };
   });
   document.querySelectorAll('.tab').forEach(el => {
     el.onclick = () => { VIEW = el.dataset.v; START = ''; render(); };
@@ -4288,7 +3884,7 @@ async function loadHandover() {
        + 'Cases waiting on Online stay here until they close it too.</div>';
     // Anything Online handed back goes first: someone is waiting on SH.
     const first = c => c.onlineDone ? 2 : (c.handedBack || (c.request && !c.shClosed)) ? 1 : 0;
-    const order = [...d.openCases].sort((a, b) => (first(b) - first(a)) || (a.id - b.id));
+    const order = [...d.openCases].sort((a, b) => (first(b) - first(a)) || String(a.seq).localeCompare(String(b.seq)));
     for (const c of order) h += caseCard(c, false);
   }
 
@@ -4309,7 +3905,7 @@ function wireHandover() {
   document.querySelectorAll('.tick').forEach(el => {
     el.onclick = async () => {
       const out = await post('/api/case/toggle',
-        { id: Number(el.dataset.id), close: el.dataset.close === '1' });
+        { id: el.dataset.id, close: el.dataset.close === '1' });
       if (!out.ok) { toast(out.error || 'Could not change that.'); return; }
       toast(out.closed ? 'Closed ' + out.username : 'Reopened ' + out.username);
       await loadHandover();
@@ -4322,7 +3918,7 @@ function wireHandover() {
       const note = box ? box.value.trim() : '';
       if (!note) { toast('Type a note first.'); return; }
       el.disabled = true;
-      const out = await post('/api/case/note', { id: Number(id), note });
+      const out = await post('/api/case/note', { id: id, note });
       el.disabled = false;
       if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
       toast('Note added');
@@ -4541,7 +4137,7 @@ function renderOnline(d) {
 
   const shown = open
     .filter(c => c.group === ON_GROUP && (!ON_REGION || c.region === ON_REGION))
-    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (b.canPick - a.canPick) || (a.id - b.id));
+    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (b.canPick - a.canPick) || String(a.seq).localeCompare(String(b.seq)));
   if (!shown.length) h += '<div class="note">Nothing open here 🎉</div>';
   for (const c of shown) h += onlineCard(c, mine.has(c.channel));
 
@@ -4565,7 +4161,7 @@ function renderOnline(d) {
     el.onclick = async () => {
       el.disabled = true;
       const help = el.dataset.help === '1';
-      const out = await post('/api/case/pick', { id: Number(el.dataset.pick), help });
+      const out = await post('/api/case/pick', { id: el.dataset.pick, help });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not save that.'); return; }
       toast(help ? 'On your list' : 'Off your list');
       await loadHandover();
@@ -4582,7 +4178,7 @@ function renderOnline(d) {
   });
   document.querySelectorAll('[data-edit]').forEach(el => {
     el.onclick = () => {
-      const c = open.find(x => x.id === Number(el.dataset.edit));
+      const c = open.find(x => x.id === el.dataset.edit);
       if (!c) return;
       ON_EDIT[c.id] = Object.assign({ prio: c.prio }, c.fields);
       renderOnline(d);
@@ -4590,18 +4186,18 @@ function renderOnline(d) {
   });
   document.querySelectorAll('[data-eprio]').forEach(el => {
     el.onclick = () => {
-      const id = Number(el.dataset.eprio);
+      const id = el.dataset.eprio;
       keepEdit(id);
       ON_EDIT[id].prio = el.dataset.v;
       renderOnline(d);
     };
   });
   document.querySelectorAll('[data-ecancel]').forEach(el => {
-    el.onclick = () => { delete ON_EDIT[Number(el.dataset.ecancel)]; renderOnline(d); };
+    el.onclick = () => { delete ON_EDIT[el.dataset.ecancel]; renderOnline(d); };
   });
   document.querySelectorAll('[data-esave]').forEach(el => {
     el.onclick = async () => {
-      const id = Number(el.dataset.esave);
+      const id = el.dataset.esave;
       keepEdit(id);
       el.disabled = true; el.textContent = 'Saving…';
       const out = await post('/api/case/edit', { id, changes: ON_EDIT[id] });
@@ -4618,7 +4214,7 @@ function renderOnline(d) {
       // An empty box hands it back with the note they already left.
       const note = box ? box.value.trim() : '';
       el.disabled = true;
-      const out = await post('/api/case/handback', { id: Number(id), note });
+      const out = await post('/api/case/handback', { id: id, note });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not hand that back.'); return; }
       toast('Handed back to SH');
       await loadHandover();
@@ -4630,8 +4226,9 @@ function openLink(u) { if (tg && tg.openLink) tg.openLink(u); else window.open(u
 
 function visitCard(it, d) {
   const done = it.status === 'COMPLETED';
-  let h = '<div class="case' + (done ? ' gone' : '') + '">';
-  h += '<div class="nm">' + esc(it.start) + ' · ' + esc(it.type) + '</div>';
+  let h = '<div class="case' + (done ? ' gone' : '') + (it.followup && !done ? ' fu' : '') + '">';
+  h += '<div class="nm">' + esc(it.start) + ' · ' + esc(it.type)
+     + (it.followup && !done ? ' <span class="tag red">FOLLOW-UP · ' + esc(it.followup.toUpperCase()) + '</span>' : '') + '</div>';
   h += '<div class="meta">' + esc(it.customer) + (it.postal ? ' · ' + esc(it.postal) : '')
      + (d.role === 'booker' ? ' · ' + esc(it.specialist) : '') + '</div>';
   if (it.status === 'ONSITE') h += '<div class="st">On-Site now</div>';
@@ -4641,7 +4238,7 @@ function visitCard(it, d) {
       : 'Asked to move to ' + esc(it.proposed) + '. Answer in your chat with the bot.') + '</div>';
   if (VS.open[it.id]) {
     let b = '';
-    if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+    if (it.phone) b += 'Phone: <span class="phn">' + esc(it.phone) + '</span><br>';
     if (it.email) b += 'Email: ' + esc(it.email) + '<br>';
     b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '<br>';
     if (it.product) b += 'Product: ' + esc(it.product) + '<br>';
@@ -4667,6 +4264,7 @@ function visitCard(it, d) {
   } else {
     h += '<div class="more" data-vshow="' + it.id + '">Details</div>';
   }
+  if (d.role === 'specialist') h += '<div class="more" data-vv="' + it.id + '">Open the visit ›</div>';
   return h + '</div>';
 }
 
@@ -4704,6 +4302,24 @@ function keepBookForm() {
   }
 }
 
+function followupCard(it) {
+  let h = '<div class="case fu"><div class="nm" style="display:flex;justify-content:space-between;gap:8px">'
+    + '<span>📌 ' + (REGION_FLAGS[it.country] || '') + ' ' + esc(it.customer) + ' · ' + esc(it.type) + '</span>'
+    + '<span class="tag red" style="align-self:flex-start">FOLLOW-UP · ' + esc(it.urgency.toUpperCase()) + '</span></div>';
+  h += '<div class="meta">' + [it.when, it.postal, it.specialist].filter(Boolean).map(esc).join(' · ') + '</div>';
+  let b = '';
+  if (it.why) b += 'Last time: ' + esc(it.why) + '<br>';
+  if (it.product) b += 'Product: ' + esc(it.product) + '<br>';
+  if (it.phone) b += 'Phone: <span class="phn">' + esc(it.phone) + '</span><br>';
+  if (it.address) b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '');
+  if (b) h += '<div class="body" style="white-space:normal">' + b + '</div>';
+  if (it.map) h += '<div class="more" data-map="' + esc(it.map) + '">📍 Open in Maps</div>';
+  if (it.canSet) h += '<div class="fld" style="margin-top:8px"><label>Date and time agreed with the customer</label>'
+     + '<input type="date" id="st_d_' + it.id + '"><input type="time" id="st_t_' + it.id + '" style="margin-top:6px"></div>'
+     + '<div class="acts"><button data-settime="' + it.id + '">Book it</button></div>';
+  return h + '</div>';
+}
+
 function openCard(it) {
   const tag = it.status === 'waiting' ? ['purple', 'WAITING'] : ['teal', 'ARRANGING'];
   let h = '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px">'
@@ -4714,7 +4330,7 @@ function openCard(it) {
   let b = '';
   if (it.issue) b += 'Issue: ' + esc(it.issue) + '<br>';
   if (it.note) b += 'Note: ' + esc(it.note) + '<br>';
-  if (it.phone) b += 'Phone: <a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a><br>';
+  if (it.phone) b += 'Phone: <span class="phn">' + esc(it.phone) + '</span><br>';
   if (it.address) b += 'Address: ' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '<br>';
   if (it.order) b += 'Order: ' + esc(it.order);
   if (b) h += '<div class="body" style="white-space:normal">' + b + '</div>';
@@ -4731,9 +4347,336 @@ function openCard(it) {
 const TK_STATUS = { waiting: ['purple', 'Waiting'], arranging: ['teal', 'Arranging'], booked: ['blue', 'Booked'], onsite: ['orange', 'On site now'], done: ['green', 'Done'],
   followup: ['amber', 'Follow-up'], cancelled: ['grey', 'Cancelled'] };
 
-function trackerSwitch() {
-  return '<div class="otabs"><button data-vmode="sched" class="' + (VS.mode === 'sched' ? 'on' : '') + '">Schedule</button>'
-       + '<button data-vmode="track" class="' + (VS.mode === 'track' ? 'on' : '') + '">Tracker</button></div>';
+function trackerSwitch(d) {
+  const b = (k, n) => '<button data-vmode="' + k + '" class="' + (VS.mode === k ? 'on' : '') + '">' + n + '</button>';
+  return '<div class="otabs">' + (d && d.role === 'specialist' && !isSpecTabs() ? b('today', 'Today') : '') + b('sched', 'Schedule')
+       + (!d || d.canTrack ? b('track', 'Tracker') : '') + '</div>';
+}
+
+// The specialist's Today: the next visit with Directions and Call, then the day.
+function todayView(d) {
+  const t = d.myDay || { items: [] };
+  const five = isSpecTabs();
+  let h = '<h1>Today</h1><div class="sub">' + esc(t.label || '') + '</div>' + (five ? '' : trackerSwitch(d));
+  if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
+  const n = t.next;
+  if (n) {
+    h += '<h2>' + (n.status === 'ONSITE' ? 'On site now' : 'Next visit') + '</h2>';
+    // Plain card for a normal visit; red (with the tag) only for a follow-up or revisit.
+    h += '<div class="case' + (n.followup ? ' fu' : '') + '">'
+       + '<div class="nm">' + esc(n.when) + ' · ' + esc(n.type) + '</div>'
+       + (n.followup ? '<div><span class="tag red">FOLLOW-UP · ' + esc(String(n.followup).toUpperCase()) + '</span></div>' : '')
+       + '<div class="meta">' + (REGION_FLAGS[n.country] || '') + ' ' + esc(n.customer) + (n.postal ? ' · ' + esc(n.postal) : '') + '</div>'
+       + (n.product ? '<div class="meta">' + esc(n.product) + '</div>' : '')
+       + '<div class="acts"><button data-map="' + esc(n.map) + '">Directions</button>'
+       + '<button class="soft" data-vv="' + n.id + '">Open</button></div></div>';
+  } else {
+    h += '<div class="empty">No visits coming up.</div>';
+  }
+  h += '<h2>' + esc(t.label || 'Today') + '</h2>';
+  h += todayList(t);
+  if (!five) h += requestsList(d);
+  return h;
+}
+
+const RQ_TAG = { OPEN: ['amber', 'WAITING'], TAKEN: ['blue', 'BEING HANDLED'], DONE: ['green', 'DONE'] };
+const CAB_TAG = { RECEIPT: 'amber', PENDING: 'amber', APPROVED: 'green', REJECTED: 'red' };
+function requestsList(d) {
+  const rs = d.myRequests || [], cs = d.myClaims || [];
+  let h = '';
+  if (cs.length) h += '<h2>Your cab claims</h2>' + cs.map(c => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+    + esc(c.amount) + ' · #' + c.visit + '</span><span class="tag ' + CAB_TAG[c.status] + '">' + esc(c.statusName.toUpperCase()) + '</span></div>'
+    + '<div class="meta">' + esc(c.when) + ' · ' + esc(c.trip) + (c.reason ? ' · ' + esc(c.reason) : '') + '</div></div>').join('');
+  if (!rs.length) return h;
+  return h + '<h2>Your requests</h2>' + rs.map(r => '<div class="case"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+    + esc(r.need) + ' · #' + r.visit + '</span><span class="tag ' + RQ_TAG[r.status][0] + '">' + RQ_TAG[r.status][1] + '</span></div>'
+    + '<div class="meta">' + esc(r.when) + (r.who ? ' · ' + esc(r.who) : '') + ' · ' + esc(r.reason) + '</div>'
+    + (r.note ? '<div class="body">📝 ' + esc(r.note) + '</div>' : '') + '</div>').join('');
+}
+
+function todayList(t) {
+  let h = '';
+  if (!t.items.length) h += '<div class="empty">Nothing booked today.</div>';
+  for (const it of t.items) {
+    const st = it.status === 'COMPLETED' ? 'done' : it.status === 'ONSITE' ? 'on site' : '';
+    h += '<div class="case tk-v' + (it.status === 'COMPLETED' ? ' gone' : '') + (it.followup && it.status !== 'COMPLETED' ? ' fu' : '') + '" data-vv="' + it.id + '">'
+       + '<div class="nm"><span>' + esc(it.start) + ' · ' + esc(it.customer) + '</span>'
+       + (st ? '<span class="tag ' + (st === 'done' ? 'green' : 'orange') + '">' + st.toUpperCase() + '</span>' : '') + '</div>'
+       + '<div class="meta">' + esc(it.type) + (it.postal ? ' · ' + esc(it.postal) : '') + ' ›</div></div>';
+  }
+  return h;
+}
+
+// One visit: Arrived, the checklist, photos and Leave.
+function visitScreen(v) {
+  let h = '<div class="back" data-vvback="1">‹ ' + (isSpecTabs() ? (NAV[VIEW] || NAV.vis)[1] : VS.mode === 'today' ? 'Today' : 'Visits') + '</div>';
+  h += '<h1>' + esc(v.customer) + '</h1><div class="sub">' + (REGION_FLAGS[v.country] || '') + ' ' + esc(v.when) + ' · ' + esc(v.type)
+     + (v.status === 'ONSITE' ? ' · on site ' + esc(v.onSite) : '') + '</div>';
+  h += '<div class="tags" style="margin:6px 0 10px">'
+     + (v.arrived ? '<span class="tag green">ARRIVED ' + esc(v.arrived) + '</span>' : '')
+     + (v.followup ? '<span class="tag red">FOLLOW-UP · ' + esc(v.followup.toUpperCase()) + '</span>' : '')
+     + (v.status === 'COMPLETED' ? '<span class="tag grey">COMPLETED</span>' : '') + '</div>';
+  let b = '';
+  if (v.product) b += 'Product: ' + esc(v.product) + '<br>';
+  if (v.issue) b += 'Issue: ' + esc(v.issue) + '<br>';
+  if (v.why) b += 'Last time: ' + esc(v.why) + '<br>';
+  if (v.note) b += 'Note: ' + esc(v.note) + '<br>';
+  if (v.phone) b += 'Phone: <span class="phn">' + esc(v.phone) + '</span><br>';
+  b += 'Address: ' + esc(v.address) + (v.postal ? ' ' + esc(v.postal) : '');
+  if (v.order) b += '<br>Order: ' + esc(v.order);
+  h += '<div class="case"><div class="body" style="white-space:normal">' + b + '</div>'
+     + '<div class="acts"><button data-map="' + esc(v.map) + '">Directions</button>'
+     + '</div></div>';
+  if (v.status === 'SCHEDULED') h += '<button class="big" data-arrive="' + v.id + '">🚗 Arrived</button>';
+  if (v.status === 'ONSITE') {
+    if (VS.lv) return h + leaveForm(v);
+    h += '<h2>' + (v.type === 'Troubleshoot' ? 'Troubleshoot' : 'Set-up') + ' checklist</h2>';
+    if (v.draft) h += '<div class="note">Draft steps, to be confirmed with the specialist.</div>';
+    h += '<div class="case">' + v.checklist.map((x, i) => {
+      const on = v.ticks.includes(i);
+      return '<div class="top" style="padding:6px 0;border-bottom:1px solid var(--line)" data-tick="' + i + '" data-on="' + (on ? 1 : 0) + '">'
+        + '<div class="tick' + (on ? ' on' : '') + '">' + (on ? '✓' : '') + '</div><div style="padding-top:3px">' + esc(x) + '</div></div>';
+    }).join('') + '</div>';
+    h += '<h2>Photos (optional)</h2><label class="big ghost" style="display:block;text-align:center">📷 Add a photo<input type="file" accept="image/*" data-vphoto="1" hidden></label><div class="note">'
+       + (v.photos ? v.photos + ' added so far.' : 'None yet.') + '</div>';
+    h += '<h2>Customer sign-off</h2>' + (v.signed ? '<div class="case"><div class="nm">✅ Signed by ' + esc(v.signed) + '</div><div class="meta">Sent to SH with the visit.</div></div>'
+       : (VS.sign ? signForm(v) : '<button class="big ghost" data-signopen="1">✍️ Customer signs here</button>'));
+    h += '<button class="big" data-leave="' + v.id + '">🏁 Leave</button>';
+  }
+  if (v.status === 'COMPLETED' && v.report) h += '<div class="case"><div class="body">' + esc(v.report) + '</div></div>';
+  if (v.status === 'COMPLETED' && v.reviewQr) h += '<button class="big ghost" data-rvqr="' + v.id + '">⭐ Show review QR</button><div id="rvbox"></div>';
+  if (v.canRequest) h += VS.rq ? rqForm(v) : '<button class="big ghost" data-rqopen="1">📦 Replacement / payment request</button>';
+  if (v.canClaim) h += VS.cab ? cabForm(v) : '<button class="big ghost" data-cabopen="1">🚕 Cab claim</button>';
+  return h;
+}
+
+function rqForm(v) {
+  const f = VS.rq;
+  const pick = (k, val, name) => '<button data-rqf="' + k + '" data-v="' + val + '" class="' + (f[k] === val ? 'on' : '') + '">' + name + '</button>';
+  let h = '<h2>Replacement / payment request</h2><div class="note">Goes to the SH x Ops chat. No customer phone or address is posted.</div>';
+  h += '<div class="fld"><label>Visit</label><input value="#' + String(v.id).slice(0, 8) + ' · ' + esc(v.product || v.type) + '" disabled></div>';
+  h += '<div class="fld"><label>Need</label><div class="pick">' + pick('need', 'REPLACEMENT', 'Replacement unit') + pick('need', 'PART', 'Part') + pick('need', 'OTHER', 'Other') + '</div></div>';
+  h += '<div class="fld"><label>Reason</label><textarea id="rq_reason" rows="2" placeholder="Won’t power on, fault confirmed on site">' + esc(f.reason || '') + '</textarea></div>';
+  h += '<div class="fld"><label>Warranty</label><div class="pick">' + pick('warranty', 'IN', 'In warranty') + pick('warranty', 'OUT', 'Out of warranty') + '</div></div>';
+  h += '<div class="fld"><label>Customer pays by</label><div class="pick">' + pick('pays_by', 'NONE', 'No charge') + pick('pays_by', 'PAYNOW', 'PayNow') + pick('pays_by', 'LINK', 'Payment link') + '</div></div>';
+  const paid = f.pays_by === 'LINK';
+  h += '<div class="fld"><label>Price (' + esc(v.currency || 'SGD') + (paid ? ')' : ', leave empty if to confirm)') + '</label><input id="rq_price" inputmode="decimal" placeholder="120.00" value="' + esc(f.price || '') + '"></div>';
+  if (f.pays_by === 'PAYNOW') h += '<button class="big ghost" data-rqpn="1">Show PayNow QR</button><div id="rqpnbox"></div>';
+  if (f.pays_by === 'LINK') h += '<div class="fld"><label>Customer name</label><input id="rq_cname" autocomplete="off" value="' + esc(f.cust_name || '') + '"></div>'
+    + '<div class="fld"><label>Customer email</label><input id="rq_cemail" type="email" autocomplete="off" placeholder="name@example.com" value="' + esc(f.cust_email || '') + '">'
+    + '<div class="note">Finance gets these in their chat and emails the customer a payment link. They aren’t posted in SH x Ops.</div></div>';
+  h += '<button class="big" id="rqSend">Send to SH x Ops</button><button class="big ghost" id="rqBack2">Back</button>';
+  return h;
+}
+
+// The customer signs on the specialist's phone: what was done, their name, the consent tick and a signature.
+function signForm(v) {
+  const f = VS.sign, done = (v.checklist || []).filter((x, i) => (v.ticks || []).includes(i));
+  return '<div class="case"><div class="nm">Visit #' + String(v.id).slice(0, 8) + ' · ' + esc(v.type) + (v.product ? ' · ' + esc(v.product) : '') + '</div>'
+    + (done.length ? '<div class="meta" style="margin-top:6px">Done: ' + done.map(esc).join('; ') + '</div>' : '') + '</div>'
+    + '<div class="fld"><label>Your name</label><input id="sg_name" autocomplete="off" value="' + esc(f.name || '') + '"></div>'
+    + '<div class="top" data-sgok="1" style="padding:6px 0;cursor:pointer"><div class="tick' + (f.consent ? ' on' : '') + '">' + (f.consent ? '✓' : '') + '</div><div style="padding-top:3px">' + esc(v.signText) + '</div></div>'
+    + (v.signDraft ? '<div class="note">Draft wording until TC confirms it.</div>' : '')
+    + '<div class="fld"><label>Sign here</label><canvas id="sg_pad" style="width:100%;height:180px;background:#fff;border:2px solid #8A9099;border-radius:6px;touch-action:none"></canvas>'
+    + '<button class="big ghost" id="sgClear" style="margin-top:6px">Clear</button></div>'
+    + '<button class="big" id="sgSave">Confirm sign-off</button><button class="big ghost" id="sgBack">Back</button>';
+}
+
+function cabForm(v) {
+  const f = VS.cab;
+  const pick = (val, name) => '<button data-cabt="' + val + '" class="' + (f.trip === val ? 'on' : '') + '">' + name + '</button>';
+  return '<h2>Cab claim</h2><div class="fld"><label>Trip</label><div class="pick">' + pick('TO', 'To the visit') + pick('FROM', 'From the visit') + pick('BOTH', 'Both ways') + '</div></div>'
+    + '<div class="fld"><label>Fare (' + esc(v.currency || 'SGD') + ')</label><input id="cab_amount" inputmode="decimal" placeholder="18.40" value="' + esc(f.amount || '') + '"></div>'
+    + '<div class="fld"><label>Receipt photo</label><label class="big ghost" style="display:block;text-align:center;margin:0">' + (f.photo ? '✅ Receipt added · change' : '🧾 Add the receipt photo') + '<input type="file" accept="image/*" data-cabphoto="1" hidden></label></div>'
+    + '<button class="big" id="cabSend">Send claim</button><button class="big ghost" id="cabBack">Back</button>';
+}
+
+function keepRq() {
+  if (!VS.rq) return;
+  const r = document.getElementById('rq_reason'), p = document.getElementById('rq_price');
+  if (r) VS.rq.reason = r.value; if (p) VS.rq.price = p.value;
+  const cn = document.getElementById('rq_cname'), ce = document.getElementById('rq_cemail');
+  if (cn) VS.rq.cust_name = cn.value; if (ce) VS.rq.cust_email = ce.value;
+}
+
+function leaveForm(v) {
+  const f = VS.lv;
+  const pick = (k, val, name) => '<button data-lf="' + k + '" data-v="' + val + '" class="' + (String(f[k]) === String(val) ? 'on' : '') + '">' + name + '</button>';
+  let h = '<h2>How did it go?</h2><div class="pick">' + pick('outcome', 'RESOLVED', 'Resolved')
+        + pick('outcome', 'RETURN', 'Not finished, need to come back') + pick('outcome', 'REPLACE', 'Needs a replacement unit') + '</div>';
+  if (f.outcome === 'RESOLVED') {
+    h += '<div class="fld"><label>Charge (' + esc(v.currency || 'SGD') + ')</label><div class="pick">' + pick('noCharge', '', 'Charge') + pick('noCharge', '1', 'No charge') + '</div></div>';
+    if (!f.noCharge) {
+      h += '<div class="fld"><label>Amount</label><input id="lf_amount" inputmode="decimal" value="' + esc(f.amount || '') + '"></div>';
+      h += '<div class="fld"><label>How did the customer pay?</label><div class="pick">' + pick('method', 'CASH', 'Cash') + pick('method', 'PAYNOW', 'PayNow') + pick('method', 'OTHER', 'Other') + '</div></div>';
+      if (f.method === 'PAYNOW') h += '<button class="big ghost" data-pnqr="' + v.id + '">Show PayNow QR</button><div id="pnbox"></div>'
+        + '<label class="big ghost" style="display:block;text-align:center">' + (v.payPhoto ? '✅ Payment photo added · change' : '📷 Photo of the payment') + '<input type="file" accept="image/*" data-payphoto="1" hidden></label>'
+        + '<div class="note">Take a photo of the customer’s PayNow confirmation screen.</div>';
+    }
+  }
+  if (f.outcome === 'RETURN') {
+    h += '<div class="note">No charge for this visit. The customer pays when the job is done.</div>';
+    h += '<div class="fld"><label>Why didn’t it finish?</label><div class="pick">' + pick('reason', 'PART', 'Need a part') + pick('reason', 'TIME', 'Out of time')
+       + pick('reason', 'NOTREADY', 'Customer not ready') + pick('reason', 'OTHER', 'Other') + '</div></div>';
+    h += '<div class="fld"><label>Note (optional)</label><textarea id="lf_note" rows="2">' + esc(f.note || '') + '</textarea></div>';
+    h += '<div class="fld"><label>How urgent?</label><div class="pick">' + pick('urgency', 'HIGH', 'High') + pick('urgency', 'MEDIUM', 'Medium') + pick('urgency', 'LOW', 'Low') + '</div></div>';
+    h += '<div class="fld"><label>Next visit</label><div class="pick">' + pick('later', '', 'Pick a date') + pick('later', '1', 'Customer will confirm later') + '</div></div>';
+    if (!f.later) h += '<div class="fld"><input type="date" id="lf_date" value="' + esc(f.date || '') + '"><input type="time" id="lf_time" value="' + esc(f.time || '') + '" style="margin-top:6px"></div>';
+  }
+  if (f.outcome) h += '<button class="big" id="lfSave">' + (f.outcome === 'RETURN' && !f.later ? 'Book the next visit' : 'Finish the visit') + '</button>';
+  h += '<button class="big ghost" id="lfBack">Back</button>';
+  return h;
+}
+
+function keepLeave() {
+  if (!VS.lv) return;
+  for (const k of ['amount', 'note', 'date', 'time']) { const el = document.getElementById('lf_' + k); if (el) VS.lv[k] = el.value; }
+}
+
+async function loadVisitScreen(d) {
+  const app = document.getElementById('app');
+  const out = await post('/api/visit/one', { id: VS.vv });
+  if (!out.ok) { VS.vv = null; toast(out.error || 'Could not open that.'); return loadVisits(); }
+  const v = out.visit;
+  if (VS.lv && VS.lv.amount === undefined && v.suggest) VS.lv.amount = (v.suggest / 100).toFixed(2);
+  app.innerHTML = visitScreen(v) + navBar();
+  wireVisits(d);
+  const on = (sel, fn) => document.querySelectorAll(sel).forEach(el => { el.onclick = () => fn(el); });
+  on('[data-vvback]', () => { VS.vv = null; VS.lv = null; VS.rq = null; VS.cab = null; loadVisits(); });
+  on('[data-arrive]', async el => {
+    el.disabled = true;
+    const r = await post('/api/visit/arrive', { id: v.id });
+    if (!r.ok) { el.disabled = false; toast(r.error || 'Could not save that.'); return; }
+    toast('Arrived'); loadVisits();
+  });
+  on('[data-tick]', async el => {
+    const r = await post('/api/visit/check', { id: v.id, i: Number(el.dataset.tick), on: el.dataset.on !== '1' });
+    if (!r.ok) { toast(r.error || 'Could not save that.'); return; }
+    loadVisits();
+  });
+  on('[data-leave]', () => { VS.lv = { urgency: 'MEDIUM' }; loadVisits(); });
+  const qrImg = (img, sample, caption) => '<div class="case" style="text-align:center">' + (sample ? '<div class="warn">SAMPLE — not a payment code. PayNow isn’t set up yet.</div>' : '')
+    + (img ? '<img src="' + img + '" style="width:240px;max-width:100%;image-rendering:pixelated">' : '') + '<div class="meta">' + esc(caption) + '</div></div>';
+  on('[data-pnqr]', async () => {
+    keepLeave();
+    const r = await post('/api/visit/paynow', { id: v.id, amount: VS.lv.amount });
+    if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
+    document.getElementById('pnbox').innerHTML = qrImg(r.img, r.sample, r.static ? 'Scan to pay TC Acoustic' + (r.amount ? ' · customer keys in ' + r.amount : '') : r.amount + ' · Reference ' + r.ref);
+  });
+  on('[data-signopen]', () => { VS.sign = {}; loadVisits(); });
+  const pad = document.getElementById('sg_pad');
+  if (pad) {
+    const r0 = pad.getBoundingClientRect(), k = window.devicePixelRatio || 1;
+    pad.width = r0.width * k; pad.height = r0.height * k;
+    const g = pad.getContext('2d'); g.scale(k, k); g.lineWidth = 2.5; g.lineCap = 'round'; g.lineJoin = 'round'; g.strokeStyle = '#101418';
+    let drawing = false, inked = false;
+    const at = e => { const r = pad.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    pad.onpointerdown = e => { drawing = true; pad.setPointerCapture(e.pointerId); const [x, y] = at(e); g.beginPath(); g.moveTo(x, y); };
+    pad.onpointermove = e => { if (!drawing) return; const [x, y] = at(e); g.lineTo(x, y); g.stroke(); inked = true; };
+    pad.onpointerup = pad.onpointercancel = () => { drawing = false; };
+    document.getElementById('sgClear').onclick = () => { g.clearRect(0, 0, pad.width, pad.height); inked = false; };
+    const keepSign = () => { const n = document.getElementById('sg_name'); if (n) VS.sign.name = n.value; };
+    on('[data-sgok]', () => { keepSign(); VS.sign.consent = !VS.sign.consent; const t = document.querySelector('[data-sgok] .tick'); t.classList.toggle('on', VS.sign.consent); t.textContent = VS.sign.consent ? '✓' : ''; });
+    document.getElementById('sgBack').onclick = () => { VS.sign = null; loadVisits(); };
+    const sv = document.getElementById('sgSave');
+    sv.onclick = async () => {
+      keepSign();
+      if (!(VS.sign.name || '').trim()) { toast('Ask the customer to type their name.'); return; }
+      if (!VS.sign.consent) { toast('The customer needs to tick the box.'); return; }
+      if (!inked) { toast('Ask the customer to sign.'); return; }
+      sv.disabled = true; sv.textContent = 'Saving…';
+      const r = await post('/api/visit/signoff', { id: v.id, name: VS.sign.name, consent: true, sig: pad.toDataURL('image/png') });
+      sv.disabled = false; sv.textContent = 'Confirm sign-off';
+      if (!r.ok) { toast(r.error || 'Could not save the sign-off.'); return; }
+      VS.sign = null; toast('Signed. Thank you!'); loadVisits();
+    };
+  }
+  document.querySelectorAll('[data-payphoto]').forEach(el => el.onchange = async () => {
+    keepLeave();
+    const img = await shrinkPhoto(el.files && el.files[0]);
+    if (!img) { toast('That photo couldn’t be read. Try another.'); return; }
+    toast('Saving the photo…');
+    const r = await post('/api/visit/payphoto', { id: v.id, photo: img });
+    if (!r.ok) { toast(r.error || 'Could not save the photo.'); return; }
+    toast('Payment photo added'); loadVisits();
+  });
+  on('[data-rvqr]', async () => {
+    const r = await post('/api/visit/reviewqr', {});
+    if (!r.ok) { toast(r.error || 'Could not make the QR.'); return; }
+    document.getElementById('rvbox').innerHTML = qrImg(r.img, false, 'Scan to leave us a review');
+  });
+  on('[data-rqpn]', async () => {
+    keepRq();
+    const r = await post('/api/visit/paynow', { id: v.id, amount: VS.rq.price });
+    if (!r.ok) { toast(r.error || 'Type the price first.'); return; }
+    document.getElementById('rqpnbox').innerHTML = qrImg(r.img, r.sample, r.static ? 'Scan to pay TC Acoustic' + (r.amount ? ' · customer keys in ' + r.amount : '') : r.amount + ' · Reference ' + r.ref);
+  });
+  on('[data-rqopen]', () => { VS.rq = {}; loadVisits(); });
+  on('[data-cabopen]', () => { VS.cab = {}; loadVisits(); });
+  on('[data-cabt]', el => { const a = document.getElementById('cab_amount'); if (a) VS.cab.amount = a.value; VS.cab.trip = el.dataset.cabt; loadVisits(); });
+  const cb = document.getElementById('cabBack');
+  if (cb) cb.onclick = () => { VS.cab = null; loadVisits(); };
+  const cs = document.getElementById('cabSend');
+  if (cs) cs.onclick = async () => {
+    VS.cab.amount = document.getElementById('cab_amount').value;
+    if (!VS.cab.trip || !VS.cab.amount) { toast('Pick the trip and type the fare.'); return; }
+    if (!VS.cab.photo) { toast('Add the receipt photo.'); return; }
+    cs.disabled = true; cs.textContent = 'Sending…';
+    const r = await post('/api/visit/cab', { id: v.id, trip: VS.cab.trip, amount: VS.cab.amount, photo: VS.cab.photo });
+    cs.disabled = false; cs.textContent = 'Send claim';
+    if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
+    VS.cab = null; toast(r.sent ? 'Cab claim sent for approval.' : 'Now send the receipt photo to SH Bot in your chat.'); loadVisits();
+  };
+  document.querySelectorAll('[data-cabphoto]').forEach(el => el.onchange = async () => {
+    const a = document.getElementById('cab_amount'); if (a) VS.cab.amount = a.value;
+    const img = await shrinkPhoto(el.files && el.files[0]);
+    if (!img) { toast('That photo couldn’t be read. Try another.'); return; }
+    VS.cab.photo = img; loadVisits();
+  });
+  document.querySelectorAll('[data-vphoto]').forEach(el => el.onchange = async () => {
+    const img = await shrinkPhoto(el.files && el.files[0]);
+    if (!img) { toast('That photo couldn’t be read. Try another.'); return; }
+    toast('Adding the photo…');
+    const r = await post('/api/visit/photo', { id: v.id, photo: img });
+    if (!r.ok) { toast(r.error || 'Could not add the photo.'); return; }
+    toast('Photo added (' + r.photos + ' so far)'); loadVisits();
+  });
+  on('[data-rqf]', el => { keepRq(); VS.rq[el.dataset.rqf] = el.dataset.v; loadVisits(); });
+  const rb = document.getElementById('rqBack2');
+  if (rb) rb.onclick = () => { VS.rq = null; loadVisits(); };
+  const rs = document.getElementById('rqSend');
+  if (rs) rs.onclick = async () => {
+    keepRq();
+    const f = VS.rq;
+    if (!f.need || !f.warranty || !f.pays_by) { toast('Pick the need, warranty and how they pay.'); return; }
+    if (!f.reason || f.reason.trim().length < 3) { toast('Say why in a few words.'); return; }
+    if (f.pays_by === 'LINK' && !(parseFloat(f.price) > 0)) { toast('Type the price the customer pays.'); return; }
+    if (f.pays_by === 'LINK' && (!(f.cust_name || '').trim() || !/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test((f.cust_email || '').trim()))) { toast('Type the customer’s name and email.'); return; }
+    rs.disabled = true;
+    const r = await post('/api/visit/request', Object.assign({ id: v.id }, f));
+    rs.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not send that.'); return; }
+    VS.rq = null; toast((r.posted ? 'Sent to SH x Ops' : 'Sent to the On-Site admins (no request chat set yet)') + (f.pays_by === 'LINK' ? '. Finance will email the payment link.' : '')); loadVisits();
+  };
+  on('[data-lf]', el => { keepLeave(); VS.lv[el.dataset.lf] = el.dataset.v; loadVisits(); });
+  const back = document.getElementById('lfBack');
+  if (back) back.onclick = () => { VS.lv = null; loadVisits(); };
+  const save = document.getElementById('lfSave');
+  if (save) save.onclick = async () => {
+    keepLeave();
+    const f = VS.lv;
+    if (f.outcome === 'RETURN' && !f.reason) { toast('Pick why it didn’t finish.'); return; }
+    if (f.outcome === 'RETURN' && !f.later && (!f.date || !f.time)) { toast('Pick the date and time, or Customer will confirm later.'); return; }
+    if (f.outcome === 'RESOLVED' && !f.noCharge && (!f.amount || !f.method)) { toast('Type the amount and pick how they paid.'); return; }
+    if (f.outcome === 'RESOLVED' && !f.noCharge && f.method === 'PAYNOW' && !v.payPhoto) { toast('Add a photo of the customer’s PayNow payment.'); return; }
+    save.disabled = true;
+    const r = await post('/api/visit/leave', Object.assign({ id: v.id }, f, { later: !!f.later, noCharge: !!f.noCharge }));
+    save.disabled = false;
+    if (!r.ok) { toast(r.error || 'Could not save that.'); return; }
+    VS.lv = null; if (f.outcome !== 'RESOLVED') VS.vv = null;
+    toast(f.outcome === 'RETURN' && !f.later ? 'Done. The next visit is booked and pinned in your chat.' : 'Done. The report has gone to SH.');
+    loadVisits();
+  };
 }
 
 function trackerVisit(it) {
@@ -4757,7 +4700,7 @@ function trackerVisit(it) {
       h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
          + '<div class="note" style="margin-top:8px">Phone and address are with whoever booked it and the specialist doing it.</div></div>';
     } else {
-      if (it.phone) c += '<b>Phone</b><span><a href="tel:' + esc(it.phone) + '">' + esc(it.phone) + '</a></span>';
+      if (it.phone) c += '<b>Phone</b><span><span class="phn">' + esc(it.phone) + '</span></span>';
       if (it.email) c += '<b>Email</b><span>' + esc(it.email) + '</span>';
       c += '<b>Address</b><span>' + esc(it.address) + (it.postal ? ' ' + esc(it.postal) : '') + '</span>';
       h += '<div class="tk-sec"><h2>Customer</h2><div class="tk-kv">' + c + '</div>'
@@ -4774,7 +4717,7 @@ async function loadTracker(d) {
   const open = VS.tv ? t.items.concat(t.open || []).find(x => x.id === VS.tv) : null;
   if (open) { app.innerHTML = trackerVisit(open) + navBar(); wireVisits(d); return; }
   VS.tv = null;
-  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch();
+  let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>' + trackerSwitch(d);
   h += '<div class="otabs small"><button data-tw="' + t.prev + '">◀ Prev</button>'
      + '<button class="on">' + esc(t.weekLabel) + '</button>'
      + '<button data-tw="' + t.next + '">Next ▶</button></div>';
@@ -4829,10 +4772,19 @@ async function loadVisits() {
     wireVisits(d);
     return;
   }
-  if (!d.canTrack) VS.mode = 'sched';
+  if (isSpecTabs()) { VS.mode = VIEW === 'today' ? 'today' : (VS.mode === 'track' ? 'track' : 'sched'); VS.modeSet = true; }
+  if (d.role === 'specialist' && !VS.modeSet) { VS.mode = 'today'; VS.modeSet = true; }
+  if (!d.canTrack && VS.mode === 'track') VS.mode = 'sched';
+  if (d.role !== 'specialist' && VS.mode === 'today') VS.mode = 'sched';
+  if (VS.vv) return loadVisitScreen(d);
+  if (isSpecTabs() && VIEW !== 'today' && VIEW !== 'vis') {
+    const view = { hov: handoversView, oreq: requestsView, prof: meView }[VIEW];
+    app.innerHTML = view(d) + navBar(); wireVisits(d); wireSpecTabs(); return;
+  }
   if (VS.mode === 'track') return loadTracker(d);
+  if (VS.mode === 'today') { app.innerHTML = todayView(d) + navBar(); wireVisits(d); if (isSpecTabs()) addNewsCard(); return; }
   let h = '<h1>' + (d.role === 'booker' ? 'Visits' : 'My visits') + '</h1>';
-  if (d.canTrack) h += trackerSwitch();
+  if (d.canTrack || d.role === 'specialist') h += trackerSwitch(d);
   if (d.role === 'booker') {
     h += '<div class="otabs">' + d.countries.map(c =>
         '<button data-vc="' + c.code + '" class="' + (d.country === c.code ? 'on' : '') + '">' + (REGION_FLAGS[c.code] || '') + ' ' + esc(c.code) + '</button>').join('') + '</div>';
@@ -4845,12 +4797,15 @@ async function loadVisits() {
     }
     h += '<button class="big" id="bookNew" style="margin:6px 0 4px">Hand over to On-Site</button>';
     h += requestButton();
-  } else {
+  } else if (!isSpecTabs()) {
     h += '<button class="big ghost" id="addOwn" style="margin:6px 0 4px">+ Add appointment</button>';
   }
+  if ((d.followups || []).length) h += '<h2>Follow-ups</h2>' + d.followups.map(x => followupCard(x)).join('');
   const waiting = d.open.filter(x => x.status === 'waiting'), arranging = d.open.filter(x => x.status === 'arranging');
-  if (waiting.length) h += '<h2>Waiting for a specialist</h2>' + waiting.map(x => openCard(x)).join('');
-  if (arranging.length) h += '<h2>Arranging with the customer</h2>' + arranging.map(x => openCard(x)).join('');
+  if (!isSpecTabs()) {
+    if (waiting.length) h += '<h2>Waiting for a specialist</h2>' + waiting.map(x => openCard(x)).join('');
+    if (arranging.length) h += '<h2>Arranging with the customer</h2>' + arranging.map(x => openCard(x)).join('');
+  }
   if (d.role === 'specialist') h += '<h2>Booked</h2>';
   h += '<div class="otabs small"><button data-vw="' + d.prev + '">◀ Prev</button>'
      + '<button class="on">' + esc(d.weekLabel) + '</button>'
@@ -4861,6 +4816,91 @@ async function loadVisits() {
   }
   app.innerHTML = h + navBar();
   wireVisits(d);
+}
+
+// Handovers tab: new ones in their country, the ones they're arranging, and their own.
+function handoversView(d) {
+  const waiting = d.open.filter(x => x.status === 'waiting'), arranging = d.open.filter(x => x.status === 'arranging');
+  const c = (d.me && d.me.country) || d.country;
+  let h = '<h1>Handovers</h1><div class="sub">' + esc((d.me && d.me.countryName) || ((REGION_FLAGS[c] || '') + ' ' + c)) + '</div>';
+  h += '<button class="big ghost" id="addOwn" style="margin:6px 0 4px">+ Add your own customer</button>';
+  h += '<h2>Waiting for a specialist</h2>';
+  h += waiting.length ? waiting.map(x => openCard(x)).join('') : '<div class="empty">No new handovers right now.</div>';
+  if (arranging.length) h += '<h2>Yours to arrange with the customer</h2>' + arranging.map(x => openCard(x)).join('');
+  return h;
+}
+
+// Requests tab: replacement / payment requests and cab claims, then a visit to start a new one from.
+function requestsView(d) {
+  let h = '<h1>Requests</h1><div class="sub">Replacement / payment requests and cab claims</div>';
+  const list = requestsList(d);
+  h += list || '<div class="empty">Nothing sent yet.</div>';
+  const seen = {}, recent = [];
+  for (const it of (d.myDay ? d.myDay.items : [])) { if (!seen[it.id]) { seen[it.id] = 1; recent.push({ id: it.id, when: it.start, customer: it.customer, type: it.type }); } }
+  for (const day of d.days) for (const it of day.items) {
+    if (it.kind === 'visit' && !seen[it.id]) { seen[it.id] = 1; recent.push({ id: it.id, when: day.label + ' ' + it.start, customer: it.customer, type: it.type }); }
+  }
+  h += '<h2>New request or cab claim</h2><div class="note">Pick the visit, then tap 📦 Replacement / payment request or 🚕 Cab claim.</div>';
+  h += recent.length ? recent.slice(0, 12).map(v => '<div class="case tk-v" data-vv="' + v.id + '"><div class="nm"><span>'
+      + esc(v.when) + ' · ' + esc(v.customer) + '</span></div><div class="meta">#' + String(v.id).slice(0, 8) + ' · ' + esc(v.type) + ' ›</div></div>').join('')
+    : '<div class="empty">No visits this week.</div>';
+  return h;
+}
+
+// Me tab: who they are, and the Feedback button.
+function meView(d) {
+  const m = d.me || {};
+  let h = '<h1>' + esc(m.name || 'Me') + '</h1><div class="sub">' + esc((m.teams || []).join(' + ') || 'On-Site') + '</div>';
+  h += '<div class="case"><div class="meta">Country</div><div class="nm">' + esc(m.countryName || ((REGION_FLAGS[m.country] || '') + ' ' + (m.country || ''))) + '</div></div>';
+  const st = m.stats || {}, pay = m.pay;
+  if (pay) h += '<div class="p tappable paycard" data-gopay="1" style="cursor:pointer"><div class="ptop"><div>'
+     + '<div class="k">' + esc(pay.label) + '</div><div class="v">' + esc(pay.total || 'Rate not set') + '</div></div><div class="t">›</div></div>'
+     + '<div class="t">' + pay.count + ' visit' + (pay.count === 1 ? '' : 's') + ' · tap for details</div></div>';
+  const stat = (n, l) => '<div class="mest"><div class="n">' + (n || 0) + '</div><div class="l">' + l + '</div></div>';
+  h += '<h2>Your visits</h2><div class="mestats">' + stat(st.month, 'This month') + stat(st.total, 'All time')
+     + stat(st.firstTime, 'Resolved first visit') + stat(st.followups, 'Needed a return') + stat(st.replacements, 'Needed a replacement') + '</div>';
+  const past = m.past || [];
+  h += '<h2>Past visits</h2>';
+  if (!past.length) h += '<div class="empty">Finished visits show here.</div>';
+  let mon = '';
+  past.forEach(p => {
+    if (p.month !== mon) { mon = p.month; h += '<div class="lab-m">' + esc(mon) + '</div>'; }
+    const tag = p.outcome === 'RESOLVED' ? 'green' : p.outcome === 'RETURN' ? 'red' : 'amber';
+    h += '<div class="case" data-past="' + p.id + '" style="cursor:pointer"><div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>'
+       + esc(p.when) + ' · ' + esc(p.name) + '</span><span class="tag ' + tag + '">' + esc(p.outcomeName.toUpperCase()) + '</span></div>'
+       + '<div class="meta">' + esc(p.type) + (p.product ? ' · ' + esc(p.product) : '') + (p.postal ? ' · ' + esc(p.postal) : '') + (p.followup ? ' · follow-up' : '') + '</div></div>';
+  });
+  h += '<button class="big ghost" id="meFb" style="margin-top:14px">🔧 Send feedback</button>';
+  h += '<div class="note">Ideas, problems or questions go straight to the team that runs the bot.</div>';
+  return h;
+}
+
+function pastDetail(p) {
+  const row = (k, v) => v ? '<div class="pd"><span>' + k + '</span><b>' + esc(v) + '</b></div>' : '';
+  let h = '<div class="more" id="pastBack">‹ Me</div><h1>Visit #' + String(p.id).slice(0, 8) + '</h1><div class="sub">' + esc(p.when) + '</div>';
+  h += '<div class="case">' + row('Customer', p.name) + row('Area', p.postal) + row('Type', p.type) + row('Product', p.product)
+     + row('Issue', p.issue) + row('Outcome', p.outcomeName) + row('Time on site', p.onSite) + row('Charge', p.charge)
+     + row('Why it didn’t finish', p.why) + row('Next visit', p.next) + row('Signed off by', p.signed)
+     + row('Photos', p.photos ? String(p.photos) : '') + row('Payment photo', p.payPhoto ? 'Yes' : '') + row('Follow-up visit', p.wasFollowup ? 'Yes' : '') + '</div>';
+  if ((p.done || []).length) h += '<h2>Done</h2><div class="case">' + p.done.map(x => '<div class="meta" style="font-size:14px;padding:3px 0">✓ ' + esc(x) + '</div>').join('') + '</div>';
+  return h;
+}
+
+function wireSpecTabs() {
+  const fb = document.getElementById('meFb');
+  if (fb) fb.onclick = () => { FB.back = VIEW; VIEW = 'fb'; render(); };
+  document.querySelectorAll('[data-past]').forEach(el => el.onclick = () => openPast(el.dataset.past, 'Me', () => render()));
+  document.querySelectorAll('[data-gopay]').forEach(el => el.onclick = () => { VIEW = 'pay'; PAY_MONTH = ''; render(); });
+}
+
+// A finished visit's details (from Me or Pay), with a Back link to where it came from.
+async function openPast(id, backName, back) {
+  const r = await post('/api/visit/past', { id });
+  if (!r.ok) { toast(r.error || 'Could not open that.'); return; }
+  document.getElementById('app').innerHTML = pastDetail(r.visit) + navBar();
+  wire(); window.scrollTo(0, 0);
+  const b = document.getElementById('pastBack');
+  b.textContent = '‹ ' + backName; b.onclick = back;
 }
 
 function wireVisits(d) {
@@ -4874,6 +4914,7 @@ function wireVisits(d) {
   on('[data-tclear]', () => { VS.tc = ''; VS.ts = ''; loadVisits(); });
   on('[data-tv]', el => { VS.tv = Number(el.dataset.tv); loadVisits(); window.scrollTo(0, 0); });
   on('[data-tkback]', () => { VS.tv = null; loadVisits(); });
+  on('[data-vv]', el => { VS.vv = Number(el.dataset.vv); VS.lv = null; loadVisits(); window.scrollTo(0, 0); });
   on('[data-vc]', el => { VS.country = el.dataset.vc; VS.spec = ''; loadVisits(); });
   on('[data-vsp]', el => { VS.spec = el.dataset.vsp; loadVisits(); });
   on('[data-vw]', el => { VS.week = el.dataset.vw; loadVisits(); });
@@ -4889,7 +4930,7 @@ function wireVisits(d) {
     const date = document.getElementById('mv_d_' + id).value, time = document.getElementById('mv_t_' + id).value;
     if (!date || !time) { toast('Pick the new date and time.'); return; }
     el.disabled = true;
-    const out = await post('/api/visit/reschedule', { id: Number(id), date, time });
+    const out = await post('/api/visit/reschedule', { id: id, date, time });
     el.disabled = false;
     if (!out.ok) { toast(out.error || 'Could not ask for that.'); return; }
     delete VS.move[id]; toast('Sent to the specialist to accept'); loadVisits();
@@ -4897,7 +4938,7 @@ function wireVisits(d) {
   on('[data-cxsend]', async el => {
     const id = el.dataset.cxsend;
     el.disabled = true;
-    const out = await post('/api/visit/cancel', { id: Number(id), reason: document.getElementById('cx_' + id).value });
+    const out = await post('/api/visit/cancel', { id: id, reason: document.getElementById('cx_' + id).value });
     el.disabled = false;
     if (!out.ok) { toast(out.error || 'Could not cancel that.'); return; }
     delete VS.cancel[id]; toast('Cancelled. The specialist has been told.'); loadVisits();
@@ -4925,7 +4966,7 @@ function wireVisits(d) {
   };
   on('[data-take]', async el => {
     el.disabled = true;
-    const out = await post('/api/visit/take', { id: Number(el.dataset.take) });
+    const out = await post('/api/visit/take', { id: el.dataset.take });
     if (!out.ok) { toast(out.error || 'Could not take it.'); loadVisits(); return; }
     toast('It’s yours. Call the customer, then set the time.'); loadVisits();
   });
@@ -4934,20 +4975,20 @@ function wireVisits(d) {
     const date = document.getElementById('st_d_' + id).value, time = document.getElementById('st_t_' + id).value;
     if (!date || !time) { toast('Pick the date and time you agreed.'); return; }
     el.disabled = true;
-    const out = await post('/api/visit/settime', { id: Number(id), date, time });
+    const out = await post('/api/visit/settime', { id: id, date, time });
     el.disabled = false;
     if (!out.ok) { toast(out.error || 'Could not book that.'); return; }
     VS.week = date; toast('Booked'); loadVisits();
   });
   on('[data-giveback]', async el => {
     if (!await askSure('Give this back so another specialist can take it?')) return;
-    const out = await post('/api/visit/giveback', { id: Number(el.dataset.giveback) });
+    const out = await post('/api/visit/giveback', { id: el.dataset.giveback });
     if (!out.ok) { toast(out.error || 'Could not give it back.'); return; }
     toast('Given back. The other specialists have been told.'); loadVisits();
   });
   on('[data-hcancel]', async el => {
     if (!await askSure('Cancel this handover? The specialist is told if someone took it.')) return;
-    const out = await post('/api/visit/cancel', { id: Number(el.dataset.hcancel), reason: '' });
+    const out = await post('/api/visit/cancel', { id: el.dataset.hcancel, reason: '' });
     if (!out.ok) { toast(out.error || 'Could not cancel it.'); return; }
     toast('Cancelled'); loadVisits();
   });
@@ -5036,7 +5077,7 @@ async function claim(el) {
   el.classList.add('busy');
   const want = el.dataset.want === '1';
   try {
-    const out = await post('/api/claim', { slot: Number(el.dataset.slot), want });
+    const out = await post('/api/claim', { slot: el.dataset.slot, want });
     if (!out.ok) {
       toast(out.error || 'Could not change that.');
       await loadWeek();
@@ -5166,7 +5207,7 @@ async function loadTeam() {
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
 
-  let h = adminHead() + '<h1>Team</h1><div class="seg">'
+  let h = adminHead() + '<h1>Team</h1>' + teamKindSeg() + '<div class="seg">'
     + `<div data-p="week" class="${MODE === 'week' ? 'on' : ''}">Week</div>`
     + `<div data-p="month" class="${MODE === 'month' ? 'on' : ''}">Month</div>`
     + '</div>';
@@ -5213,6 +5254,7 @@ async function loadTeam() {
   }
   app.innerHTML = h + navBar();
   wire();
+  wireTeamKind();
 }
 
 // Special request to Ops: the same steps as /request in the bot, on one screen.
@@ -5235,7 +5277,7 @@ function requestTags(r) {
 }
 function requestCards(list) {
   return list.map(r => '<div class="p' + (r.statusKey === 'DONE' ? ' quiet' : '') + '">' + requestTags(r)
-    + '<div class="pn">#' + r.id + ' · ' + esc(r.category) + '</div>'
+    + '<div class="pn">#' + String(r.id).slice(0, 8) + ' · ' + esc(r.category) + '</div>'
     + '<div class="t">' + esc(r.order) + ' · ' + esc(r.delivery) + '</div>'
     + (r.reason ? '<div class="t">Reason: ' + esc(r.reason) + '</div>' : '')
     + (r.note ? '<div class="t">Ops note: ' + esc(r.note) + '</div>' : '') + '</div>').join('');
@@ -5347,7 +5389,8 @@ async function loadRequest() {
 
 // Feedback: a button on every screen, straight to the owner by DM.
 const SCREEN_NAMES = { home: 'Home', week: 'Week', me: 'Hours', ho: 'Handover', vis: 'Visits',
-                       team: 'Team', req: 'Special request' };
+                       team: 'Team', req: 'Special request', today: 'Today', hov: 'Handovers',
+                       oreq: 'Requests', prof: 'Me' };
 let FB = { back: 'home', kind: 'IDEA', text: '' };
 function feedbackButton() {
   if (document.getElementById('fbBtn')) return;
@@ -5390,6 +5433,74 @@ function loadFeedback() {
   };
 }
 
+// On-Site specialists are paid per visit: the Pay tab, and Admin → Team → On-Site.
+let PAY_MONTH = '', TEAM_KIND = '', TEAM_KINDS = [];
+function monthNav(d) {
+  return '<div class="nav">'
+    + `<button id="mPrev" data-m="${d.prev}">‹</button><div class="m">${esc(d.label)}</div>`
+    + `<button id="mNext" data-m="${d.next}" ${d.hasNext ? '' : 'disabled'}>›</button></div>`;
+}
+function wireMonthNav(go) {
+  const p = document.getElementById('mPrev'), n = document.getElementById('mNext');
+  if (p) p.onclick = () => go(p.dataset.m);
+  if (n) n.onclick = () => go(n.dataset.m);
+}
+async function loadPay() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/pay' + (PAY_MONTH ? '?month=' + PAY_MONTH : ''));
+  const TAG = { RESOLVED: 'green', RETURN: 'red', REPLACE: 'amber', CANCELLED: 'grey' };
+  const row = (v, counts) => `<div class="case${counts ? '' : ' gone'}"${counts ? ` data-pvisit="${v.id}" style="cursor:pointer"` : ''}>`
+    + `<div class="nm" style="display:flex;justify-content:space-between;gap:8px"><span>${esc(v.day)} · ${esc(v.customer)}</span>`
+    + `<span class="tag ${TAG[v.key] || 'grey'}">${esc(String(v.outcome).toUpperCase())}</span></div>`
+    + `<div class="meta">${esc(v.type)}${v.product ? ' · ' + esc(v.product) : ''}${v.postal ? ' · ' + esc(v.postal) : ''}</div></div>`;
+  let h = (isSpecTabs() ? '<div class="more" id="payBack">‹ Me</div>' : '') + '<h1>Pay</h1><div class="sub">Your pay by month</div>' + monthNav(d);
+  h += '<div class="cards">'
+    + `<div class="card pay wide"><div class="n">${esc(d.total || (d.count + ' visit' + (d.count === 1 ? '' : 's')))}</div>`
+    + `<div class="l">${d.total ? 'Total pay' : 'Rate not set: ask an admin'}</div></div>`
+    + `<div class="card"><div class="n">${d.count}</div><div class="l">Visits</div></div>`
+    + `<div class="card"><div class="n">${d.resolved}</div><div class="l">Resolved</div></div></div>`;
+  h += d.counted.length ? '<h2>Visits that count</h2>' + d.counted.map(v => row(v, true)).join('')
+                        : '<div class="empty">No finished visits this month yet.</div>';
+  if (d.notCounted.length) h += '<h2>Not counted</h2>' + d.notCounted.map(v => row(v, false)).join('');
+  h += '<div class="note">A visit counts once you tap 🏁 Leave. Wrong? Tap 🔧 and tell us which visit.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  wireMonthNav(m => { PAY_MONTH = m; loadPay(); });
+  const pb = document.getElementById('payBack');
+  if (pb) pb.onclick = () => { VIEW = 'prof'; render(); };
+  document.querySelectorAll('[data-pvisit]').forEach(el => el.onclick = () => openPast(el.dataset.pvisit, 'Pay', () => loadPay()));
+}
+async function loadTeamOnsite() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/team/onsite' + (PAY_MONTH ? '?month=' + PAY_MONTH : ''));
+  let h = adminHead() + '<h1>Team</h1>' + teamKindSeg() + monthNav(d);
+  h += '<div class="cards">'
+    + `<div class="card"><div class="n">${d.done}</div><div class="l">Visits done</div></div>`
+    + `<div class="card"><div class="n">${d.people.length}</div><div class="l">Specialists</div></div></div>`;
+  h += d.people.length ? '<h2>By specialist</h2>' + d.people.map(p =>
+      `<div class="p"><div class="ptop"><div class="pn">${esc(p.flag)} ${esc(p.name)}</div><div class="pp">${esc(p.pay)}</div></div>`
+      + `<div class="t">${p.count} visit${p.count === 1 ? '' : 's'}</div></div>`).join('')
+    : '<div class="empty">No On-Site specialists yet.</div>';
+  if (d.people.length) h += '<div class="p" style="background:var(--ink);color:#fff;border-color:var(--ink)"><div class="ptop"><div class="pn">Total</div><div class="pp">' + esc(d.total || 'Rate not set') + '</div></div>'
+    + '<div class="t" style="color:var(--headmuted)">' + d.done + ' visit' + (d.done === 1 ? '' : 's') + '</div></div>';
+  h += '<div class="note">Each country is paid in its own currency.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+  wireTeamKind();
+  wireMonthNav(m => { PAY_MONTH = m; loadTeamOnsite(); });
+}
+function teamKindSeg() {
+  if (TEAM_KINDS.length < 2) return '';
+  return '<div class="seg" id="teamKind">'
+    + `<div data-tk="lc" class="${TEAM_KIND === 'lc' ? 'on' : ''}">Livechat</div>`
+    + `<div data-tk="onsite" class="${TEAM_KIND === 'onsite' ? 'on' : ''}">On-Site</div></div>`;
+}
+function wireTeamKind() {
+  document.querySelectorAll('[data-tk]').forEach(el => el.onclick = () => {
+    TEAM_KIND = el.dataset.tk; START = ''; PAY_MONTH = ''; AGENT = null; render();
+  });
+}
+
 // 🛡 Admin: admins flip between their own App and the admin side (People, Team).
 let ADMIN_TABS = null, ADMIN_MODE = false;
 let PEOPLE = null, PERSON = null, APPROVE = null, P_TEAM = 'ALL', P_FIND = '';
@@ -5397,7 +5508,10 @@ let AP = { teams: [], channels: [], country: '' };
 async function adminButton() {
   if (ADMIN_TABS === null) {
     ADMIN_TABS = [];
-    try { ADMIN_TABS = (await getJSON('/api/admin')).tabs || []; } catch (e) {}
+    try {
+      const a = await getJSON('/api/admin');
+      ADMIN_TABS = a.tabs || []; TEAM_KINDS = a.teamKinds || []; TEAM_KIND = TEAM_KINDS[0] || '';
+    } catch (e) {}
   }
   let b = document.getElementById('admBtn');
   if (!ADMIN_TABS.length) { if (b) b.remove(); document.body.classList.remove('has-adm'); return; }
@@ -5610,7 +5724,7 @@ let UPD = { edit: null, form: { kind: 'NEW', title: '', body: '', teams: ['ALL']
 async function addNewsCard() {
   let d;
   try { d = await getJSON('/api/updates'); } catch (e) { return; }
-  if (VIEW !== 'home' || !d.items.length || document.getElementById('newsCard')) return;
+  if ((VIEW !== 'home' && VIEW !== 'today') || !d.items.length || document.getElementById('newsCard')) return;
   const sub = document.querySelector('#app .sub');
   if (!sub) return;
   const el = document.createElement('div');
@@ -5732,14 +5846,19 @@ async function render() {
     catch (e) { showFatal('The request form would not load', e.message || e); }
     return;
   }
-  if (VIEW === 'vis') {
+  if (VIEW === 'vis' || SPEC_VIEWS.includes(VIEW)) {
     try { await loadVisits(); }
     catch (e) { showFatal('Visits would not load', e.message || e); }
     return;
   }
   if (VIEW === 'team') {
-    try { AGENT ? await loadAgent() : await loadTeam(); }
+    try { TEAM_KIND === 'onsite' ? await loadTeamOnsite() : AGENT ? await loadAgent() : await loadTeam(); }
     catch (e) { showFatal('The team view would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'pay') {
+    try { await loadPay(); }
+    catch (e) { showFatal('Pay would not load', e.message || e); }
     return;
   }
   if (VIEW === 'people') {

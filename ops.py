@@ -182,7 +182,7 @@ def request_text(r, head: str = "") -> str:
     if is_flagged(r["id"]):
         tag = "🚩 <b>ESCALATION</b> · " + tag
     lines += [
-        f"{tag}📦 <b>Special request #{r['id']}</b> · {esc(REQUEST_COUNTRY_NAMES.get(r['country'] or '', ''))}",
+        f"{tag}📦 <b>Special request #{ref(r['id'])}</b> · {esc(REQUEST_COUNTRY_NAMES.get(r['country'] or '', ''))}",
         f"<b>{esc(CATEGORY_NAMES[r['category']])}</b>",
         "",
         f"Order: <code>{esc(r['order_no'])}</code>",
@@ -232,8 +232,12 @@ def cant_buttons(rid: int, bot_username: str = "") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def get_request(rid: int):
-    return q1("SELECT * FROM special_requests WHERE id=?", (rid,))
+def get_request(rid):
+    return data.row("special_requests", id=rid) if rid else None
+
+
+def set_request(rid, **values) -> list:
+    return data.change("special_requests", values, id=rid)
 
 
 # 🚩 Escalation: shown to Ops in Telegram and the App only, never in the
@@ -346,7 +350,7 @@ async def sync_to_sheet(rid: int) -> None:
     if r and r["source"] != "paperform" and not on_sg_sheet(r["country"]):
         # Not for the SG sheet: nothing to send, so don't leave it to retry.
         async with write_lock:
-            run("UPDATE special_requests SET sheet_dirty=0 WHERE id=?", (rid,))
+            set_request(rid, sheet_dirty=False)
         return
     async with sheet_turn():
         await _sync_to_sheet(rid)
@@ -366,24 +370,24 @@ async def _sync_to_sheet(rid: int) -> None:
         return
     async with write_lock:
         if out.get("row"):
-            run("UPDATE special_requests SET sheet_row=? WHERE id=?", (int(out["row"]), rid))
-        run("UPDATE special_requests SET sheet_dirty=0 WHERE id=?", (rid,))
+            set_request(rid, sheet_row=int(out["row"]))
+        set_request(rid, sheet_dirty=False)
     # A new row and an answer that came before it reached the sheet: send that too.
     r = get_request(rid)
     if out.get("row") and (r["status"] in ("DONE", "CANT") or r["ops_note"]):
         async with write_lock:
-            run("UPDATE special_requests SET sheet_dirty=1 WHERE id=?", (rid,))
+            set_request(rid, sheet_dirty=True)
         await _sync_to_sheet(rid)
 
 
 async def job_sheet_retry(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for r in q("SELECT id FROM special_requests WHERE sheet_dirty=1 ORDER BY id LIMIT 50"):
+    for r in data.rows("special_requests", sheet_dirty=True, order="created_at", limit=50):
         await sync_to_sheet(r["id"])
 
 
 async def mark_dirty_and_sync(rid: int) -> None:
     async with write_lock:
-        run("UPDATE special_requests SET sheet_dirty=1 WHERE id=?", (rid,))
+        set_request(rid, sheet_dirty=True)
     in_background(sync_to_sheet(rid))
 
 
@@ -766,8 +770,7 @@ async def post_to_ops(bot, rid: int, head: str = "") -> bool:
         log.warning("Couldn't post special request %s to Ops: %s", rid, e)
         return False
     async with write_lock:
-        run("UPDATE special_requests SET ops_chat_id=?, ops_msg_id=? WHERE id=?",
-            (target["chat"], msg.message_id, rid))
+        set_request(rid, ops_chat_id=target["chat"], ops_msg_id=msg.message_id)
     return True
 
 
@@ -796,7 +799,7 @@ async def tell_sender(bot, r, text: str) -> None:
 
 
 def about(r) -> str:
-    return (f"request #{r['id']}</b> ({esc(CATEGORY_NAMES[r['category']])}, "
+    return (f"request #{ref(r['id'])}</b> ({esc(CATEGORY_NAMES[r['category']])}, "
             f"order <code>{esc(r['order_no'])}</code>)")
 
 
@@ -820,14 +823,14 @@ def sent_text(rid: int, posted, kind: str) -> str:
     late = {"LATE": " It's after the cut-off, so it may move to a later day.",
             "URGENT": " It's same-day, so Ops see it as URGENT."}.get(kind, "")
     if posted == "SHEET":         # on time: the Ops sheet only
-        return (f"✅ Sent to Ops as <b>request #{rid}</b>. It's before the cut-off, so it goes "
+        return (f"✅ Sent to Ops as <b>request #{ref(rid)}</b>. It's before the cut-off, so it goes "
                 "straight into the Ops sheet. I'll message you when it's done.")
     if isinstance(posted, str):   # held for the next round
-        return (f"✅ Saved as <b>request #{rid}</b>.{late}\nOps are working in rounds today, so they'll "
+        return (f"✅ Saved as <b>request #{ref(rid)}</b>.{late}\nOps are working in rounds today, so they'll "
                 f"see it at <b>{posted}</b>. I'll message you when they pick it up.")
     if posted:
-        return f"✅ Sent to Ops as <b>request #{rid}</b>.{late}\nI'll message you when they pick it up."
-    return (f"✅ Saved as <b>request #{rid}</b>, but there's no Ops chat for that country yet, "
+        return f"✅ Sent to Ops as <b>request #{ref(rid)}</b>.{late}\nI'll message you when they pick it up."
+    return (f"✅ Saved as <b>request #{ref(rid)}</b>, but there's no Ops chat for that country yet, "
             "so an admin has been told.")
 
 
@@ -841,15 +844,13 @@ async def create_request(bot, d: dict, created_by: int, source: str = "bot",
     created = now()
     kind = cutoff_kind(created, date.fromisoformat(d["delivery_date"]), d.get("country") or "")
     async with write_lock:
-        rid = run(
-            "INSERT INTO special_requests (order_no, country, category, details, delivery_date, timeframe,"
-            " timeframe_other, created_by, created_at, after_cutoff, urgent, status, sheet_dirty,"
-            " source, submitted_name) VALUES (?,?,?,?,?,?,?,?,?,?,?, 'OPEN', ?, ?, ?)",
-            (d["order_no"], d.get("country") or "", d["category"], d["details"], d["delivery_date"],
-             d["timeframe"], d.get("timeframe_other"), created_by, created.isoformat(),
-             1 if kind == "LATE" else 0, 1 if kind == "URGENT" else 0,
-             1 if source != "paperform" and on_sg_sheet(d.get("country") or "") else 0,
-             source, submitted_name or None)).lastrowid
+        rid = data.add("special_requests", {
+            "order_no": d["order_no"], "country": d.get("country") or "", "category": d["category"],
+            "details": d["details"], "delivery_date": d["delivery_date"], "timeframe": d["timeframe"],
+            "timeframe_other": d.get("timeframe_other"), "created_by": created_by or None,
+            "created_at": created.isoformat(), "after_cutoff": kind == "LATE", "urgent": kind == "URGENT",
+            "status": "OPEN", "sheet_dirty": source != "paperform" and on_sg_sheet(d.get("country") or ""),
+            "source": source, "submitted_name": submitted_name or None})["id"]
         if d.get("red_flag"):
             set_setting(f"red_flag:{rid}", "yes")
     # Saved: the sender is answered now, and the Ops chat and the sheet are done
@@ -890,7 +891,7 @@ async def deliver_request(bot, rid: int, post: bool, sheet: bool) -> None:
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(
-                    admin, f"⚠️ Special request #{rid} ({country or 'no country'}) couldn't "
+                    admin, f"⚠️ Special request #{ref(rid)} ({country or 'no country'}) couldn't "
                     f"reach Ops: {why}.")
             except Exception:
                 pass
@@ -906,7 +907,7 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """sr:tk (take) / sr:ok / sr:no / sr:nr:<reason> / sr:bk on a request in an Ops chat."""
     query = update.callback_query
     parts = query.data.split(":")
-    action, rid, uid = parts[1], int(parts[2]), query.from_user.id
+    action, rid, uid = parts[1], parts[2], query.from_user.id
     if not is_ops(uid):
         await query.answer("Only the Ops team can answer requests.", show_alert=True)
         return
@@ -923,8 +924,8 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if action == "tk":
         async with write_lock:
-            run("UPDATE special_requests SET status='TAKEN', taken_by=?, taken_at=?, sheet_dirty=1"
-                " WHERE id=? AND status='OPEN'", (uid, now().isoformat(), rid))
+            data.change("special_requests", {"status": "TAKEN", "taken_by": uid, "taken_at": now().isoformat(),
+                                             "sheet_dirty": True}, id=rid, status="OPEN")
         r = get_request(rid)
         if r["taken_by"] != uid:
             await query.answer(f"{display_name_of(r['taken_by'], 'Someone')} just took it.", show_alert=True)
@@ -949,10 +950,7 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer()
         return
     async with write_lock:
-        run("UPDATE special_requests SET status=?, reason=?, handled_by=?, handled_at=?, sheet_dirty=1,"
-            " taken_by=COALESCE(taken_by, ?), taken_at=COALESCE(taken_at, ?)"
-            " WHERE id=? AND status IN ('OPEN','TAKEN')",
-            (status, reason, uid, now().isoformat(), uid, now().isoformat(), rid))
+        answer_request(rid, status, reason, uid)
     r = get_request(rid)
     await query.answer("Done ✅" if status == "DONE" else "Marked can't do")
     await refresh_ops_message(context.bot, rid)
@@ -966,15 +964,30 @@ async def on_ops_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     in_background(sync_to_sheet(rid))
 
 
+def answer_request(rid, status: str, reason: str | None, uid: int) -> None:
+    """Done or can't do, if it's still open: whoever answers has taken it, unless someone already had."""
+    r = get_request(rid)
+    if not r or r["status"] not in LIVE:
+        return
+    ts = now().isoformat()
+    data.change("special_requests", {"status": status, "reason": reason, "handled_by": uid, "handled_at": ts,
+                                     "sheet_dirty": True, "taken_by": r["taken_by"] or uid,
+                                     "taken_at": r["taken_at"] or ts}, id=rid, status=list(LIVE))
+
+
+def is_ref(raw: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f-]{36}", raw or ""))
+
+
 async def start_cant_reason(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
     """/start srx_<id>, from ✏️ Other reason: Ops type why it can't be done."""
     uid = update.effective_user.id
-    r = get_request(int(raw)) if raw.isdigit() else None
+    r = get_request(raw) if is_ref(raw) else None
     if not r or not is_ops(uid):
         await update.message.reply_text("That request is gone, or this is for the Ops team only.")
         return ConversationHandler.END
     if r["status"] not in LIVE:
-        await update.message.reply_text(f"Request #{r['id']} is already answered: {STATUS_NAMES[r['status']]}.")
+        await update.message.reply_text(f"Request #{ref(r['id'])} is already answered: {STATUS_NAMES[r['status']]}.")
         return ConversationHandler.END
     if r["status"] == "TAKEN" and r["taken_by"] != uid and not is_admin(uid):
         await update.message.reply_text(f"{display_name_of(r['taken_by'], 'Someone')} is on that one.")
@@ -995,13 +1008,10 @@ async def on_cant_reason_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Nothing was changed.")
         return ConversationHandler.END
     async with write_lock:
-        run("UPDATE special_requests SET status='CANT', reason=?, handled_by=?, handled_at=?, sheet_dirty=1,"
-            " taken_by=COALESCE(taken_by, ?), taken_at=COALESCE(taken_at, ?)"
-            " WHERE id=? AND status IN ('OPEN','TAKEN')",
-            (text, uid, now().isoformat(), uid, now().isoformat(), rid))
+        answer_request(rid, "CANT", text, uid)
     r = get_request(rid)
     if r["status"] != "CANT" or r["reason"] != text:
-        await update.message.reply_text(f"Request #{rid} was answered meanwhile: {STATUS_NAMES[r['status']]}.")
+        await update.message.reply_text(f"Request #{ref(rid)} was answered meanwhile: {STATUS_NAMES[r['status']]}.")
         return ConversationHandler.END
     await refresh_ops_message(context.bot, rid)
     await tell_sender(context.bot, r, f"🚫 <b>Ops can't do {about(r)}\nReason: <b>{esc(text)}</b>\n"
@@ -1014,7 +1024,7 @@ async def on_cant_reason_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def start_ops_note(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: str) -> int:
     """/start srn_<id>, from 📝 Note to sender: Ops write the note here, privately."""
     uid = update.effective_user.id
-    r = get_request(int(raw)) if raw.isdigit() else None
+    r = get_request(raw) if is_ref(raw) else None
     if not r or not is_ops(uid):
         await update.message.reply_text("That request is gone, or notes are for the Ops team only.")
         return ConversationHandler.END
@@ -1035,7 +1045,7 @@ async def on_ops_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("Nothing was sent.")
         return ConversationHandler.END
     async with write_lock:
-        run("UPDATE special_requests SET ops_note=? WHERE id=?", (text, rid))
+        set_request(rid, ops_note=text)
     r = get_request(rid)
     await tell_sender(context.bot, r, f"📝 <b>Note from Ops on {about(r)}\n\n{esc(text)}\n"
                                       f"<i>— {esc(display_name_of(update.effective_user.id, 'Ops'))}</i>")
@@ -1049,8 +1059,8 @@ async def on_ops_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def post_round(bot, country: str, label: str) -> int:
     """Post every request for this country still waiting for a round, under one
     heading. Returns how many went."""
-    rows = [r for r in q("SELECT * FROM special_requests WHERE country=? AND status IN ('OPEN','TAKEN')"
-                         " AND ops_msg_id IS NULL ORDER BY delivery_date, id", (country,)) if in_ops_chat(r)]
+    rows = [r for r in data.rows("special_requests", country=country, status=list(LIVE), ops_msg_id=None,
+                                 order="delivery_date,created_at") if in_ops_chat(r)]
     target = ops_target(country)
     if not rows or not target:
         return 0
@@ -1118,8 +1128,8 @@ async def job_carry_over(context: ContextTypes.DEFAULT_TYPE) -> None:
     if today.weekday() >= 5:
         return
     start = today.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    rows = q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN') AND after_cutoff=1"
-             " AND created_at < ? ORDER BY delivery_date, id", (start,))
+    rows = data.rows("special_requests", status=list(LIVE), after_cutoff=True, created_at=("lt", start),
+                     order="delivery_date,created_at")
     groups: dict = {}
     for r in rows:
         if not is_working_day(r["country"] or "", today.date()):
@@ -1196,8 +1206,8 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """/requests — Ops and admins: the special requests still open."""
     if update.effective_chat.type != constants.ChatType.PRIVATE or not is_ops(update.effective_user.id):
         return
-    rows = q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN')"
-             " ORDER BY country, urgent DESC, after_cutoff DESC, delivery_date, id")
+    rows = data.rows("special_requests", status=list(LIVE),
+                     order="country,-urgent,-after_cutoff,delivery_date,created_at")
     rows = sorted(rows, key=lambda r: (r["country"] or "", not is_flagged(r["id"])))
     if not rows:
         await update.message.reply_text("No special requests open. 🎉")
@@ -1211,7 +1221,7 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         flags = ("🚩 " if is_flagged(r["id"]) else "") + ("🔴 " if r["urgent"] else "⏰ " if r["after_cutoff"] else "") \
             + ("🙋 " if r["status"] == "TAKEN" else "") \
             + ("" if r["ops_msg_id"] else "🕒 " if in_ops_chat(r) else "📄 ")
-        lines.append(f"{flags}<b>#{r['id']}</b> {esc(CATEGORY_NAMES[r['category']])} · "
+        lines.append(f"{flags}<b>#{ref(r['id'])}</b> {esc(CATEGORY_NAMES[r['category']])} · "
                      f"<code>{esc(r['order_no'])}</code> · "
                      f"{date_label(date.fromisoformat(r['delivery_date']))}, {esc(timeframe_text(r))}"
                      + (f" · {esc(display_name_of(r['taken_by'], ''))}" if r["status"] == "TAKEN" else ""))
@@ -1299,8 +1309,7 @@ def web_paperform(payload: dict) -> dict:
 def find_sheet_request(po: str, timestamp: str, category: str):
     """The open request a ticked sheet row belongs to: the bot's own rows match
     on PO # and timestamp, Paperform's on PO # and request type."""
-    live = q("SELECT * FROM special_requests WHERE order_no=? AND status IN ('OPEN','TAKEN')"
-             " ORDER BY id DESC", (po,))
+    live = data.rows("special_requests", order_no=po, status=list(LIVE), order="-created_at")
     for r in live:
         if r["source"] != "paperform" and sheet_values(r)[1] == timestamp:
             return r
@@ -1322,8 +1331,8 @@ def web_sheet_tick(body: dict) -> dict:
                            str(body.get("category") or ""))
     if not r:
         return {"ok": True, "matched": False}
-    run("UPDATE special_requests SET status='DONE', handled_by=0, handled_at=?, sheet_dirty=0"
-        " WHERE id=? AND status IN ('OPEN','TAKEN')", (now().isoformat(), r["id"]))
+    data.change("special_requests", {"status": "DONE", "handled_by": None, "handled_at": now().isoformat(),
+                                     "sheet_dirty": False}, id=r["id"], status=list(LIVE))
     on_bot_loop(after_sheet_tick(bot_ref(), r["id"]))
     return {"ok": True, "matched": True, "id": r["id"]}
 
@@ -1335,7 +1344,7 @@ def web_sheet_tick(body: dict) -> dict:
 def request_form_payload(user_id: int, country: str = "") -> dict:
     """The form's choices for one country, and this person's recent requests."""
     if country not in REQUEST_COUNTRY_NAMES:
-        me = q1("SELECT country FROM agents WHERE user_id=?", (user_id,))
+        me = data.agent(user_id)
         country = (me["country"] if me and me["country"] in REQUEST_COUNTRY_NAMES else "") or "SG"
     days, day, when = [], now().date(), now()
     while len(days) < DATE_CHOICES:
@@ -1366,15 +1375,14 @@ def my_requests(user_id: int, limit: int) -> list:
         "takenBy": display_name_of(r["taken_by"], "") if r["status"] == "TAKEN" and r["taken_by"] else "",
         "reason": CANT_NAMES.get(r["reason"], r["reason"] or "") if r["status"] == "CANT" else "",
         "note": r["ops_note"] or "",
-    } for r in q("SELECT * FROM special_requests WHERE created_by=? ORDER BY id DESC LIMIT ?",
-                 (user_id, limit))]
+    } for r in data.rows("special_requests", created_by=user_id, order="-created_at", limit=limit)]
 
 
 def ops_home(user_id: int) -> dict:
     """Ops's Home: what's open, the urgent ones first, each linking to its
     message in the Ops chat (that's where it's answered)."""
-    rows = flagged_first(q("SELECT * FROM special_requests WHERE status IN ('OPEN','TAKEN')"
-                           " ORDER BY urgent DESC, after_cutoff DESC, delivery_date, id"))
+    rows = flagged_first(data.rows("special_requests", status=list(LIVE),
+                                   order="-urgent,-after_cutoff,delivery_date,created_at"))
     def item(r):
         chat = str(r["ops_chat_id"] or "")
         link = (f"https://t.me/c/{chat[4:]}/{r['ops_msg_id']}"
@@ -1395,8 +1403,7 @@ def ops_home(user_id: int) -> dict:
         "urgent": sum(1 for r in rows if r["urgent"]),
         "late": sum(1 for r in rows if r["after_cutoff"] and not r["urgent"]),
         "mine": sum(1 for r in rows if r["status"] == "TAKEN" and r["taken_by"] == user_id),
-        "doneToday": q1("SELECT COUNT(*) AS n FROM special_requests WHERE status IN ('DONE','CANT')"
-                        " AND handled_at >= ?", (today,))["n"],
+        "doneToday": data.count("special_requests", status=["DONE", "CANT"], handled_at=("gte", today)),
         "requests": [item(r) for r in rows[:30]],
     }
 

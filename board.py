@@ -86,7 +86,7 @@ async def got_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def got_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     draft = context.user_data["draft"]
     txt = update.message.text.strip()
-    preset_names = [r["name"] for r in q("SELECT name FROM presets ORDER BY name")]
+    preset_names = [r["name"] for r in data.rows("presets", order="name")]
 
     if txt == "-":
         draft["slots"] = dict(DEFAULT_SLOTS)
@@ -97,7 +97,7 @@ async def got_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"No preset called {txt!r}. Available: {', '.join(preset_names)}"
             )
             return ASK_SLOTS
-        draft["slots"] = json.loads(q1("SELECT config FROM presets WHERE name=?", (match,))["config"])
+        draft["slots"] = json.loads(data.row("presets", name=match)["config"])
     else:
         # A line starting with + adds to the standard pattern for that day.
         # Anything else replaces that day outright.
@@ -192,7 +192,7 @@ def week_shape_keyboard(has_slots: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🎌 Public holiday", callback_data="ws:ph")],
     ]
     saved = [
-        r["name"] for r in q("SELECT name FROM presets ORDER BY name")
+        r["name"] for r in data.rows("presets", order="name")
         if r["name"] not in ("standard", "campaign")
     ]
     for nm in saved[:4]:
@@ -246,7 +246,7 @@ async def on_week_shape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     if choice.startswith("preset:"):
         name = choice.split(":", 1)[1]
-        row = q1("SELECT config FROM presets WHERE name=?", (name,))
+        row = data.row("presets", name=name)
         if not row:
             await query.edit_message_text(f"Preset {name} no longer exists.")
             return ASK_SLOTS
@@ -517,38 +517,23 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     async with write_lock:
         prev = open_week()
         if prev:
-            run("UPDATE weeks SET status='closed' WHERE id=?", (prev["id"],))
+            data.change("weeks", {"status": "closed"}, id=prev["id"])
 
-        cur = run(
-            "INSERT INTO weeks (label, start_date, end_date, key_events, deadline) "
-            "VALUES (?,?,?,?,?)",
-            (
-                draft["label"],
-                draft["monday"].isoformat(),
-                draft["sunday"].isoformat(),
-                draft["events"],
-                draft["deadline"].isoformat(),
-            ),
-        )
-        week_id = cur.lastrowid
+        week_id = data.add("weeks", {
+            "label": draft["label"], "start_date": draft["monday"].isoformat(),
+            "end_date": draft["sunday"].isoformat(), "key_events": draft["events"],
+            "deadline": draft["deadline"].isoformat(), "status": "open"})["id"]
 
-        for i, name in enumerate(DAY_NAMES):
-            if name not in draft["slots"]:
-                continue
-            the_date = draft["monday"] + timedelta(days=i)
-            dcur = run(
-                "INSERT INTO days (week_id, idx, name, the_date) VALUES (?,?,?,?)",
-                (week_id, i, name, the_date.isoformat()),
-            )
-            day_id = dcur.lastrowid
-            caps = draft.get("caps", {})
-            for j, lbl in enumerate(draft["slots"][name]):
-                run(
-                    "INSERT INTO slots (day_id, idx, label, start_min, capacity) "
-                    "VALUES (?,?,?,?,?)",
-                    (day_id, j, lbl, slot_start_minutes(lbl),
-                     caps.get(f"{name}|{lbl}", SLOT_CAPACITY)),
-                )
+        days = data.add("days", [
+            {"week_id": week_id, "idx": i, "name": name,
+             "the_date": (draft["monday"] + timedelta(days=i)).isoformat()}
+            for i, name in enumerate(DAY_NAMES) if name in draft["slots"]])
+        caps = draft.get("caps", {})
+        slots = [{"day_id": d["id"], "idx": j, "label": lbl, "start_min": slot_start_minutes(lbl),
+                  "capacity": caps.get(f"{d['name']}|{lbl}", SLOT_CAPACITY)}
+                 for d in days for j, lbl in enumerate(draft["slots"][d["name"]])]
+        if slots:
+            data.add("slots", slots)
 
         fixed_filled = apply_fixed_slots(week_id)
 
@@ -560,20 +545,20 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     header = await send_group(
         bot, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
     )
-    run("UPDATE weeks SET header_msg_id=? WHERE id=?", (header.message_id, week_id))
+    data.change("weeks", {"header_msg_id": header.message_id}, id=week_id)
     try:
         await bot.pin_chat_message(GROUP_CHAT_ID, header.message_id, disable_notification=True)
     except (BadRequest, Forbidden):
         log.info("Couldn't pin — bot may not be a group admin.")
 
     if BOARD_MODE != "single":
-        for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
+        for d in data.board(week_id)["days"]:
             day_text, day_kb = render_day(d["id"])
             msg = await send_group(
                 bot, day_text, reply_markup=day_kb,
                 parse_mode=constants.ParseMode.HTML,
             )
-            run("UPDATE days SET msg_id=? WHERE id=?", (msg.message_id, d["id"]))
+            data.change("days", {"msg_id": msg.message_id}, id=d["id"])
 
     if POST_INTRO:
         if GROUP_BUTTONS:
@@ -606,7 +591,7 @@ async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not is_admin(update.effective_user.id):
         return
-    rows = q("SELECT * FROM presets ORDER BY name")
+    rows = data.rows("presets", order="name")
     lines = ["<b>Saved timing presets</b>"]
     for r in rows:
         cfg = json.loads(r["config"])
@@ -634,15 +619,10 @@ async def cmd_savepreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("No week to save from yet.")
         return
     cfg: dict[str, list[str]] = {}
-    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (w["id"],)):
-        cfg[d["name"]] = [
-            s["label"] for s in q("SELECT label FROM slots WHERE day_id=? ORDER BY idx", (d["id"],))
-        ]
-    run(
-        "INSERT INTO presets (name, config) VALUES (?,?) "
-        "ON CONFLICT(name) DO UPDATE SET config=excluded.config",
-        (name, json.dumps(cfg)),
-    )
+    b = data.board(w["id"])
+    for d in b["days"]:
+        cfg[d["name"]] = [s["label"] for s in b["slots"][d["id"]]]
+    data.add("presets", {"name": name, "config": json.dumps(cfg)}, on_conflict="name")
     total = sum(len(v) for v in cfg.values())
     await update.message.reply_text(
         f"Saved preset <b>{name}</b> ({total} slots). Use it by sending "
@@ -675,7 +655,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     msg = await send_group(
         bot, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
     )
-    run("UPDATE weeks SET header_msg_id=? WHERE id=?", (msg.message_id, w["id"]))
+    data.change("weeks", {"header_msg_id": msg.message_id}, id=w["id"])
 
     # Retire the old copy so there's only ever one live board.
     if old_id and old_id != msg.message_id:
@@ -797,7 +777,7 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     new = "\n".join(lines)
     async with write_lock:
-        run("UPDATE weeks SET key_events=? WHERE id=?", (new or None, w["id"]))
+        data.change("weeks", {"key_events": new or None}, id=w["id"])
 
     body = esc(new) if new else "<i>none</i>"
     await update.message.reply_text(
@@ -808,7 +788,7 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def schedule_week_jobs(app: Application, week_id: int) -> None:
-    w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
+    w = data.row("weeks", id=week_id)
     if not w or w["status"] != "open":
         return
     jq = app.job_queue
