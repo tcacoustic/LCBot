@@ -1421,7 +1421,7 @@ async def job_auto_close(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         end = None
         if r["slot_id"]:
-            run_ = slot_run_from(r["slot_id"])
+            run_ = slot_run_from(r["slot_id"], r["agent_id"])
             if run_:
                 last = run_[-1]
                 finish_min = last["start_min"] + slot_minutes(last["label"])

@@ -43,13 +43,16 @@ def snapshot(path: str) -> None:
     db.execute("insert into weeks values (7, 'Wk 45', '2026-11-02', '2026-11-08', null, '2026-10-31 18:00:00', 'open', 501)")
     db.execute("insert into days values (70, 7, 0, 'MON', '2026-11-02', 601)")
     db.executemany("insert into slots values (?,?,?,?,?,?)", [(700, 70, 0, "10am-12pm", 600, 2), (701, 70, 1, "12pm-2pm", 720, 2)])
-    db.executemany("insert into signups values (?,?,?,?)", [(700, STAFF, "Ann", T), (701, LEAVER, "Cal", T)])
+    # 700 is held by two people; the one listed first by time isn't the one whose shift runs on into 701
+    db.executemany("insert into signups values (?,?,?,?)", [(700, STAFF, "Ann", T), (700, LEAVER, "Cal", "2026-11-01T09:00:00+08:00"),
+                                                            (701, STAFF, "Ann", T)])
     db.execute("insert into confirmations values (7, ?, ?)", (STAFF, T))
     db.execute("insert into time_entries (id, agent_id, slot_id, the_date, clock_in, clock_out, status, source) "
-               "values (40, ?, 700, '2026-11-02', '2026-11-02T10:00:00+08:00', '2026-11-02T12:30:00+08:00', 'closed', 'bot')", (STAFF,))
+               "values (40, ?, 700, '2026-11-02', '2026-11-02T10:00:00+08:00', '2026-11-02T14:00:00+08:00', 'closed', 'bot')", (STAFF,))
     db.execute("insert into time_entries (id, agent_id, slot_id, the_date, clock_in, status) "
                "values (41, 123456789, null, '2026-11-02', '2026-11-02T10:00:00+08:00', 'open')")   # someone nobody knows
     db.execute("insert into ot_claims values (50, 40, ?, '2026-11-02 12:30:00', 30, 'approved', ?, ?, ?, null)", (STAFF, T, ADMIN, T))
+    db.execute("insert into ot_claims values (51, 40, ?, '', 0, 'confirmed', ?, null, null, null)", (STAFF, T))
     db.execute("insert into pay_rates values (60, ?, 1200, '2026-01-01', ?, ?)", (STAFF, ADMIN, T))
     db.execute("insert into channel_posts (id, channel, chat_id, agent_id, the_date, created_at, kind) "
                "values (80, 'SHOPEE_SG', -1001, ?, '2026-11-02', ?, 'cases')", (STAFF, T))
@@ -160,8 +163,10 @@ class LoadTest(SnapshotCase):
                                   "on f.id = a.followup_of_id where a.legacy_id = 29"), "30")
         self.assertEqual(self.one("select count(*) from lc_bot_dev.signups s join lc_bot_dev.slots sl on sl.id = s.slot_id "
                                   "join lc_bot_dev.days d on d.id = sl.day_id join lc_bot_dev.weeks w on w.id = d.week_id "
-                                  "where w.legacy_id = 7"), "2")
+                                  "where w.legacy_id = 7"), "3")
         self.assertEqual(self.one("select online_channel from lc_bot_dev.handover_cases"), "LAZADA_SG")
+        self.assertEqual(self.one("select c.claimed_out_at = e.clock_out_at from lc_bot_dev.ot_claims c join "
+                                  "lc_bot_dev.time_entries e on e.id = c.time_entry_id where c.legacy_id = 51"), "t")
         self.assertEqual(self.one("select config::text from lc_bot_dev.presets where name = 'custom'"), '[{"d": 1}]')
         case = self.one("select id from lc_bot_dev.handover_cases")
         appt = self.one("select id from lc_bot_dev.appointments where legacy_id = 30")

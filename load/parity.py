@@ -13,8 +13,8 @@ both sides answer with their own code: access status, teams, admin, who holds ea
 confirmed each week, each person's timesheet per week and per month (minutes, pay, overtime,
 shifts, open), each overtime claim, the open cases and each appointment.
 
-One difference is agreed in #378 and built in: a removed member the old bot shows as `declined` is
-`revoked` now (no access either way). It's counted as expected and listed in --details.
+One difference is agreed in #378 and built in: someone the old bot shows as `declined` is `revoked`
+now if they left with history, and unknown if they never had any (no access either way). It's counted as expected and listed in --details.
 --expected lists the other differences already agreed, one fnmatch pattern of question keys per line
 (`#` starts a comment). It names people by Telegram id, so keep it outside git, next to the
 snapshot. Any other difference fails the run. The output is counts and PASS or FAIL only;
@@ -196,9 +196,9 @@ def compare(old: dict, new: dict, expected: list[str]) -> tuple[Counter, list[st
         a, b = old.get(key, "(not asked)"), new.get(key, "(not asked)")
         if a == b:
             continue
-        if a == "declined" and b == "revoked" and key.endswith(":status"):
-            counts[(kind, "expected")] += 1      # #378: a leaver is revoked on identity; no access either way
-            details.append(f"agreed     {key}: old {a!r} new {b!r} (#378: leavers are revoked)")
+        if a == "declined" and b in ("revoked", None) and key.endswith(":status"):
+            counts[(kind, "expected")] += 1      # #378: leavers are revoked, and declined people with no
+            details.append(f"agreed     {key}: old {a!r} new {b!r} (#378)")   # history aren't created
             continue
         if any(fnmatch.fnmatchcase(key, p) for p in expected):
             counts[(kind, "expected")] += 1

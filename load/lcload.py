@@ -260,8 +260,10 @@ class Loader:
             self.pid[tg] = str(self.conn.execute(fn, (tg, name, m.get("nickname") or None, country, status))
                                .fetchone()[0])
             self.r.people[f"created {status}"] += 1
+            if m.get("nickname"):
+                self.r.people["nicknames set"] += 1
         for tg, m in self.merge.items():
-            if m.get("nickname") and tg in self.pid:
+            if m.get("nickname") and tg in existing:
                 cur = self.conn.execute("update identity.people set nickname = %s "
                                         "where telegram_id = %s and nickname is distinct from %s",
                                         (m["nickname"], tg, m["nickname"]))
@@ -320,6 +322,10 @@ class Loader:
         tz = SG
         if old == "appointments":
             tz = self.country_tz.get(r.get("country") or "", SG)
+        if old == "ot_claims" and not r.get("claimed_out"):
+            # "Yes, that's when I finished" was saved with no time; the new bot saves the shift's clock-out
+            r = {**r, "claimed_out": self.clock_outs().get(r.get("entry_id")) or r.get("asked_at")}
+            self.r.notes["ot_claims.claimed_out_at taken from the shift's clock-out (confirmed claims)"] += 1
         out = {}
         if "legacy_id" in cols:
             out["legacy_id"] = int(r["id"])
@@ -362,6 +368,11 @@ class Loader:
         if old == "ho_cases" and not out.get("online_channel"):
             out["online_channel"] = self.channel_for(r.get("platform"), r.get("store")) or None
         return out
+
+    def clock_outs(self) -> dict:
+        if not hasattr(self, "_clock_outs"):
+            self._clock_outs = {r["id"]: r["clock_out"] for r in self.old_rows("time_entries")}
+        return self._clock_outs
 
     def table(self, old: str) -> None:
         new = self.data.TABLES[old][0]
