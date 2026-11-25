@@ -2,9 +2,9 @@
 
 Written for the person taking over the SH Bot. It covers what the bot does, who uses it, how changes go live, and what's still open. There are no passwords or tokens in this file. Those live in Railway → Variables.
 
-**Two versions exist right now (Nov 2026).** The live bot runs on `main` with a SQLite file. `staging` has been moved onto the TC data warehouse (Supabase) by Wilson, and the test bot runs it. The live bot switches over when PR #84 (`staging` → `main`) is merged, which only Wilson does. Section 3 explains what that means for changes.
+**Data lives in the TC data warehouse (Supabase) since Wed 25 Nov 2026.** Wilson moved the live bot off its SQLite file (PR #84, merged 25 Nov 12:09). The live bot uses schema `lc_bot`; the test bot uses `lc_bot_dev`. Wilson (AI lead) owns the warehouse side, including backups and schema changes.
 
-For how the code is laid out, read [CLAUDE.md](CLAUDE.md). For the On-Site App that's ready to launch, read [docs/ONSITE-LAUNCH.md](https://github.com/tcacoustic/LCBot/blob/onsite-app/docs/ONSITE-LAUNCH.md) (in PR #81).
+For how the code is laid out, read [CLAUDE.md](CLAUDE.md). For the On-Site App (its code is live but not yet launched to staff), read [docs/ONSITE-LAUNCH.md](docs/ONSITE-LAUNCH.md).
 
 ---
 
@@ -41,20 +41,13 @@ Each team gets its own Home screen in the App. Admins get an 🛡 Admin switch (
 
 ## 3. How changes go live
 
-**Until the warehouse switch (PR #84):**
-- Change nothing on the live bot unless it's urgent. `main` (SQLite) and `staging` (warehouse) are different code now, so every fix would have to be made twice.
-- New work starts from `staging`, goes to the test bot, and goes live with the switch.
-- An urgent live fix: branch from `main`, ship it, then tell Wilson so it's carried into `staging`.
-
-**After the switch (`main` = `staging` again):**
-
-1. A change is made on a branch and opened as a PR on GitHub.
-2. **Test:** merge the PR into the `staging` branch. Railway's **LCBot Test** service deploys it automatically (about 1–2 minutes). Try it on the test bot. The test bot has its **own empty database**, so use made-up customers.
+1. A change is made on a branch from `main` and opened as a PR on GitHub. Code reads and writes data through the `data` module (`data.py`), not SQL.
+2. **Test:** merge the PR into the `staging` branch. Railway's **LCBot Test** service deploys it automatically (about 1–2 minutes). Try it on the test bot. The test bot has its **own separate database** (`lc_bot_dev`), so use made-up customers.
 3. **Ship:** merge the PR into `main`. Railway deploys the live bot automatically. Ship **after 8pm** when the bot is quiet, then check the deploy succeeded (Railway → Deployments, or the green tick on the GitHub commit).
 4. Keep `staging` = `main` + whatever is being tested.
 
 Rules agreed with management:
-- **Database changes need the AI lead's review before going live.** Before the switch, new tables and columns are added in code on startup. After it, they are migration PRs in `tc-data-warehouse`, reviewed and merged by Wilson. The bot no longer creates tables itself.
+- **Database changes need the AI lead's review before going live.** New tables and columns are migration PRs in `tc-data-warehouse`, reviewed and merged by Wilson. The bot doesn't create tables itself.
 - Made-up data only in tests and screenshots. Never put real customer or staff data in the repo.
 - No secrets in code: everything comes from Railway variables.
 - The bot never messages customers.
@@ -64,7 +57,7 @@ If a deploy breaks the live bot: Railway → Deployments → the previous good d
 ## 4. Day-to-day admin
 
 - **New people** send `/start` to the bot. The owner approves each one **by hand** (deliberately, for security) and ticks their teams. Everyone must `/start` before they can be added anywhere.
-- **Backups:** until the switch, the bot backs up its SQLite file daily and `/backup` (owner) sends a copy. **Don't use `/restore`** unless you really mean to replace all data. After the switch, `/backup` and `/restore` are gone: the warehouse handles recovery (ask Wilson).
+- **Backups:** `/backup` and `/restore` are gone. The warehouse handles backups and recovery (ask Wilson).
 - **Teams and stores:** `/departments`, `/channels @name` (which stores a TC Online person looks after), `/store` (FS store), country for On-Site.
 - **Admin for:** an admin can be limited to some teams (People → Admin for). The owner has everything.
 - **View as a team:** `/viewas` (owner) shows the bot as another team sees it. Admin powers pause while viewing; switch off with `/viewas` again.
@@ -86,11 +79,11 @@ Still to link when the On-Site App launches: `/visitchat`, `/requestchat`, `/fin
 
 ## 5. Settings (Railway variables, names only)
 
-Required: `BOT_TOKEN`, `GROUP_CHAT_ID`. After the switch, also `DB_SCHEMA`, `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SERVICE_TOKEN_SEED`, `SERVICE_TOKEN_VOLUME_PATH` (Wilson sets these; `DB_PATH` is no longer used).
+Required: `BOT_TOKEN`, `GROUP_CHAT_ID`, and the warehouse settings `DB_SCHEMA`, `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SERVICE_TOKEN_SEED`, `SERVICE_TOKEN_VOLUME_PATH` (Wilson sets these; don't change them without him).
 
-Common: `ADMIN_IDS`, `TZ_NAME` (Asia/Singapore), `DB_PATH`, `PUBLIC_URL` (turns on the App), `OPS_CHAT_ID` / `OPS_THREAD_ID`, `SHIFTCALL_CHAT_ID`, `BOARD_MODE`, `GROUP_BUTTONS`, `DM_REMINDERS`, `PAY_MODE`, `SHIFT_CALL_TIME`, `BACKUP_TIME`, the `OT_*` overtime settings, `REQUEST_SHEET_URL` / `REQUEST_SHEET_SECRET` (Ops sheet), `REQUEST_CUTOFF` / `REQUEST_CARRY_TIME` (Ops 2pm cut-off), `HANDOVER_NUDGE_TIME`, `ONSITE_FORM_URL` (Zoho sign-off form).
+Common: `ADMIN_IDS`, `TZ_NAME` (Asia/Singapore), `PUBLIC_URL` (turns on the App), `OPS_CHAT_ID` / `OPS_THREAD_ID`, `SHIFTCALL_CHAT_ID`, `BOARD_MODE`, `GROUP_BUTTONS`, `DM_REMINDERS`, `PAY_MODE`, `SHIFT_CALL_TIME`, the `OT_*` overtime settings, `REQUEST_SHEET_URL` / `REQUEST_SHEET_SECRET` (Ops sheet), `REQUEST_CUTOFF` / `REQUEST_CARRY_TIME` (Ops 2pm cut-off), `HANDOVER_NUDGE_TIME`, `ONSITE_FORM_URL` (Zoho sign-off form).
 
-With the On-Site App (PR #81), optional: `PAYNOW_UEN` / `PAYNOW_NAME` (only for a generated QR; not needed if TC's own QR is set with `/paynowqr`), `REVIEW_URL` (review QR).
+With the On-Site App, optional: `PAYNOW_UEN` / `PAYNOW_NAME` (only for a generated QR; not needed if TC's own QR is set with `/paynowqr`), `REVIEW_URL` (review QR).
 
 The full list with defaults is in the Config section at the top of `core.py`. The test bot has its own values (its own token, test sheet copy).
 
@@ -98,15 +91,15 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 
 | What | State | Next step |
 |---|---|---|
-| **Warehouse switch** (PR #84, warehouse #378) | Test bot moved 21 Nov; live still SQLite | Wilson: data load + check, DPO sign-off, then switch on a day after a pay run. Test with the LCBot Test Run checklist |
-| **On-Site App** (PR #81, combines #67–#77 and #80) | Built, on the test bot; already inside `staging`, so it goes live with the switch unless shipped earlier | Follow [docs/ONSITE-LAUNCH.md](https://github.com/tcacoustic/LCBot/blob/onsite-app/docs/ONSITE-LAUNCH.md): AI lead DB review, real checklists, sign-off wording, Finance (QR, cab rules, chat), Ops chat, MY/HK/TH rates, dry run, ship, SG first |
+| **Warehouse switch** (PR #84, warehouse #378) | Done 25 Nov 2026 (live on `lc_bot`) | Watch the first days for odd data or errors; report to Wilson |
+| **On-Site App** (PR #81, combines #67–#77 and #80) | Code went live with #84 on 25 Nov; not launched to staff | Follow [docs/ONSITE-LAUNCH.md](docs/ONSITE-LAUNCH.md): real checklists, sign-off wording, Finance (QR, cab rules, chat), Ops chat, MY/HK/TH rates, link the chats, dry run, SG first |
 | Make Zoe an admin with Admin for = On-Site (live) | Not done | People in the App. Needed for booked FYIs, cab claims, 11am nudge |
-| PR #48 (old Pay tab) and #67–#80 (stacked parts) | History, not separate work. #67–#77 and #80 are all inside #81; #48 was rebuilt as #80; #78 is closed (went live as #79) | Keep open until #81 is reviewed, then close each with the comment "Included in #81". Closing doesn't delete: they stay readable on GitHub as a record of why each piece was built |
+| PR #48 (old Pay tab) and #67–#80 (stacked parts) | History, not separate work. #67–#77 and #80 are all inside #81; #48 was rebuilt as #80; #78 is closed (went live as #79) | #81 is merged, so close each with the comment "Included in #81". Closing doesn't delete: they stay readable on GitHub as a record of why each piece was built |
 | LCBot #60 (old load script) | Replaced by Wilson's move | Close after checking with Wilson |
 | MY / HK / TH sheets for Ops requests | Parked | SG sheet only today |
 | RMA app (Service Concierge replacement) | AppSheet trial planned | Waiting on IT |
 | Standalone phone app (outside Telegram) | Idea | Installable web app with "Log in with Telegram" first; needs IT / AI lead sign-off |
-| App error box says "send it to @caydenseee" (`core.py` `MINIAPP_HTML`, on `main`, `staging`, `onsite-app`) | Points at the previous owner | Change to the new owner's handle, or "use the Feedback button". Branch from `staging`, tell Wilson, or do it after #84 |
+| App error box says "send it to @caydenseee" (`core.py` `MINIAPP_HTML`) | Points at the previous owner | Change to the new owner's handle, or "use the Feedback button". Normal test → ship |
 | `/stats` (owner-only counts) | Idea | Build if wanted |
 
 ## 7. Handover checklist
@@ -135,7 +128,7 @@ The new owner isn't technical. When they bring a problem, Claude should do the i
 | Store or Ops chat stopped getting posts | Bot removed from the chat, or chat moved | Re-add, then `/onchat <store>` or `/opschat` (add MY, HK or TH) in that chat | |
 | Ops request in Telegram but not in the sheet | Apps Script "Special Req – bot link" → run `checkBotLink` then `checkSetup` | `REQUEST_SHEET_SECRET` must match in Railway and Script Properties; `REQUEST_SHEET_URL` must be the current web app URL | After editing the script: Deploy → **New deployment** (or Edit → New version), else the old code keeps running |
 | Hours or pay look wrong | `/timesheet`, `/audit`, App Hours tab | `/clockoutfor @handle 18:00`, `/addtime @handle YYYY-MM-DD HH:MM HH:MM`, `/fixtime <id> HH:MM HH:MM` | Explain the calculation (`PAY_MODE`, `rate_for`, `OT_*`) |
-| Data missing or wrong (after the warehouse switch) | Everyone, since a time? | Don't hand-edit data | Wilson owns the data |
+| Data missing or wrong | Everyone, since a time? | Don't hand-edit data | Wilson owns the data |
 
 Golden rules: undo first (Redeploy the last good deploy), investigate after. Never ask for or accept tokens or passwords in chat. Logs and screenshots may contain staff or customer names; ask the owner to remove them first.
 
