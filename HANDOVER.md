@@ -1,6 +1,6 @@
 # SH Bot: handover guide
 
-Written for the person taking over the SH Bot. It covers what the bot does, who uses it, how changes go live, and what's still open. There are no passwords or tokens in this file. Those live in Railway → Variables.
+Written for Zoe, who takes over the SH Bot from Cayden on Fri 27 Nov 2026. It covers what the bot does, who uses it, how changes go live, and what's still open. There are no passwords or tokens in this file. Those live in Railway → Variables.
 
 **Data lives in the TC data warehouse (Supabase) since Wed 25 Nov 2026.** Wilson moved the live bot off its SQLite file (PR #84, merged 25 Nov 12:09). The live bot uses schema `lc_bot`; the test bot uses `lc_bot_dev`. Wilson (AI lead) owns the warehouse side, including backups and schema changes.
 
@@ -93,7 +93,6 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 |---|---|---|
 | **Warehouse switch** (PR #84, warehouse #378) | Done 25 Nov 2026 (live on `lc_bot`) | Watch the first days for odd data or errors; report to Wilson |
 | **On-Site App** (PR #81, combines #67–#77 and #80) | Code went live with #84 on 25 Nov; not launched to staff | Follow [docs/ONSITE-LAUNCH.md](docs/ONSITE-LAUNCH.md): real checklists, sign-off wording, Finance (QR, cab rules, chat), Ops chat, MY/HK/TH rates, link the chats, dry run, SG first |
-| Make Zoe an admin with Admin for = On-Site (live) | Not done | People in the App. Needed for booked FYIs, cab claims, 11am nudge |
 | PR #48 (old Pay tab) and #67–#80 (stacked parts) | History, not separate work. #67–#77 and #80 are all inside #81; #48 was rebuilt as #80; #78 is closed (went live as #79) | #81 is merged, so close each with the comment "Included in #81". Closing doesn't delete: they stay readable on GitHub as a record of why each piece was built |
 | LCBot #60 (old load script) | Replaced by Wilson's move | Close after checking with Wilson |
 | MY / HK / TH sheets for Ops requests | Parked | SG sheet only today |
