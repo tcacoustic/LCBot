@@ -173,5 +173,6 @@ Then open the `LCBot` folder in Claude Code. Claude reads `CLAUDE.md` automatica
 - Data warehouse: https://github.com/tcacoustic/tc-data-warehouse (move plan: https://github.com/tcacoustic/tc-data-warehouse/issues/378)
 - LCBot Test Run checklist, On-Site ideas and App vision page, tutorial videos, team guide: Claude artifacts (see section 2).
 - Telegram bot docs: https://core.telegram.org/bots
+- Team onboarding messages to paste into Telegram: [docs/onboarding-messages.md](docs/onboarding-messages.md). How-to video scripts per team: [docs/video-scripts.md](docs/video-scripts.md). Bot profile picture options: [assets/bot-picture/](assets/bot-picture/).
 - Plain-language guide for the owner (transfers, everyday jobs, troubleshooting, using Claude): Claude Doc "SH Bot: guide for the new owner" (shared with the owner; ask IT to keep a copy).
 - Railway: the "livechat-agent-bot" project (Deployments → Logs for errors).
