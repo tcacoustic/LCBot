@@ -405,6 +405,21 @@ async def apply_viewas(bot, uid: int, dept: str) -> str:
             "/viewas to switch back.")
 
 
+async def cmd_fspreview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/fspreview: the owner opens the design preview of FS joining On-Site (made-up data)."""
+    uid = update.effective_user.id
+    if not is_owner(uid) or update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not app_url():
+        await update.message.reply_text("The App isn't switched on here (PUBLIC_URL isn't set).")
+        return
+    await update.message.reply_text(
+        "<b>FS joins On-Site: design preview</b>\nMade-up visits only. Nothing is saved or sent.",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "Open the preview", web_app=WebAppInfo(url=app_url() + "&p=fs"))]]))
+
+
 async def cmd_viewas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/viewas on | ON | Livechat | off — the owner sees the bot as a team."""
     uid = update.effective_user.id
