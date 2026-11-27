@@ -2461,9 +2461,7 @@ async def nudge(context: ContextTypes.DEFAULT_TYPE, week_id: int, prefix: str) -
     parts = [f"⏰ <b>{prefix} — {w['label']} closes {dl.strftime('%a %H:%M')}</b>"]
 
     if st["missing"]:
-        names = " ".join(
-            f"@{a['username']}" if a["username"] else a["name"] for a in st["missing"]
-        )
+        names = tag_list(st["missing"])     # tags by Telegram id; usernames aren't kept any more
         parts.append(
             f"\nNot yet confirmed: {names}"
             "\n<i>Check the pinned board and hit ✅ Slots.</i>"
