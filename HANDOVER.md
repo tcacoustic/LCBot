@@ -46,6 +46,17 @@ Each team gets its own Home screen in the App. Admins get an 🛡 Admin switch (
 3. **Ship:** merge the PR into `main`. Railway deploys the live bot automatically. Ship **after 8pm** when the bot is quiet, then check the deploy succeeded (Railway → Deployments, or the green tick on the GitHub commit).
 4. Keep `staging` = `main` + whatever is being tested.
 
+**Releases: bundle changes into one PR.** Agreed with the previous owner on Fri 27 Nov 2026, to keep the PR list short and restarts few.
+
+1. Ideas, problems and staff feedback collect in one list.
+2. When there are enough (about 3–5), pick a bundle. A release every week or two suits this bot.
+3. Claude builds the bundle as **one release PR** titled "Release: <date>". The description has **one heading per item** (what changed, why, how to test).
+4. **Each item is its own commit** inside that PR, so one item can be undone on its own if it causes trouble.
+5. "test #N" puts the whole release on the test bot. Try every item there.
+6. "ship #N" puts it all live in one evening: one restart, and one What's new card.
+
+Urgent fixes (something broken for staff right now) still go out on their own, straight away.
+
 Rules agreed with management:
 - **Database changes need the AI lead's review before going live.** New tables and columns are migration PRs in `tc-data-warehouse`, reviewed and merged by Wilson. The bot doesn't create tables itself.
 - Made-up data only in tests and screenshots. Never put real customer or staff data in the repo.
