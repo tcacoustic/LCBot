@@ -5808,6 +5808,7 @@ async function loadUpdatesAdmin() {
 }
 
 async function render() {
+  if (VIEW === 'fsprev') { fsPreview(); return; }
   feedbackButton();
   await adminButton();
   const fb = document.getElementById('fbBtn');
@@ -5926,6 +5927,68 @@ async function load() {
     app.innerHTML = '<div class="err">Could not load your hours.<br><br>' + why + '</div>';
   }
 }
+// ---- Design preview: FS joining the On-Site team (test bot only, /fspreview) ----
+// Made-up visits, nothing is saved or sent. Opened with ?p=fs on the App link.
+let FP = { tab: 'today', form: false, type: 'Recce', who: 'me', msg: '' };
+function fsPreview() {
+  const app = document.getElementById('app');
+  let h = '';
+  if (FP.form) {
+    h += '<div class="back" id="fpBack">&lsaquo; Back</div>';
+    h += '<div class="eyebrow">🇸🇬 On-Site · Orchard</div><h1>Add a customer</h1><div class="sub">New visit</div>';
+    const pick = (key, opts) => '<div class="otabs">' + opts.map(([v, t]) =>
+      `<button type="button" data-fp${key}="${v}" class="${FP[key] === v ? 'on' : ''}">${t}</button>`).join('') + '</div>';
+    h += '<div class="fld"><label>Type</label>' + pick('type', [['Set up', 'Set up'], ['Fix', 'Fix'], ['Recce', 'Recce']]) + '</div>';
+    h += '<div class="fld"><label>Who goes?</label>' + pick('who', [['me', 'I&#39;ll go'], ['spec', 'Pass to a specialist']]) + '</div>';
+    h += '<div class="fld"><label>When</label><input value="Mon 30 Nov 2pm"></div>';
+    h += '<div class="fld"><label>Customer name</label><input value="Mr Tan"></div>';
+    h += '<div class="fld"><label>Phone</label><input value="9123 4567" inputmode="tel"></div>';
+    h += '<div class="fld"><label>Address</label><input value="12 Example Road"></div>';
+    h += '<button class="big" id="fpAdd" type="button">Add visit</button>';
+  } else if (FP.tab === 'today') {
+    h += '<div class="eyebrow">🇸🇬 On-Site · Orchard</div><h1>Today</h1><div class="sub">Fri 27 Nov</div>';
+    if (FP.msg) h += `<div class="warn" style="background:#E6F2EA;border-color:var(--green);color:var(--green)">${esc(FP.msg)}</div>`;
+    h += '<div class="lab-m" style="margin-top:0">Next visit</div>';
+    h += '<div class="hero" style="border-color:var(--accent)"><div class="tags"><span class="tag blue">BOOKED</span><span class="tag grey">RECCE</span></div>';
+    h += '<div class="v">3pm · Mr Tan</div><div class="t">12 Example Road · living room</div>';
+    h += '<div class="chips" style="flex-wrap:nowrap"><button type="button" style="flex:1">Directions</button><button type="button" style="flex:1">Open</button></div></div>';
+    h += '<div class="lab-m">Later today</div>';
+    h += '<div class="p"><div class="ptop"><span class="pn">5pm · Ms Lim</span><span class="tag blue">BOOKED</span></div></div>';
+    h += '<div class="p"><div class="ptop"><span class="pn">7pm · Mr Goh</span><span class="tag orange">PASSED ON</span></div></div>';
+    h += '<button class="big" id="fpNew" type="button">+ Add a customer</button>';
+  } else if (FP.tab === 'vis') {
+    h += '<div class="eyebrow">🇸🇬 On-Site · Orchard</div><h1>Visits</h1><div class="sub">This week</div>';
+    [['Mon 30 Nov', '2pm · Mr Tan', 'RECCE'], ['Tue 1 Dec', '11am · Ms Ong', 'SET UP'], ['Thu 3 Dec', '4pm · Mr Lee', 'FIX']]
+      .forEach(([d, w, t]) => {
+        h += `<div class="lab-m">${d}</div><div class="p"><div class="ptop"><span class="pn">${w}</span>`
+          + `<span class="tag ${t === 'RECCE' ? 'grey' : 'blue'}">${t}</span></div></div>`;
+      });
+  } else {
+    h += '<div class="eyebrow">🇸🇬 On-Site · Orchard</div><h1>Me</h1><div class="sub">Fran</div>';
+    h += '<div class="lab-m" style="margin-top:0">November so far</div>';
+    h += '<div class="mestats" style="grid-template-columns:repeat(3,minmax(0,1fr))">'
+      + '<div class="mest"><div class="n">9</div><div class="l">Visits</div></div>'
+      + '<div class="mest"><div class="n">4</div><div class="l">Recce</div></div>'
+      + '<div class="mest"><div class="n">3</div><div class="l">Set up</div></div>'
+      + '<div class="mest"><div class="n">2</div><div class="l">Fix</div></div></div>';
+    h += '<button class="big ghost" type="button" style="margin-top:20px">Special request to Ops</button>';
+    h += '<button class="big ghost" type="button">Look up a case</button>';
+  }
+  h += '<div class="note">Design preview with made-up visits. Nothing here is saved or sent.</div>';
+  h += '<div class="nav-bar">' + [['today', ICONS.week, 'Today'], ['vis', ICONS.visits, 'Visits'], ['me', ICONS.user, 'Me']]
+    .map(([v, ic, t]) => `<div class="${!FP.form && FP.tab === v ? 'on' : ''}" data-fptab="${v}">${icon(ic)}${t}</div>`).join('') + '</div>';
+  app.innerHTML = h;
+  window.scrollTo(0, 0);
+  const on = (id, f) => { const el = document.getElementById(id); if (el) el.onclick = f; };
+  on('fpNew', () => { FP.form = true; FP.msg = ''; fsPreview(); });
+  on('fpBack', () => { FP.form = false; fsPreview(); });
+  on('fpAdd', () => { FP.form = false; FP.tab = 'today'; FP.msg = 'Preview only: the visit was not saved.'; fsPreview(); });
+  document.querySelectorAll('[data-fptype]').forEach(el => { el.onclick = () => { FP.type = el.dataset.fptype; fsPreview(); }; });
+  document.querySelectorAll('[data-fpwho]').forEach(el => { el.onclick = () => { FP.who = el.dataset.fpwho; fsPreview(); }; });
+  document.querySelectorAll('[data-fptab]').forEach(el => { el.onclick = () => { FP.form = false; FP.msg = ''; FP.tab = el.dataset.fptab; fsPreview(); }; });
+}
+if (new URLSearchParams(location.search).get('p') === 'fs') VIEW = 'fsprev';
+
 render();
 </script>
 </body></html>"""

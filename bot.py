@@ -424,6 +424,7 @@ def main() -> None:
     app.add_handler(CommandHandler("departments", cmd_departments))
     app.add_handler(CallbackQueryHandler(on_dept_pick, pattern=r"^dp:\d+:"))
     app.add_handler(CommandHandler("viewas", cmd_viewas))
+    app.add_handler(CommandHandler("fspreview", cmd_fspreview))
     app.add_handler(CommandHandler("specialists", cmd_specialists))
     app.add_handler(CallbackQueryHandler(on_country_pick, pattern=r"^vz:cy:\d+:[A-Z]{2}$"))
     app.add_handler(CommandHandler("store", cmd_store))
