@@ -34,7 +34,7 @@ Each team gets its own Home screen in the App. Admins get an 🛡 Admin switch (
 | Ops sheet link | Google Apps Script project "Special Req – bot link" (separate from the sheet's own script) + the "Special Req" tab of the 🇸🇬 SG B2C Order Entry Tracker | Share or transfer the script project so it keeps running after the old owner's account closes |
 | Data warehouse | `tcacoustic/tc-data-warehouse`, plan #378 (Wilson owns it) | Nothing to transfer. Schema changes go to Wilson as warehouse PRs |
 | Telegram chats the bot works in | The groups in section 4 | Make the new owner an admin of each group, so they can add or remove the bot |
-| Claude artifacts (ideas page, App vision, tutorial videos, team guide, test checklist) | The previous owner's Claude account | Share each with the new owner before the last day. They stop working when the account closes, so ask IT whether to copy them |
+| Claude artifacts (ideas page, App vision, tutorial videos, team guide, test checklist, On-Site launch prep, On-Site quick-start guide, handover page) | The previous owner's Claude account | Share each with the new owner before the last day. They stop working when the account closes, so ask IT whether to copy them |
 | Claude's notes about this project | Saved only on the previous owner's Mac | The rules that matter are copied into section 9 of this file |
 
 **After the previous owner leaves:** rotate the bot token (BotFather → API Token → Revoke, then update `BOT_TOKEN` in Railway) and `REQUEST_SHEET_SECRET` (Railway + the Apps Script's Script Properties). Rotating is normal practice when someone who knew a secret leaves.
@@ -87,13 +87,15 @@ With the On-Site App, optional: `PAYNOW_UEN` / `PAYNOW_NAME` (only for a generat
 
 The full list with defaults is in the Config section at the top of `core.py`. The test bot has its own values (its own token, test sheet copy).
 
-## 6. Open work (as of Wed 25 Nov 2026)
+## 6. Open work (as of Fri 27 Nov 2026)
 
 | What | State | Next step |
 |---|---|---|
 | **Warehouse switch** (PR #84, warehouse #378) | Done 25 Nov 2026 (live on `lc_bot`) | Watch the first days for odd data or errors; report to Wilson |
-| **On-Site App** (PR #81, combines #67–#77 and #80) | Code went live with #84 on 25 Nov; not launched to staff | Follow [docs/ONSITE-LAUNCH.md](docs/ONSITE-LAUNCH.md): real checklists, sign-off wording, Finance (QR, cab rules, chat), Ops chat, MY/HK/TH rates, link the chats, dry run, SG first |
+| Deadline reminder lost its tags after the switch | Fixed: PR #86 shipped 27 Nov; test bot matches live | Check the next reminder shows names in blue (tagged). If not, look for other `@username` tags the move missed |
+| **On-Site App** (PR #81, combines #67–#77 and #80) | Code went live with #84 on 25 Nov; not launched to staff. Specialists who open the App already see the new screens, with the checklist and sign-off wording marked as drafts | Follow [docs/ONSITE-LAUNCH.md](docs/ONSITE-LAUNCH.md): real checklists, sign-off wording, Finance (QR, cab rules, chat), Ops chat, MY/HK/TH rates, link the chats, dry run, SG first |
 | PR #48 (old Pay tab) and #67–#80 (stacked parts) | History, not separate work. #67–#77 and #80 are all inside #81; #48 was rebuilt as #80; #78 is closed (went live as #79) | #81 is merged, so close each with the comment "Included in #81". Closing doesn't delete: they stay readable on GitHub as a record of why each piece was built |
+| **Livechat pay by country** (🇸🇬 SGD / 🇲🇾 MYR / 🇹🇭 THB, one hourly rate per country) | Designed, not built. Mockup agreed 24 Nov | Needs Wilson to add a country to pay rates (warehouse PR), and each agent's country on their identity record. Then: currency on every pay screen, totals per currency, an owner-only Pay check screen. Rates are entered in the bot, never in code |
 | LCBot #60 (old load script) | Replaced by Wilson's move | Close after checking with Wilson |
 | MY / HK / TH sheets for Ops requests | Parked | SG sheet only today |
 | RMA app (Service Concierge replacement) | AppSheet trial planned | Waiting on IT |
@@ -171,7 +173,7 @@ Then open the `LCBot` folder in Claude Code. Claude reads `CLAUDE.md` automatica
 
 - Bot code: https://github.com/tcacoustic/LCBot (open PRs: https://github.com/tcacoustic/LCBot/pulls)
 - Data warehouse: https://github.com/tcacoustic/tc-data-warehouse (move plan: https://github.com/tcacoustic/tc-data-warehouse/issues/378)
-- LCBot Test Run checklist, On-Site ideas and App vision page, tutorial videos, team guide: Claude artifacts (see section 2).
+- LCBot Test Run checklist, On-Site Launch Prep (who each launch item waits on, with ready-to-send messages), On-Site App Quick-Start Guide (editable doc with screenshots), SH Bot Handover page, On-Site ideas and App vision page, tutorial videos, team guide: Claude artifacts (see section 2).
 - Telegram bot docs: https://core.telegram.org/bots
 - Team onboarding messages to paste into Telegram: [docs/onboarding-messages.md](docs/onboarding-messages.md). How-to video scripts per team: [docs/video-scripts.md](docs/video-scripts.md). Bot profile picture options: [assets/bot-picture/](assets/bot-picture/).
 - Plain-language guide for the owner (transfers, everyday jobs, troubleshooting, using Claude): Claude Doc "SH Bot: guide for the new owner" (shared with the owner; ask IT to keep a copy).
