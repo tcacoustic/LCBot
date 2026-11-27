@@ -114,6 +114,25 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 | App error box says "send it to @caydenseee" (`core.py` `MINIAPP_HTML`) | Points at the previous owner | Change to the new owner's handle, or "use the Feedback button". Normal test → ship |
 | `/stats` (owner-only counts) | Idea | Build if wanted |
 
+### Idea: FS joins the On-Site team (suggested 27 Nov 2026)
+
+FS staff do home visits and recces before a sale, the same work as On-Site specialists. The idea is to drop FS as a separate team and put FS staff in On-Site, so there's one team, one set of screens and no separate handover form for them.
+
+| FS need | How it fits in On-Site |
+|---|---|
+| Recce before a sale | Add **Recce** as a third visit type next to Set up and Troubleshoot, with its own short checklist (room size, TV and wall, power, Wi-Fi, photos) |
+| They're store staff, not freelancers | Mark them **salaried** (the bot already supports this), so the Me tab shows their visits but no per-visit pay |
+| Which store they're from | Keep the store on their profile, so reports can split store visits from freelance specialist visits |
+| Not pinged for every handover | Only freelance specialists get the "I'll take it" ping. FS staff add their own customers ("+ Add your own customer") and can still take from the pool |
+| Ops special requests and case lookup (FS has these today) | Keep them for anyone with a store |
+
+**Check before building:**
+- Are FS staff ever paid per visit? If some are, don't mark those people salaried.
+- Ask the FS lead. Their daily screens change, so trial it with one store first.
+- Moving existing FS people into On-Site is a data change: tell Wilson first. Check whether the warehouse accepts a new visit type, or whether that needs a warehouse PR.
+
+**How:** mockup first (Claude can make one with made-up data), then build it as one release PR, test with one store, then ship. If FS stays its own team instead, a smaller fix is a "Your handovers" list on FS Home showing each handed-over case as Waiting / Taken by… / Booked for… (today FS only see a case once a time is booked).
+
 ## 7. Handover checklist
 
 | When | Do |
