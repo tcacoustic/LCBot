@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+**Always read [HANDOVER.md](HANDOVER.md) first and follow its house rules** (section 9): test bot first, live only when the owner says "ship", made-up data only, no secrets, database changes go to Wilson, and explain things in plain words because the owner isn't technical.
+
 ## Which repo to work through
 
 - **Database-related work** (schemas, warehouse tables, data pipelines, queries against company data): go through the separate data warehouse repo, not this one

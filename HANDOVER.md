@@ -46,6 +46,17 @@ Each team gets its own Home screen in the App. Admins get an 🛡 Admin switch (
 3. **Ship:** merge the PR into `main`. Railway deploys the live bot automatically. Ship **after 8pm** when the bot is quiet, then check the deploy succeeded (Railway → Deployments, or the green tick on the GitHub commit).
 4. Keep `staging` = `main` + whatever is being tested.
 
+**Releases: bundle changes into one PR.** Agreed with the previous owner on Fri 27 Nov 2026, to keep the PR list short and restarts few.
+
+1. Ideas, problems and staff feedback collect in one list.
+2. When there are enough (about 3–5), pick a bundle. A release every week or two suits this bot.
+3. Claude builds the bundle as **one release PR** titled "Release: <date>". The description has **one heading per item** (what changed, why, how to test).
+4. **Each item is its own commit** inside that PR, so one item can be undone on its own if it causes trouble.
+5. "test #N" puts the whole release on the test bot. Try every item there.
+6. "ship #N" puts it all live in one evening: one restart, and one What's new card.
+
+Urgent fixes (something broken for staff right now) still go out on their own, straight away.
+
 Rules agreed with management:
 - **Database changes need the AI lead's review before going live.** New tables and columns are migration PRs in `tc-data-warehouse`, reviewed and merged by Wilson. The bot doesn't create tables itself.
 - Made-up data only in tests and screenshots. Never put real customer or staff data in the repo.
@@ -102,6 +113,25 @@ The full list with defaults is in the Config section at the top of `core.py`. Th
 | Standalone phone app (outside Telegram) | Idea | Installable web app with "Log in with Telegram" first; needs IT / AI lead sign-off |
 | App error box says "send it to @caydenseee" (`core.py` `MINIAPP_HTML`) | Points at the previous owner | Change to the new owner's handle, or "use the Feedback button". Normal test → ship |
 | `/stats` (owner-only counts) | Idea | Build if wanted |
+
+### Idea: FS joins the On-Site team (suggested 27 Nov 2026)
+
+FS staff do home visits and recces before a sale, the same work as On-Site specialists. The idea is to drop FS as a separate team and put FS staff in On-Site, so there's one team, one set of screens and no separate handover form for them.
+
+| FS need | How it fits in On-Site |
+|---|---|
+| Recce before a sale | Add **Recce** as a third visit type next to Set up and Troubleshoot, with its own short checklist (room size, TV and wall, power, Wi-Fi, photos) |
+| They're store staff, not freelancers | Mark them **salaried** (the bot already supports this), so the Me tab shows their visits but no per-visit pay |
+| Which store they're from | Keep the store on their profile, so reports can split store visits from freelance specialist visits |
+| Not pinged for every handover | Only freelance specialists get the "I'll take it" ping. FS staff add their own customers ("+ Add your own customer") and can still take from the pool |
+| Ops special requests and case lookup (FS has these today) | Keep them for anyone with a store |
+
+**Check before building:**
+- Are FS staff ever paid per visit? If some are, don't mark those people salaried.
+- Ask the FS lead. Their daily screens change, so trial it with one store first.
+- Moving existing FS people into On-Site is a data change: tell Wilson first. Check whether the warehouse accepts a new visit type, or whether that needs a warehouse PR.
+
+**How:** mockup first (Claude can make one with made-up data), then build it as one release PR, test with one store, then ship. If FS stays its own team instead, a smaller fix is a "Your handovers" list on FS Home showing each handed-over case as Waiting / Taken by… / Booked for… (today FS only see a case once a time is booked).
 
 ## 7. Handover checklist
 
